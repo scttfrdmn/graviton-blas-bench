@@ -45,7 +45,7 @@ else
 endif
 OMPLIBS ?=
 
-.PHONY: all clean openblas armpl blis reference roofline dirs
+.PHONY: all clean openblas openblas-omp coreprobe armpl blis reference roofline dirs
 
 all: dirs roofline
 
@@ -70,6 +70,32 @@ openblas: dirs
 	@test -n "$(OPENBLAS_DIR)" || { echo "set OPENBLAS_DIR"; exit 1; }
 	@test -n "$(VARIANT)"      || { echo "set VARIANT";      exit 1; }
 	$(CC) $(CFLAGS) $(SRC)/bench.c -o $(BIN)/gbb-openblas-$(VARIANT) \
+	  -L$(OPENBLAS_DIR)/lib -lopenblas \
+	  -Wl,-rpath,$(OPENBLAS_DIR)/lib $(LDLIBS)
+
+# The USE_OPENMP=1 OpenBLAS needs libgomp at link time. Note what is NOT here:
+# -fopenmp. Adding a compiler flag for one arm would make the harness itself
+# differ between arms, which standing order 6 forbids and gates/p0.sh checks.
+# bench.c contains no OpenMP directives, so -lgomp alone is sufficient and
+# leaves the compilation of bench.c byte-identical to every other arm.
+#
+# This arm exists to answer "how much of the ArmPL lead is the threading
+# backend?" -- ArmPL is OpenMP and honours OMP_PROC_BIND; OpenBLAS as the
+# wheels ship it is pthreads and does not. Measuring that is not the same as
+# equalising it by rebuilding, which would change what is under test.
+openblas-omp: dirs
+	@test -n "$(OPENBLAS_DIR)" || { echo "set OPENBLAS_DIR"; exit 1; }
+	@test -n "$(VARIANT)"      || { echo "set VARIANT";      exit 1; }
+	$(CC) $(CFLAGS) $(SRC)/bench.c -o $(BIN)/gbb-openblas-$(VARIANT) \
+	  -L$(OPENBLAS_DIR)/lib -lopenblas \
+	  -Wl,-rpath,$(OPENBLAS_DIR)/lib $(LDLIBS) -lgomp
+
+# Reports what OpenBLAS selected, per OPENBLAS_CORETYPE. See src/coreprobe.c:
+# the coretype axis is a request until this confirms it was honoured.
+coreprobe: dirs
+	@test -n "$(OPENBLAS_DIR)" || { echo "set OPENBLAS_DIR"; exit 1; }
+	@test -n "$(VARIANT)"      || { echo "set VARIANT";      exit 1; }
+	$(CC) $(CFLAGS) $(SRC)/coreprobe.c -o $(BIN)/gbb-coreprobe-$(VARIANT) \
 	  -L$(OPENBLAS_DIR)/lib -lopenblas \
 	  -Wl,-rpath,$(OPENBLAS_DIR)/lib $(LDLIBS)
 

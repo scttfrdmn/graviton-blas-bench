@@ -295,6 +295,18 @@ static int verify_gemm_corner(const double *A, int lda, const double *B, int ldb
 
 static const char *g_host, *g_instance, *g_library, *g_target, *g_build,
                   *g_run_id, *g_arch_selected;
+/* Provenance that was previously unrecorded, and whose absence made numbers
+ * inadmissible under standing order 5:
+ *   g_blas_sha       the SHA of the BLAS under test. g_build is the *gbb repo*
+ *                    SHA and was being misread as the library version.
+ *   g_coretype       what OPENBLAS_CORETYPE was forced to at runtime, which is
+ *                    a different claim from the build-time TARGET= in g_target
+ *                    and from the auto-detected g_arch_selected.
+ *   g_thread_backend pthreads vs openmp. Not cosmetic: it decides whether the
+ *                    arm obeys OMP_PROC_BIND at all, which was the confound.
+ *   g_pin_policy     the exact external binding applied to this arm.
+ */
+static const char *g_blas_sha, *g_coretype, *g_thread_backend, *g_pin_policy;
 static int g_threads;
 static long g_batch = 1;   /* set by TIMED_LOOP */
 
@@ -329,6 +341,8 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
 
     printf("{\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\","
            "\"library\":\"%s\",\"target\":\"%s\",\"build\":\"%s\","
+           "\"blas_sha\":\"%s\",\"coretype\":\"%s\","
+           "\"thread_backend\":\"%s\",\"pin_policy\":\"%s\","
            "\"arch_selected\":\"%s\",\"threads\":%d,"
            "\"routine\":\"%s\",\"m\":%d,\"n\":%d,\"k\":%d,\"lda_pad\":%d,"
            "\"reps\":%d,\"batch\":%ld,\"calls\":%ld,"
@@ -336,6 +350,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"t_min\":%.9g,\"t_p50\":%.9g,\"t_p90\":%.9g,"
            "\"gflops\":%.6f,\"gflops_p50\":%.6f,\"verified\":%s,\"note\":\"%s\"}\n",
            g_run_id, g_host, g_instance, g_library, g_target, g_build,
+           g_blas_sha, g_coretype, g_thread_backend, g_pin_policy,
            g_arch_selected, g_threads,
            routine, m, n, k, lda_pad,
            reps, g_batch, (long)reps * g_batch,
@@ -559,6 +574,10 @@ int main(int argc, char **argv) {
     g_target        = env_or("GBB_TARGET", "unknown");
     g_build         = env_or("GBB_BUILD", "unknown");
     g_arch_selected = env_or("GBB_ARCH_SELECTED", "unknown");
+    g_blas_sha       = env_or("GBB_BLAS_SHA", "unknown");
+    g_coretype       = env_or("GBB_CORETYPE", "unforced");
+    g_thread_backend = env_or("GBB_THREAD_BACKEND", "unknown");
+    g_pin_policy     = env_or("GBB_PIN_POLICY", "none");
     g_threads       = atoi(env_or("GBB_THREADS", "1"));
 
     calibrate_timer();

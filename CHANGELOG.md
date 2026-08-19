@@ -20,9 +20,78 @@ change can be compared.
   against the harness before any cloud spend.
 - Records now carry `batch`, `calls`, `timer_overhead_ns` and `timer_res_ns`, so
   a reader can check the timing contract held rather than assume it.
+- Records now carry `blas_sha`, `coretype`, `thread_backend` and `pin_policy`.
+  `build` was the *gbb repo* SHA and was the only SHA in the record, so the
+  identity of the library under test never reached `results/` at all — which made
+  every record inadmissible under standing order 5.
+- `src/coreprobe.c` and `make coreprobe`: reports what OpenBLAS actually
+  selected. `OPENBLAS_CORETYPE` is a *request* — `force_coretype()` silently
+  ignores a name it does not know, and a non-`DYNAMIC_ARCH` build ignores the
+  variable entirely — so every coretype is now verified before its arm runs and
+  the record carries what the library reported, not what was asked for.
+- `results/census-<run_id>.ndjson`: one `arm_outcome` record per attempted arm,
+  with `status` of `measured` / `build_failed` / `unrunnable` / `runtime_failed`
+  / `skipped` and a stated `reason`. Without it the analysis cannot tell "V1 and
+  V2 are at parity" from "the V1 arm never ran", and those support opposite
+  conclusions. Required by gate P1.
+- `results/topology-<run_id>.txt`: `numactl -H` and `lscpu` verbatim, which gate
+  P2 requires.
+- Incremental S3 shipping via `GBB_S3_URI`, after every arm rather than at the
+  end of the sweep, plus on any trapped signal. Instances are terminated on
+  completion and a spot reclaim can come sooner; a multi-hour sweep whose results
+  only existed locally was spending instance-hours it could lose.
+- `tests/run-matrix-stubs.sh`: 33 assertions covering the runner's decision
+  logic against stub binaries — the refusal paths, coretype verification, the
+  census, and the pinning arithmetic. None of it needs a Graviton, and all of it
+  is what would be most expensive to get wrong.
+- `make openblas-omp`: links the `USE_OPENMP=1` OpenBLAS with `-lgomp` and
+  *without* `-fopenmp`, so the harness compilation stays byte-identical across
+  arms as standing order 6 requires.
 
 ### Changed — affects comparability of numbers
 
+- **Pinning is now external and uniform, and this is the single most important
+  change in the release.** The runner set `OMP_PROC_BIND=close`/`OMP_PLACES=cores`
+  on every arm while OpenBLAS was built `USE_OPENMP=0`. Only OpenMP arms obey
+  those, so ArmPL — the reference — was pinned and shipping pthread OpenBLAS was
+  not. That is a systematic advantage to the reference of about the size of the
+  deficit being investigated. Binding now happens outside the process with
+  `numactl`/`taskset`, identically for every arm regardless of threading backend,
+  and `OMP_PROC_BIND=false` is set so no arm gets a 1:1 pinning its competitors
+  cannot have. What pinning is worth is measured by the new `DYNAMIC_OMP_BOUND`
+  arm instead of being left in the comparison as a bias. Pinning was **not**
+  equalised by rebuilding OpenBLAS with `USE_OPENMP=1`: that changes the
+  threading backend and so what is under test, and pthreads is what the wheels
+  ship.
+- A uniform `numactl` memory policy also closes a second gap at no cost:
+  `bench.c` first-touches its matrices serially and `roofline.c` in parallel, so
+  on a multi-node host the denominator and the measurement used to land their
+  pages on different nodes. Under one explicit `--membind`/`--interleave` policy
+  they cannot.
+- **The hardware × target cross is now a runtime `OPENBLAS_CORETYPE` sweep on one
+  `DYNAMIC_ARCH` binary, not six separate `TARGET=` builds.** `TARGET=` is not
+  only a kernel-table selection — it also sets the compiler flags applied to the
+  *common* code (`Makefile.arm64` gives `NEOVERSEN2` `-march=armv8.5-a+sve+sve2+bf16`)
+  so a `NEOVERSEV1`-vs-`NEOVERSEV2` comparison across two builds moved the kernel
+  table and the codegen of every shared source file at once, with no way to
+  attribute the difference afterwards. One binary, one set of common-code flags,
+  only the kernel table varying is strictly less confounded. Two static `TARGET=`
+  builds survive as controls — the host's native target and the cross target — to
+  check that `DYNAMIC_ARCH` dispatch costs nothing measurable and that a forced
+  coretype lands where a real `TARGET=` build does.
+- **`OPENBLAS_REF` must now be an immutable commit SHA**, defaulting to the
+  audited `cc3fc1e`. It defaulted to `develop`. The five hosts are built on
+  different days, so a branch name meant `c6g` and `c9g` could silently get
+  different libraries while the cross-host comparison that is the entire
+  deliverable treated them as one. Override with `GBB_ALLOW_MUTABLE_REF=1`.
+  Full SHAs are recorded, not `--short`: an abbreviated SHA does not identify a
+  commit outside the repo that produced it.
+- **`capture-env.sh`'s exit status now stops the sweep.** It was discarded, so
+  the run-invalidating (3) and escalate (4) exit codes stopped nothing and a
+  multi-hour sweep would start on a host already known to produce incomparable
+  numbers. Exit 3 requires `GBB_FORCE_INVALID_HOST=1`; exit 4 requires
+  `GBB_ESCALATION_ACK` with a note, which is recorded — standing order 8 says
+  stop and escalate, so proceeding has to leave a trace.
 - **Timing loop is now batched.** Each sample times a batch of back-to-back
   calls and divides, instead of bracketing every call with `now()`. The old
   scheme cost ~31 ns per call pair, 27.9% of the sample at n=8, and a constant
@@ -64,6 +133,18 @@ change can be compared.
   JSON; `decompose.py` dropped such records with a one-line warning and
   under-counted silently. Now emits a valid record noting the timer was outrun.
 - Unchecked `realloc` in the timing loop.
+- The failed-arm record omitted `instance`, so a failure could not be attributed
+  to a host. Arms that were never built or were unrunnable produced no record at
+  all and simply vanished from the results.
+- A host where the native and cross control targets coincide — any NEON-only
+  host, or one whose MIDR is unreadable — built the same `TARGET=` twice,
+  installing over itself and emitting two identical manifest lines that the
+  census would count as two arms. That inflated apparent coverage on exactly the
+  hosts we know least about.
+- The build manifest was written to `$GBB_PREFIX`, outside `results/`, so the
+  analysis could not reach it. It is now copied to
+  `results/manifest-<run_id>.ndjson`, which is what the P1 expected-arm census
+  reads.
 
 ### Corrected
 

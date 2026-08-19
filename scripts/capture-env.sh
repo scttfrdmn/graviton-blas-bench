@@ -40,7 +40,7 @@ for arg in "$@"; do
   case "$arg" in
     --warn-only) WARN_ONLY=1 ;;
     -h|--help)
-      sed -n '2,36p' "$0"
+      sed -n '2,34p' "$0"
       exit 0
       ;;
     *)
@@ -413,6 +413,7 @@ OB_CORE=""
 OB_CONFIG=""
 OB_STATUS="not_attempted"
 OB_FORCING="not_probed"
+OB_LIB=""
 if [ -n "${GBB_OPENBLAS_DYNAMIC_DIR:-}" ] && [ -d "$GBB_OPENBLAS_DYNAMIC_DIR" ]; then
   OB_STATUS="build_failed"
   TMPC="$(mktemp /tmp/gblas-obcore-XXXX.c)"; TMPB="${TMPC%.c}"
@@ -448,6 +449,12 @@ EOF
       else
         OB_FORCING="unavailable"
       fi
+      # WHICH libopenblas answered matters as much as what it said. -lopenblas
+      # falls back to the linker's default search path, so if
+      # GBB_OPENBLAS_DYNAMIC_DIR/lib has no libopenblas the probe silently
+      # reports the *system* library's dispatch instead of the build under
+      # test. Record the resolved path so the field is auditable.
+      OB_LIB="$(ldd "$TMPB" 2>/dev/null | awk '/libopenblas/{print $3; exit}')"
     fi
   fi
   rm -f "$TMPC" "$TMPB"
@@ -505,12 +512,18 @@ sn openblas_dynamic_selection "$OB_CORE"; printf ','
 sn openblas_dynamic_config "$OB_CONFIG"; printf ','
 s openblas_dynamic_probe_status "$OB_STATUS"; printf ','
 s openblas_coretype_forcing "$OB_FORCING"; printf ','
+sn openblas_dynamic_probe_dir "${GBB_OPENBLAS_DYNAMIC_DIR:-}"; printf ','
+sn openblas_dynamic_lib_resolved "$OB_LIB"; printf ','
 
 # ---- warnings, computed before the array is emitted ------------------------
 # Anything that invalidates a run or needs a human is decided here so it lands
 # inside the JSON as well as on stderr.
 if [ "$MIDR_SEEN" -gt 0 ] && [ "$CORE_NAME" = "UNRECOGNISED" ]; then
-  warn 4 "cpu0 MIDR part $PART is not in OpenBLAS dynamic_arm64.c's switch. Record which target DYNAMIC_ARCH actually selects: on a host with SVE the fallback is ARMV8SVE, which carries more SVE kernels than a named Neoverse V2/V3 target, so this may be an interesting result rather than a regression. Escalate before drawing a conclusion (standing order 8)."
+  if [ "$HAS_SVE" = true ]; then
+    warn 4 "cpu0 MIDR part $PART is not in OpenBLAS dynamic_arm64.c's switch, and this host HAS SVE. The fallback is then ARMV8SVE, which carries more SVE kernels (94) than a named Neoverse V2/V3 target (5) -- so this is an interesting finding, not necessarily a bad outcome. Record what openblas_dynamic_selection actually says and escalate before drawing a conclusion (standing order 8)."
+  else
+    warn 4 "cpu0 MIDR part $PART is not in OpenBLAS dynamic_arm64.c's switch and this host reports no SVE, so DYNAMIC_ARCH will fall back to generic ARMV8 (NEON) here. Record what openblas_dynamic_selection actually says and escalate (standing order 8)."
+  fi
 fi
 i=0
 while [ "$i" -lt "${#CL_NAME[@]}" ]; do
@@ -550,6 +563,15 @@ case "$OB_STATUS" in
 esac
 
 if [ "$OB_STATUS" = ok ]; then
+  case "$OB_LIB" in
+    "$GBB_OPENBLAS_DYNAMIC_DIR"/*) : ;;
+    "")
+      warn 0 "DYNAMIC_ARCH probe ran but ldd could not say which libopenblas it resolved. openblas_dynamic_selection '$OB_CORE' may not describe the library in $GBB_OPENBLAS_DYNAMIC_DIR."
+      ;;
+    *)
+      warn 0 "DYNAMIC_ARCH probe resolved $OB_LIB, which is NOT under $GBB_OPENBLAS_DYNAMIC_DIR. openblas_dynamic_selection '$OB_CORE' describes THAT library, not the build under test -- the standing-order-8 check did not look at the intended OpenBLAS."
+      ;;
+  esac
   case "$OB_LOWER" in
     *sve*) : ;;
     *armv8*)
