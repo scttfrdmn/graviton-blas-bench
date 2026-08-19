@@ -799,7 +799,22 @@ def band_for(ca: Cell, cb: Cell, min_effect: float) -> float:
 
     A delta smaller than the spread that produced it is not a finding. This is
     the single guard that stops run-to-run noise being published as a kernel
-    result -- t_min/t_p50/t_p90 were collected and never used before."""
+    result -- t_min/t_p50/t_p90 were collected and never used before.
+
+    KNOWN LIMIT, and it is a property of the design rather than a defect in it:
+    **an adaptive band derived from the same samples as the statistic it bands can
+    absorb a bias in that statistic.** run_spread comes from the same per-run
+    values whose median becomes the cell value, so anything that biases the value
+    toward one run's number widens the band by about the amount it moves the delta
+    and the row stays `parity`. Found by mutation: substituting max for the
+    median across runs is invisible to every verdict-level assertion in
+    gates/p1.sh, which is why the lucky-pass scenario asserts the pooled *number*
+    instead. Two consequences worth carrying forward -- a self-cancelling bias in
+    the aggregation reads as parity rather than as an anomaly, so aggregation must
+    be tested on numbers and not on verdicts; and a real effect on a genuinely
+    noisy host is banded away, which is a deliberate trade (a false null is
+    publishable, a false headline is not) and the reason within_spread and
+    run_spread are printed next to every verdict rather than folded into it."""
     return max(min_effect, ca.within_spread, cb.within_spread, ca.run_spread, cb.run_spread)
 
 

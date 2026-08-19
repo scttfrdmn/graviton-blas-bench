@@ -110,6 +110,84 @@ change can be compared.
   `instance_id` and is correctly not counted as one. Gate P3 now requires the
   headline to reproduce between passes.
 
+- CI now runs gate P1, `tests/arch-selected-assert.sh`, and a new P0 section that
+  asserts every gate and suite in the tree is wired into CI. P0's requirement is
+  "CI green on a clean clone", which is worth exactly the set of things CI runs —
+  and P1 and the arch-selected suite were both in the tree and in neither job, so
+  a drift between `synth.py` and `bench.c` would have been found by a dataset that
+  cost instance-hours instead of by a push.
+
+- **`incx` is now in the record and in the comparison key.** `run_level1` runs
+  the same `(routine, m, n, k, lda_pad)` at stride 1 and stride 4, and the record
+  did not say which — so the two collapsed into one cell and the min-within-run
+  rule silently kept the slower of the pair. That deleted the stride axis, which is
+  one of the specific places the arm64 tree is expected to be weakest, and it
+  deleted it in the direction that hides an effect. Records written before this
+  change default to `incx=1`, which is correct for every level-3 routine and merges
+  the old level-1 pairs exactly as they merged before.
+- `canon_coretype()` in `decompose.py`: an unforced arm reaches the analysis with
+  `coretype` as `""`, `null`, or absent depending on which producer wrote the line,
+  and those were three different arms in the arm key. One physical arm counted three
+  times is a coverage hole, a thin cell, or both.
+
+- `tools/synth.py` and `gates/p1.sh`: the analysis is now calibrated against
+  datasets whose right answer is known by construction, because campaign data
+  cannot serve that purpose — the right answer there is the thing being looked
+  for. 36 scenarios plant a null, a broad effect, an effect confined to the small
+  regime, an effect confined to `incx=4`, a leading-dimension penalty, a dead arm,
+  an arm returning wrong answers, a mislabelled arm, an arm censused `aliased`, an
+  arm that produced only some of its sizes, an arm with no provenance, generic
+  `ARMV8` on an SVE host, an acknowledged escalation, a host with no `peak_fma`,
+  a directory polluted with instrument-check records, a run with a lucky duplicate
+  sample, three passes one of which is flattered, a host on which every arm failed
+  to build, two passes that agree and two that disagree, and two hosts built from
+  different OpenBLAS trees. Each declares its own
+  expectations; `gates/p1.sh` generates it, runs `decompose.py` over it, and
+  checks the report and the exit bits against them, so adding a scenario needs no
+  gate edit. Fixtures are written to a scratch directory and never to `results/`:
+  they are not measurements (standing order 3) and must not be able to reach the
+  published dataset. The gate also asserts that synth.py's copies of bench.c's
+  size ladders still match bench.c, since a drifted copy makes every fixture a
+  faithful test of the wrong experiment.
+- **`decompose.py` section 8, replicate agreement, and exit bit 16.** The two
+  `hpc7g` passes gate P3 requires are now compared rather than pooled. Pooling
+  would convert the campaign's strongest evidence — that the headline reproduces
+  on a different box of the same type — into slightly tighter error bars on one
+  number. Each `(instance_type, instance_id)` is analysed independently and the
+  verdict codes are set against each other: `REPRODUCES`, `DIVERGES-DIRECTION`,
+  `DIVERGES-INCONCLUSIVE`, or `NO-REPLICATE`. Divergence sets exit bit 16 and
+  prints a `VERDICT-CAVEAT:`. The per-pass delta spread is reported but never
+  gated on — the claim is about the direction of the finding, not its magnitude.
+
+- **The scenarios are validated by mutation, not by passing.** A fixture that
+  cannot fail is a decoration, and an adversarial audit of the first 25 found
+  several that could not: every effect-bearing scenario is now re-run with its
+  planted effect deleted and must go red, and every rule a scenario claims to
+  guard is broken in `decompose.py` and must also turn it red. Two rules turned out
+  to be guarded by nothing at all — see the aggregation entry under Fixed — and
+  the exit-bit table now covers bit 1 as well as 2, 4, 8 and 16.
+
+- **`role` is a filter in `decompose.py`, not just a field in the record.**
+  Records carrying a role other than the requested one (default `campaign`) are
+  excluded before anything else looks at them, counted in
+  `inputs.foreign_roles`, and reported as a `role_excluded` anomaly with exit
+  bit 2. One `aws s3 sync` of a bucket holding both prefixes puts instrument-check
+  records from `castor`/`pollux` into a campaign directory, and quarantining them
+  by construction (standing order: by construction, not by discipline) requires the
+  consumer to enforce it too. The failure was quiet in the worst way: those records
+  scale every arm by the same factor, so the cross ratios survive pooling unchanged
+  while the measured-peak denominator is inflated — which is precisely how standing
+  order 1's headroom check goes silent.
+- **An acknowledged escalation is reported by the analysis, not only recorded by
+  the runner.** `GBB_ESCALATION_ACK` lets a sweep proceed past a standing-order-8
+  refusal and writes an `escalation_ack` census record; `decompose.py` now loads it,
+  raises it as a hard anomaly and sets exit bit 2. A trace nothing reads is not a
+  trace.
+- **`sve_kernels: unknown` is a provenance gap, not a pass.** The check that
+  escalates `no` accepted `unknown` — "the archive could not be inspected" — as
+  equivalent to "SVE kernels are present". It now records a provenance gap, raises
+  `sve_kernels_unknown` and sets exit bit 8.
+
 ### Changed — affects comparability of numbers
 
 - **Pinning is now external and uniform, and this is the single most important
@@ -173,6 +251,62 @@ change can be compared.
   per measurement is now 0.28–0.30 s from n=8 to n=2048.
 
 ### Fixed
+
+- **A timer-outrun record was reported as a wrong answer.** `bench.c:381` sets
+  *both* `gflops = 0` and `verified = false` on the same record when the timer is
+  outrun, because it never ran the verification — so a timer-outrun record arrives
+  with both markers set. `build_cells` tested `verified is False` first, which
+  classified every one of them as a verification failure, made the `zero_gflops`
+  branch unreachable on real data, and printed "WRONG ANSWER, excluded" against a
+  kernel that had merely finished too fast to time. Both paths exclude the record,
+  so no number changed — but the anomaly table exists to say *which* thing went
+  wrong, and it was sending the reader after a numerical bug that did not exist.
+  The specific diagnosis is now tested first. Found by gate P1's `dead-arm`
+  scenario.
+- **A clean dataset raised an unexplained coverage hole.** `run-matrix.sh`
+  censuses the roofline cross-check as an arm (`library=roofline`,
+  `target=native`) so that an absent `peak_fma` carries a stated reason like any
+  other gap — but it writes `roofline-*.ndjson`, not `bench-*.ndjson`.
+  `report_coverage` folded every census arm into the expected *bench* arms, so
+  that pseudo-arm was expected to produce a cell for every condition on the host
+  and produced none: 36 `MISSING-UNEXPLAINED` cells and exit bit 4 on a dataset
+  with nothing missing. Every real P2 run would have looked broken, and the flag
+  that says "you have a coverage hole" would have been the one flag guaranteed to
+  be lying. Non-bench libraries are now excluded from the expected-arm set at that
+  site. Found by gate P1's `null` scenario.
+- **The same coverage-hole defect existed twice more, and one half of it was in the
+  producer.** `run-matrix.sh` skipped the netlib reference arm with a bare
+  `continue` before any `census()` call, so an arm the manifest declares built and
+  runnable simply vanished — standing order 11 says every arm the runner declines to
+  run carries a reason, and this one did not. It is now censused `skipped` with the
+  reason "correctness control, never timed". On the analysis side `reference` and
+  `host` joined `roofline` in the non-bench set: the `host` census record that
+  `GBB_FORCE_INVALID_HOST=1` writes was also being expected to produce a cell for
+  every condition on the host.
+- **`aliased` was missing from the set of census statuses that mean "the arm
+  ran".** Standing order 8 records that OpenBLAS resolves `NEOVERSEV2` onto
+  `NEOVERSEN2` on a recognised V2/V3 part, so on every real `c8g`/`c9g` run the
+  campaign's central arm is censused `aliased` — written *before* the arm runs, so
+  it can never explain a missing cell. It was nonetheless accepted as one, which
+  would have let a genuine hole in the arm the whole cross rests on be accounted for
+  by a line that says "running it".
+- **The aggregation policy was guarded by nothing.** `build_cells` takes the minimum
+  within a `run_id` and the median across `run_id`s, both to stop the luckiest
+  sample from being the one that survives — and no fixture emitted a duplicate
+  record or a third pass, so swapping either rule for `max` left all 33 scenarios
+  green. Two scenarios now plant exactly those shapes: a re-run appended into one
+  file 40% faster than the honest sample (min keeps the honest one, `max` publishes
+  a 40% kernel-set win that was never measured), and three passes one of which is
+  25% fast on one side of the cross. The second is asserted on the pooled *number*
+  rather than the verdict, deliberately: substituting `max` across runs raises
+  `run_spread` by exactly the amount it raises the delta, so the parity band widens
+  in step and every verdict-level assertion in the file survives the mutant.
+- **Exit code 1 was the one exit code no gate could assert on.** `decompose.py`
+  returned before writing its report when nothing loaded, and `gates/p1.sh` cannot
+  tell a scenario that wrote no report from one whose analysis crashed. It now
+  writes the same schema with empty sections and `verdict.code = NO-DATA`, and the
+  `all-arms-failed` scenario — provenance and a census of build failures, no
+  measurements — asserts it.
 
 - **TRSM/TRMM were timed on `Inf` and on exact zeros.** Both are destructive in
   place on `B` and the timing loop never restored it, so the triangular

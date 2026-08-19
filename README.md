@@ -114,6 +114,7 @@ scripts/build-libs.sh  DYNAMIC_ARCH + control builds, ArmPL link, BLIS
 scripts/capture-env.sh MIDR per core, HWCAP, NUMA, cgroups, governor, dispatch
 scripts/run-matrix.sh  orchestrates arm x coretype x threads on one host
 analysis/decompose.py  the reports, the coverage census, and an anomaly section
+tools/synth.py         planted-effect datasets whose right answer is known: gate P1
 tests/                 stub-based regression suite for the runner's decisions
 gates/                 one script per phase gate; each exits 0/1 with evidence
 ```
@@ -192,6 +193,26 @@ support opposite conclusions.
   one silently leaves the others at their defaults.
 - **The harness itself is built identically everywhere** — `-O2`, no
   `-march=native`. Only the BLAS under test varies.
+- **The analysis is calibrated before it is trusted.** On campaign data the right
+  answer is the thing being looked for, so there is nowhere to check the analysis
+  against — which is what `tools/synth.py` is for. It writes complete result sets
+  in which the effect is known by construction: a null, an effect in one regime
+  only, an effect at one stride only, a leading-dimension penalty, a dead arm, a
+  mislabelled arm, an arm that never ran, an arm that ran only half its sizes, a
+  lucky duplicate sample, a flattered pass, two passes that disagree.
+  `gates/p1.sh` runs `decompose.py` over each and asserts the report says the
+  planted thing. The instrument earns nothing on its own — it earns its place by
+  having already found defects that would each have survived into published
+  numbers, including one that raised a coverage-hole flag on a dataset with no hole
+  in it, one that reported a timer-outrun record as a wrong answer, and an arm the
+  runner declined to run without recording that it had.
+- **The instrument is itself calibrated, by mutation.** A scenario that cannot
+  fail is a decoration, so each is checked two ways: with its planted effect
+  deleted it must go red, and with the `decompose.py` rule it claims to guard
+  broken it must also go red. That is how two rules were found to be guarded by
+  nothing — the minimum-within-a-run and median-across-runs aggregation, both of
+  which exist so that the luckiest sample is not the one that survives, and neither
+  of which any fixture could reach.
 
 ## Hazards, learned the hard way
 
@@ -229,6 +250,19 @@ support opposite conclusions.
   the chip may be faster than one that does. `capture-env.sh` and `decompose.py`
   surface an unrecognised part as a finding to read against the `ARMV8SVE` arm,
   not as an alarm.
+- **An adaptive parity band can absorb the bias it is supposed to expose.**
+  `band_for()` widens the parity band to the dispersion actually observed, so a
+  delta smaller than the spread that produced it is not published as a finding.
+  But `run_spread` is computed from the same per-run values whose median becomes
+  the cell value, so anything that biases the value toward one run's number widens
+  the band by roughly the amount it moves the delta, and the row still reads
+  `parity`. This is not hypothetical: replacing the median across runs with `max`
+  is invisible to every verdict-level assertion in `gates/p1.sh`, and was caught
+  only by asserting the pooled *number*. The general form — any band derived from
+  the same samples as the statistic it bands can hide a bias in that statistic —
+  is where the next blind spot of this kind will be, so aggregation rules are
+  tested on numbers, and `within_spread`/`run_spread` are printed beside every
+  verdict rather than folded into it.
 - **The alarming dispatch outcome is narrower than the above.** Generic `ARMV8`
   selected on a host that *has* SVE would mean the SVE detection itself failed;
   `NO_SVE` set at build time would mean the SVE kernels were never compiled in.
@@ -262,10 +296,20 @@ support opposite conclusions.
 
 ## What the output supports
 
-`decompose.py` prints eight numbered sections and then a `DECISION` block. The
+`decompose.py` prints nine numbered sections and then a `DECISION` block. The
 sections are: 0 hosts and admissibility, 1 deficit by routine, 2 the target
 cross, 3 the leading-dimension penalty, 4 the regime profile, 5 anomalies,
-6 thread scaling, 7 the coverage census.
+6 thread scaling, 7 the coverage census, 8 replicate agreement.
+
+Section 8 exists because the docs call for repeated `hpc7g` runs, and the
+tempting thing to do with a second box is pool it with the first. Pooling turns
+the campaign's strongest available evidence — that the headline reproduces on
+different silicon of the same type — into slightly tighter error bars on a single
+number. So passes are **compared, never pooled**: each `(instance_type,
+instance_id)` pair is analysed independently and the resulting verdict codes are
+set against each other. If they disagree in direction, that is exit bit 16 and a
+`VERDICT-CAVEAT:` line, because a headline that does not reproduce is not a
+headline.
 
 The `DECISION` block is **computed, not a guide to be read against**. It emits
 exactly one machine-greppable `VERDICT:` line, so `gates/p4.sh` can assert on it

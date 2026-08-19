@@ -142,6 +142,22 @@ under `gates/` that exits 0/1 and prints its evidence.
 | `gates/p3.sh` | five hosts collected **twice**, each pass on a different `instance_id`; every `env-*.json` present; `blas_sha` identical across hosts and passes; the headline reproduces between passes within the parity band; no unresolved section-5 anomalies |
 | `gates/p4.sh` | report answers "is the N2 gap worth closing", supported by section 2, stated as a null if that is what the data says |
 
+P1 is implemented by `tools/synth.py`, which writes complete result sets whose
+answer is known by construction, and `gates/p1.sh`, which runs `decompose.py`
+over each and checks the report. Two rules about it:
+
+- **Each scenario owns its expectations; the gate owns none.** Adding a scenario
+  must not require editing `gates/p1.sh`. An unknown expectation kind FAILs rather
+  than being skipped.
+- **The fixture must stay faithful to the producers.** synth.py hand-copies
+  `bench.c`'s size ladders and the census/manifest vocabulary from
+  `run-matrix.sh`, because there is nothing to import from a shell script or a C
+  file. A copy that drifts turns every scenario into a rigorous test of the wrong
+  experiment, and it does so silently — so the ladders are asserted against
+  `bench.c` in gate section 2. If you change a ladder, a record field, or a census
+  status, change synth.py in the same commit. Fixtures go to a scratch dir, never
+  to `results/`: they are not measurements.
+
 ## Working conventions
 
 - Project management lives in GitHub: milestones P0–P4, one umbrella issue per
