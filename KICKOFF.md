@@ -22,6 +22,24 @@ What is already established, from a source audit of OpenBLAS `develop` @
   of it, and 0.3.32 maps Neoverse V3 onto the V2 target. So Graviton 4 and 5 run
   a NEON-based kernel set: **5 SVE kernels, all `gemv`**, versus 99 on
   `NEOVERSEV1`.
+- **Runtime dispatch does not fall through to generic `ARMV8` for an SVE part.**
+  When the implementer/part switch in `kernel/arm64/dynamic_arm64.c` finds
+  nothing it checks SME, then `HWCAP_SVE`, and returns `gotoblas_ARMV8SVE`
+  before it ever reaches `return NULL`. Generic `ARMV8` requires a part that is
+  unrecognised *and* SVE-less. Confirmed empirically: an OpenBLAS 0.3.30
+  `DYNAMIC_ARCH` build on Cortex-X925/A725 (parts `0xd85`/`0xd87`, neither in
+  the switch, both SVE2-capable) reports
+  `openblas_get_corename() -> armv8sve`. So an unrecognised SVE part inherits
+  the full SVE kernel set — 94 kernels — while a **recognised** Graviton 4/5
+  gets 5. Being present in the dispatch table is a **downgrade** for Neoverse
+  V2/V3, and a NumPy wheel that does *not* recognise the chip may be faster than
+  one that does. This inverts what standing order 8 below used to say: the
+  earlier prediction that an unrecognised MIDR drops the newest Graviton to
+  plain NEON was not merely unproven, it was backwards.
+- **`ARMV8SVE` is an experimental arm, not a control.** `KERNEL.ARMV8SVE` is the
+  file `KERNEL.NEOVERSEN2` does not include, which makes it the closest thing
+  in-tree to "what Graviton 4 would get if the N2 kernel-selection gap were
+  closed." It runs on every host.
 - **90 operations** have working SVE implementations in-tree that N2/V2/V3 do
   not select — all four `TRSM` kernels per type (they fall to
   `../generic/trsm_kernel_*.c`), the `TRMM`/`SYMM`/`HEMM` copy kernels, and the
@@ -89,8 +107,9 @@ on the analysis. Tag `v0.0.1`.
 Before any cloud spend, prove the analysis reports what it should. Write
 `tools/synth.py` that emits NDJSON with *planted* effects — a small-regime
 penalty, a leading-dimension penalty, a `DYNAMIC_ARCH`→generic-`ARMV8`
-fallback, a failed verification, a noisy-neighbour p50/min spread — and assert
-that `decompose.py` surfaces each one. Also plant a **null**: a dataset where
+selection *on an SVE-capable host*, a failed verification, a noisy-neighbour
+p50/min spread — and assert that `decompose.py` surfaces each one. Also plant a
+**null**: a dataset where
 V1-set and V2-set are at parity, and assert the decision guide reads as
 "publish the negative result." An instrument that can only find hits is not an
 instrument.
@@ -152,9 +171,13 @@ what the data says.
 7. **Report costs before spending.** Estimate instance-hours per phase and put
    it in the umbrella issue before launching. Terminate on completion; nothing
    idles overnight.
-8. **Stop and escalate** if `capture-env.sh` reports an unrecognised MIDR or a
-   `DYNAMIC_ARCH`→generic-`ARMV8` fallback on any host. That finding outweighs
-   every kernel question in the repo and changes what gets published first.
+8. **Stop and escalate** if `capture-env.sh` reports generic `ARMV8` selected on
+   a host that *has* SVE — which would mean the SVE detection itself failed — or
+   `NO_SVE` set at build time. That finding outweighs every kernel question in
+   the repo and changes what gets published first. An unrecognised MIDR is not
+   that case: an unrecognised SVE part gets `ARMV8SVE`, which is *more* SVE
+   kernels than a recognised Graviton 4/5 gets. Record it as an interesting and
+   possibly good finding, not an alarm.
 9. **Session-end status comment** on the active umbrella issue: what ran, what
    the gate said, what is blocked, what you need from Scott.
 

@@ -20,7 +20,7 @@ until it finds something.
   explicitly** — the profile defaults to `us-west-2`, but the campaign is pinned
   to `us-east-1`/`us-east-2`, the only regions carrying all five families.
 
-## The ten standing orders
+## The eleven standing orders
 
 1. **Measured peak, never theoretical.** The primary denominator is the best
    GFLOP/s any arm achieved on that host. `peak_fma` is a cross-check only; if
@@ -45,12 +45,28 @@ until it finds something.
 7. **Report costs before spending.** Estimate instance-hours per phase and put
    it in the umbrella issue before launching. Terminate on completion; nothing
    idles overnight.
-8. **Stop and escalate** if `capture-env.sh` reports an unrecognised MIDR or a
-   `DYNAMIC_ARCH`→generic-`ARMV8` fallback on any host. That finding outweighs
-   every kernel question in this repo and changes what gets published first.
-9. **Session-end status comment** on the active umbrella issue: what ran, what
+8. **Stop and escalate** if `capture-env.sh` reports generic `ARMV8` selected on
+   a host that *has* SVE, or `NO_SVE` in the build. That means SVE detection
+   itself failed, and it outweighs every kernel question in this repo.
+   An unrecognised MIDR is **not** that case, and the earlier version of this
+   order had the direction backwards. `dynamic_arm64.c` falls through the
+   implementer switch to an `HWCAP_SVE` test *before* `return NULL`, so an
+   unrecognised SVE part gets `ARMV8SVE` and its 94 SVE kernels, while a
+   recognised Neoverse V2/V3 gets `NEOVERSEV2`→`NEOVERSEN2` and 5. Being in the
+   dispatch table is a downgrade. Record an unrecognised MIDR as an interesting
+   and possibly *good* finding, and read it against the `ARMV8SVE` arm.
+9. **Pin every arm identically, from outside the process.** Never equalise
+   threading by rebuilding a library — `USE_OPENMP=1` changes the threading
+   backend and therefore what is being measured, and pthread OpenBLAS is what
+   the wheels ship. Bind with `taskset`/`numactl` around every arm regardless of
+   backend, choose the NUMA policy from thread count and topology, apply it
+   uniformly, and record both the policy and the threading backend per arm.
+   The original runner set `OMP_PROC_BIND`/`OMP_PLACES` while OpenBLAS was built
+   `USE_OPENMP=0`, so the only arm that obeyed them was the reference arm —
+   a confound the exact size of the effect under study.
+10. **Session-end status comment** on the active umbrella issue: what ran, what
    the gate said, what is blocked, what is needed from Scott.
-10. **Long jobs run in the background.** `build-libs.sh` is ~40 minutes and the
+11. **Long jobs run in the background.** `build-libs.sh` is ~40 minutes and the
     sweeps are longer. Launch them backgrounded and pick them up on completion;
     never block on `sleep` or a fixed timeout.
 
@@ -69,7 +85,7 @@ under `gates/` that exits 0/1 and prints its evidence.
 | gate | requires |
 |---|---|
 | `gates/p0.sh` | CI green on a clean clone; `make roofline` builds; `bash -n` clean |
-| `gates/p1.sh` | every planted effect recovered; the planted **null** reported as a null, not a weak hit |
+| `gates/p1.sh` | expected-arm census present and read from `build-manifest.ndjson`; every planted effect recovered; the planted **null** reported as a null, not a weak hit, and distinguishable from a missing arm |
 | `gates/p2.sh` | complete NDJSON set from one host; `decompose.py` clean bar genuine findings; `numactl -H` recorded |
 | `gates/p3.sh` | five hosts collected; every `env-*.json` present; no unresolved section-5 anomalies |
 | `gates/p4.sh` | report answers "is the N2 gap worth closing", supported by section 2, stated as a null if that is what the data says |
@@ -81,5 +97,12 @@ under `gates/` that exits 0/1 and prints its evidence.
 - Conventional Commits. Update `CHANGELOG.md` under `## [Unreleased]`.
 - Delegate separable work to concurrent subagents — read-only audits, per-host
   analysis, boilerplate. Keep measurement-policy judgment in the main loop.
+- **`castor.local`/`pollux.local` are instrument checks, never data.** They are
+  NVIDIA DGX Spark (GB10) — Cortex-X925 + Cortex-A725, heterogeneous,
+  SVE2 at VL=128. Real SVE2 silicon and free, so they exercise the whole
+  pipeline including the S3 path, but they are not Neoverse and not Graviton.
+  Quarantine them **by construction, not by discipline**: a distinct `run_id`
+  namespace and a separate output directory, so nothing from them can reach the
+  published dataset even by accident.
 - `results/` and `bin/` are gitignored. Collected campaign results are published
   as release artifacts, not committed.

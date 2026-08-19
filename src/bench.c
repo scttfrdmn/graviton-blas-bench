@@ -28,10 +28,39 @@
 #include <stdint.h>
 #include <float.h>
 
-#define MIN_SECONDS   0.30
-#define MIN_REPS      3
-#define MAX_REPS      200
-#define WARMUP_REPS   2
+/* ---- timing contract --------------------------------------------------- */
+/* A measurement is SAMPLES outer samples, each of which times a BATCH of
+ * back-to-back calls and divides. Batching exists because bracketing every
+ * individual call with now() cost ~31 ns per pair -- 27.9% of the sample at
+ * n=8. A constant additive term does not merely add noise, it COMPRESSES
+ * RATIOS: a true 20% difference in the small regime reads as ~14%. That biases
+ * this campaign toward "no effect found" on its primary conclusion, in the one
+ * size regime where the missing GEMM_SMALL_* path is expected to show. An
+ * instrument whose error points at its own null hypothesis is not usable.
+ *
+ * With a 1 ms batch floor the same 31 ns is 0.003% of a sample.
+ *
+ * MIN_SAMPLES is 8 rather than the old MIN_REPS of 3 because at 3 samples
+ * p50 = samples[1] and p90 = samples[(int)(0.9*2)] = samples[1] -- the same
+ * element. The min/p50 spread that README §Measurement discipline relies on to
+ * detect a noisy neighbour did not exist for any LARGE level-3 case, which is
+ * exactly where each rep is expensive and a stolen timeslice hurts most.
+ *
+ * MAX_MEASURE_SECONDS bounds the wall-clock cost of one case, and
+ * ABS_MIN_SAMPLES is the floor it may drive SAMPLES down to. The largest cases
+ * (8192-cube DGEMM at one thread is ~37 s per call) still land on
+ * ABS_MIN_SAMPLES, so they cost what they cost today; the added samples are
+ * paid for only where a call is cheap.
+ */
+#define MIN_SECONDS          0.30      /* of real BLAS work per measurement  */
+#define MIN_BATCH_SECONDS    1.0e-3    /* inner batch duration floor         */
+#define CAL_MIN_SECONDS      1.0e-4    /* calibration interval floor         */
+#define MAX_BATCH            1000000L  /* backstop, not normally reached     */
+#define ABS_MIN_SAMPLES      3         /* fewest that admit any statistic    */
+#define MIN_SAMPLES          8         /* fewest that admit p50 != p90       */
+#define MAX_SAMPLES          1000
+#define MAX_MEASURE_SECONDS  3.0       /* wall-clock cap for one case        */
+#define WARMUP_REPS          2
 
 /* ---- Fortran BLAS ABI ------------------------------------------------- */
 extern void dgemm_(const char*, const char*, const int*, const int*, const int*,
@@ -65,6 +94,35 @@ static double now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + 1e-9 * ts.tv_nsec;
+}
+
+/* Measured cost of the now() pair that brackets a timed region. Recorded in
+   every record so a reader can check for themselves that batching made it
+   negligible, rather than taking that on faith. */
+static double g_timer_overhead = 0.0;
+
+/* Smallest observable nonzero gap between two consecutive reads. This is a
+   DIFFERENT quantity from the overhead above and the distinction is
+   load-bearing: on Apple Silicon the mach timebase is 24 MHz, so the
+   resolution is ~41.7 ns while the amortised cost of a read is ~30 ns. An
+   averaged overhead measurement stays accurate under a coarse clock, so it
+   cannot warn you about one -- see TIMED_LOOP stage 1 for what that cost. */
+static double g_timer_res = 0.0;
+
+static void calibrate_timer(void) {
+    enum { N = 4096 };
+    double t0 = now();
+    for (int i = 0; i < N; i++) { double a = now(); (void)a; }
+    /* two clock reads per timed region */
+    g_timer_overhead = 2.0 * (now() - t0) / (double)N;
+
+    double best = 1.0;
+    for (int i = 0; i < 65536; i++) {
+        double a = now(), b = now();
+        double d = b - a;
+        if (d > 0.0 && d < best) best = d;
+    }
+    g_timer_res = (best < 1.0) ? best : 0.0;
 }
 
 static int cmp_double(const void *a, const void *b) {
@@ -102,11 +160,21 @@ static void fill_s(float  *p, size_t n) { for (size_t i = 0; i < n; i++) p[i] = 
  *   low-MEDIUM regimes, which is exactly where the campaign expects to find
  *   the missing GEMM_SMALL_* / generic-TRSM deficit.
  *
- *   Fix: unit diagonal, and off-diagonals scaled by 1/n. Off-diagonal
- *   magnitude is then <= 0.005/n, so the worst-case row sum is <= 0.005
- *   against a diagonal of 1.0 -- MORE diagonally dominant than before, at
- *   every n, while the operator gain is ~1.005 instead of ~n. Over 200 reps
- *   that is a bounded factor of about 2.8 rather than n^200.
+ *   Fix: unit diagonal, and off-diagonals scaled by TRI_OFFDIAG/n so the
+ *   worst-case row sum is <= TRI_OFFDIAG/2 against a diagonal of 1.0 -- MORE
+ *   diagonally dominant than before, at every n, while the operator gain is
+ *   1 + TRI_OFFDIAG/2 instead of ~n.
+ *
+ *   TRI_OFFDIAG must be chosen against the TOTAL call count, not the sample
+ *   count. TIMED_LOOP batches, so the calls per measurement are
+ *   MAX_SAMPLES * MAX_BATCH = 1e9 in the worst case, not the 200 the first
+ *   version of this fix assumed. At 1e-9 the bound over 1e9 calls is
+ *   (1 + 5e-10)^1e9 = e^0.5 ~ 1.65 -- and that is the pessimistic monotone
+ *   bound; the off-diagonals are signed, so the real drift is a random walk.
+ *
+ *   Off-diagonals are then ~1e-12 at n=1000. Still normal FP64 by 296 orders
+ *   of magnitude, so no subnormal arithmetic is introduced -- which would have
+ *   been its own timing artifact.
  *
  *   alpha stays 1.0 deliberately: scaling by alpha would also fix the growth,
  *   but many libraries have an alpha==1 fast path, and taking a different code
@@ -115,8 +183,9 @@ static void fill_s(float  *p, size_t n) { for (size_t i = 0; i < n; i++) p[i] = 
  *   Flop count and memory access pattern are unchanged by operand values, so
  *   this costs nothing in what the benchmark measures.
  */
+#define TRI_OFFDIAG 1.0e-9
 static void fill_tri_d(double *p, int n, int ld) {
-    const double off = 0.01 / (double)n;
+    const double off = TRI_OFFDIAG / (double)n;
     for (int j = 0; j < n; j++)
         for (int i = 0; i < n; i++)
             p[(size_t)j*ld + i] = (i == j) ? 1.0 : off * rng_next();
@@ -227,6 +296,7 @@ static int verify_gemm_corner(const double *A, int lda, const double *B, int ldb
 static const char *g_host, *g_instance, *g_library, *g_target, *g_build,
                   *g_run_id, *g_arch_selected;
 static int g_threads;
+static long g_batch = 1;   /* set by TIMED_LOOP */
 
 static void emit(const char *routine, int m, int n, int k, int lda_pad,
                  double *samples, int reps, double flops, int verified,
@@ -261,31 +331,62 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"library\":\"%s\",\"target\":\"%s\",\"build\":\"%s\","
            "\"arch_selected\":\"%s\",\"threads\":%d,"
            "\"routine\":\"%s\",\"m\":%d,\"n\":%d,\"k\":%d,\"lda_pad\":%d,"
-           "\"reps\":%d,\"t_min\":%.9g,\"t_p50\":%.9g,\"t_p90\":%.9g,"
+           "\"reps\":%d,\"batch\":%ld,\"calls\":%ld,"
+           "\"timer_overhead_ns\":%.3f,\"timer_res_ns\":%.3f,"
+           "\"t_min\":%.9g,\"t_p50\":%.9g,\"t_p90\":%.9g,"
            "\"gflops\":%.6f,\"gflops_p50\":%.6f,\"verified\":%s,\"note\":\"%s\"}\n",
            g_run_id, g_host, g_instance, g_library, g_target, g_build,
            g_arch_selected, g_threads,
-           routine, m, n, k, lda_pad, reps, tmin, p50, p90,
+           routine, m, n, k, lda_pad,
+           reps, g_batch, (long)reps * g_batch,
+           g_timer_overhead * 1e9, g_timer_res * 1e9,
+           tmin, p50, p90,
            gf, gf_p50,
            vstr, note ? note : "");
     fflush(stdout);
 }
 
 /* ---- per-routine drivers ----------------------------------------------- */
-#define TIMED_LOOP(CALL)                                                    \
-    do {                                                                    \
-        for (int w = 0; w < WARMUP_REPS; w++) { CALL; }                     \
-        double t0 = now(); CALL; double one = now() - t0;                   \
-        int reps = (int)(MIN_SECONDS / (one > 1e-9 ? one : 1e-9));          \
-        if (reps < MIN_REPS) reps = MIN_REPS;                               \
-        if (reps > MAX_REPS) reps = MAX_REPS;                               \
-        double *_s = realloc(samples, (size_t)reps * sizeof(double));       \
-        if (!_s) { fprintf(stderr, "gbb: sample realloc failed\n"); exit(2); } \
-        samples = _s;                                                       \
-        for (int r = 0; r < reps; r++) {                                    \
-            double a = now(); CALL; samples[r] = now() - a;                 \
-        }                                                                   \
-        nreps = reps;                                                       \
+/* Sets g_batch as a side effect, read by emit(). A macro cannot return two
+   values and the alternative is editing all nine call sites; this file already
+   passes provenance through file-scope globals, so it is consistent. */
+#define TIMED_LOOP(CALL)                                                      \
+    do {                                                                      \
+        for (int w = 0; w < WARMUP_REPS; w++) { CALL; }                       \
+        /* Stage 1: grow a batch until the interval is long enough that the    \
+           clock's RESOLUTION is not what we are measuring. Timing ONE call to \
+           size the batch does not work: at n=8 a dgemm call is ~58 ns, below  \
+           the 41.7 ns tick on some hosts, so it reads as 0, gets clamped, and \
+           the batch is sized from garbage. Measured, not hypothetical -- it   \
+           overshot by 58x and turned a 0.3 s measurement into 17.6 s. */      \
+        long _b = 1; double _cal = 0.0;                                        \
+        for (;;) {                                                             \
+            double _c0 = now();                                                \
+            for (long _i = 0; _i < _b; _i++) { CALL; }                          \
+            _cal = now() - _c0;                                                \
+            if (_cal >= CAL_MIN_SECONDS || _b >= MAX_BATCH) break;              \
+            _b *= 4;                                                           \
+        }                                                                      \
+        double _one = _cal / (double)_b;                                        \
+        if (!(_one > 0.0)) _one = CAL_MIN_SECONDS / (double)_b;                 \
+        /* Stage 2: batch so the now() pair is noise; sample so p50 != p90. */ \
+        long _bs = (long)(MIN_BATCH_SECONDS / _one) + 1;                        \
+        if (_bs > MAX_BATCH) _bs = MAX_BATCH;                                   \
+        double _per = (double)_bs * _one;                                       \
+        int _ns = (int)(MIN_SECONDS / _per) + 1;                                \
+        if (_ns < MIN_SAMPLES) _ns = MIN_SAMPLES;                               \
+        if (_ns > MAX_SAMPLES) _ns = MAX_SAMPLES;                               \
+        int _fit = (int)(MAX_MEASURE_SECONDS / _per);                            \
+        if (_ns > _fit) _ns = (_fit > ABS_MIN_SAMPLES) ? _fit : ABS_MIN_SAMPLES; \
+        double *_p = realloc(samples, (size_t)_ns * sizeof(double));            \
+        if (!_p) { fprintf(stderr, "gbb: sample realloc failed\n"); exit(2); }  \
+        samples = _p;                                                          \
+        for (int r = 0; r < _ns; r++) {                                          \
+            double _a = now();                                                 \
+            for (long _i = 0; _i < _bs; _i++) { CALL; }                         \
+            samples[r] = (now() - _a) / (double)_bs;                             \
+        }                                                                       \
+        nreps = _ns; g_batch = _bs;                                             \
     } while (0)
 
 static void run_dgemm(const Case *c) {
@@ -419,7 +520,8 @@ static void run_level1(const Case *c, const char *which, int incx) {
     }
     (void)sink;
     char note[32]; snprintf(note, sizeof note, "incx=%d", incx);
-    emit(which, n,0,0,0, samples, nreps, case_flops(which,n,0,0), 1, note);
+    emit(which, n,0,0,0, samples, nreps, case_flops(which,n,0,0),
+         VERIFIED_UNCHECKED, note);
     free(samples); free(x); free(y);
 }
 
@@ -458,6 +560,8 @@ int main(int argc, char **argv) {
     g_build         = env_or("GBB_BUILD", "unknown");
     g_arch_selected = env_or("GBB_ARCH_SELECTED", "unknown");
     g_threads       = atoi(env_or("GBB_THREADS", "1"));
+
+    calibrate_timer();
 
     const char *only = (argc > 1) ? argv[1] : "all";
     #define WANT(r) (!strcmp(only,"all") || !strcmp(only,(r)))

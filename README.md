@@ -38,6 +38,12 @@ code, only kernel selection.
 is what distro packages and NumPy wheels actually ship, so what it selects at
 runtime on each host is a finding in its own right, not bookkeeping.
 
+`ARMV8SVE` is **not** a control. `KERNEL.ARMV8SVE` is the file
+`KERNEL.NEOVERSEN2` conspicuously does not include, so the `ARMV8SVE` arm is
+the closest thing in-tree to "what Graviton 4 would get if the N2
+kernel-selection gap were closed." It is a first-class experimental arm and runs
+on every host.
+
 ## Quickstart
 
 Per host:
@@ -106,11 +112,30 @@ analysis/decompose.py  the five reports plus an anomaly section
   much larger L3 on Gv5. Large-N DGEMM partly measures that rather than kernel
   quality, which is why the small and medium regimes are reported separately
   and the triad bandwidth is captured alongside.
-- **An unrecognised MIDR is a result, not an error.** OpenBLAS dispatch falls
-  back to generic `ARMV8` for any part not in its switch. If that happens on
-  `c9g`, default NumPy on the newest Graviton is running plain NEON, which
-  outweighs every kernel question in this repo. `capture-env.sh` warns on it and
-  `decompose.py` promotes it to the top of the anomaly section.
+- **An unrecognised MIDR is a result, and the direction of that result was
+  predicted backwards here.** This file used to say that OpenBLAS dispatch
+  falls back to generic `ARMV8` for any part not in its switch, and that a
+  newer NumPy wheel on `c9g` would therefore be running plain NEON. That
+  prediction was not merely unproven, it was inverted. When the implementer/part
+  switch in `kernel/arm64/dynamic_arm64.c` falls through it checks SME, then
+  `HWCAP_SVE`, and returns `gotoblas_ARMV8SVE` before it ever reaches
+  `return NULL`. Generic `ARMV8` is reachable only for a part that is
+  unrecognised *and* has no SVE at all. Confirmed empirically: an OpenBLAS
+  0.3.30 `DYNAMIC_ARCH` build on Cortex-X925/A725 (parts `0xd85`/`0xd87`,
+  neither in the switch, both SVE2-capable) reports
+  `openblas_get_corename() -> armv8sve`. So an unrecognised SVE part inherits
+  the full SVE kernel set — 94 kernels — while a recognised Graviton 4/5 maps
+  `NEOVERSEV2`→`NEOVERSEN2` and gets 5. Being present in the dispatch table is a
+  **downgrade** for Neoverse V2/V3, and a NumPy wheel that does *not* recognise
+  the chip may be faster than one that does. `capture-env.sh` and `decompose.py`
+  still surface an unrecognised part; their wording follows the old prediction
+  and is being corrected with it.
+- **The alarming dispatch outcome is narrower than the above.** Generic `ARMV8`
+  selected on a host that *has* SVE would mean the SVE detection itself failed;
+  `NO_SVE` set at build time would mean the SVE kernels were never compiled in.
+  Either of those outweighs every kernel question in this repo. Unrecognised
+  *with* SVE does not — that is an interesting and possibly good finding, not an
+  alarm.
 
 ## Practical notes
 
@@ -135,4 +160,6 @@ analysis/decompose.py  the five reports plus an anomaly section
   the one place an SVE2 argument (TBL2/TBX, FCVTLT/FCVTNT) actually holds up.
 - Deficit concentrated in the small regime → the missing `GEMM_SMALL_*` path on
   the N2 target, the cheapest possible fix.
-- A generic-`ARMV8` fallback anywhere → report that first.
+- Generic `ARMV8` selected on a host that has SVE, or `NO_SVE` in the build →
+  report that first. An unrecognised part landing on `ARMV8SVE` is a different
+  thing: read it against the `ARMV8SVE` arm, not as an alarm.
