@@ -678,7 +678,23 @@ export GBB_BUILD
 
 while IFS=$'\t' read -r LIB TGT EXE BACKEND SHA BUILT RUNNABLE REASON; do
   [ -n "$LIB" ] || continue
-  [ "$LIB" = reference ] && continue   # correctness control, never timed
+
+  # netlib reference: a correctness control, never timed. It is declined here, so
+  # standing order 11 applies -- "every arm the runner declines to run writes a
+  # census record saying why". It used to `continue` before reaching census(),
+  # which left build-libs.sh's manifest claiming built:true/runnable:true for an
+  # arm that produced no records and no reason. decompose.py was right to call
+  # that an unexplained hole; it just happened in every dataset, which would have
+  # put 36 MISSING-UNEXPLAINED cells and exit bit 4 on the first real P2 run
+  # against a gate that requires zero of them.
+  if [ "$LIB" = reference ]; then
+    for T in $THREADS; do
+      census "$LIB" "$TGT" "" "" "$T" skipped 0 0 "$BACKEND" "${PIN_DESC[$T]}" \
+        "netlib correctness control, never timed -- not a performance arm"
+    done
+    log "skip $LIB/$TGT: correctness control, never timed"
+    continue
+  fi
 
   if [ "$BUILT" != 1 ]; then
     for T in $THREADS; do

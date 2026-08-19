@@ -36,11 +36,17 @@ number. Everything else was renumbered around them.
   6. scaling          GFLOP/s vs threads against the measured all-core peak.
   7. coverage census  every expected cell classified. MISSING-UNEXPLAINED is the
                       one that matters: a hole nothing accounts for.
+  8. replicates       P3 runs each host family twice on different physical boxes.
+                      The passes are COMPARED, never pooled: the whole point of
+                      the second pass is whether the first one reproduces, and a
+                      median across the two would convert the campaign's strongest
+                      evidence into slightly tighter error bars.
 
   VERDICT             one machine-greppable line computed from the data.
 
 EXIT CODES -- load-bearing, because gates/p1.sh has to be able to assert on
-something. 2, 4 and 8 are bit flags and are OR-ed together; 1 is returned alone.
+something. 2, 4, 8 and 16 are bit flags and are OR-ed together; 1 is returned
+alone.
 
   0  clean
   1  nothing usable was loaded (no bench records at all)
@@ -48,13 +54,21 @@ something. 2, 4 and 8 are bit flags and are OR-ed together; 1 is returned alone.
      GFLOP/s record, a non-performance governor, SMT, heterogeneous cores, a
      cgroup CPU quota, OPENBLAS_CORETYPE forcing proved unavailable, SVE
      detection having failed on a host that has SVE, an OpenBLAS build with no SVE
-     kernel symbols in it on a host that has SVE, or an arm that refused to
-     measure because its coretype label and its loaded library disagreed
+     kernel symbols in it on a host that has SVE, an arm that refused to
+     measure because its coretype label and its loaded library disagreed, a host
+     whose provenance refusal was overridden with GBB_ESCALATION_ACK, or a results
+     directory holding more than one role
   4  unexplained coverage hole: an expected (arm, condition) cell is absent --
      wholly, or short some of its sizes -- and neither the build manifest, the run
      census, nor an exclusion this file made accounts for it
-  8  provenance incomplete: a bench record whose instance has no env-*.json, or
-     conflicting blas_sha for the same library/target
+  8  provenance incomplete: a bench record whose instance has no env-*.json,
+     conflicting blas_sha for the same library/target, or an SVE host whose build
+     could not be checked for SVE kernel symbols at all (`sve_kernels:unknown`,
+     which build-libs.sh defines as "could not look", not as "fine")
+ 16  the headline does not reproduce: two independent passes on the same instance
+     type and different physical boxes reached different verdicts. Not the same
+     failure as noise -- the parity band already absorbs noise -- so it gets its
+     own bit rather than widening the meaning of 2
 
 Usage:
     python3 decompose.py results/ [--min-effect 0.05] [--json out.json]
@@ -126,17 +140,98 @@ DEFAULT_MAX_LISTED = 20
 UNRECOGNISED = "UNRECOGNISED"
 LSCPU_DEFAULTED = "lscpu produced no topology"
 
-# Census statuses that mean the arm ran, and therefore explain nothing about a
-# cell it failed to produce. run-matrix.sh emits five: measured, runtime_failed,
-# build_failed, unrunnable, mislabelled. Only the last four are explanations.
+# Census statuses that mean the arm ran, and therefore explain NOTHING about a
+# cell it failed to produce. run-matrix.sh emits nine:
+#
+#   measured             the arm ran                       -- not an explanation
+#   aliased              the arm is ABOUT TO run under a coretype the library
+#                        reports by another name; written before the run and
+#                        followed by the run itself -- not an explanation
+#   skipped              declined by policy (netlib control) -- explanation
+#   build_failed         explanation
+#   unrunnable           explanation (ISA absent, or forcing not honoured)
+#   runtime_failed       explanation
+#   mislabelled          explanation
+#   alias_duplicate      explanation (the kernel set is already being measured)
+#   forced_invalid_host  explanation, host-level not arm-level
 #
 # `mislabelled` is the one that must never be read as a flake: bench.c's
 # in-process openblas_get_corename() disagreed with the probe the runner ran in a
 # separate process, so the arm refused to measure rather than write records under
 # a label belonging to a different library. A retry reproduces it.
-CENSUS_SUCCESS = frozenset({"measured", "ok"})
+#
+# `aliased` is the one that matters most in practice, because it is the EXPECTED
+# path on the campaign's own hosts: standing order 8 records that OpenBLAS
+# resolves NEOVERSEV2 -> NEOVERSEN2, so the V2 coretype arm on a recognised V2/V3
+# part is censused `aliased` on every real run. Reading it as an explanation would
+# have let a genuine hole in the campaign's central arm be accounted for by a line
+# that says "running it".
+CENSUS_SUCCESS = frozenset({"measured", "ok", "aliased"})
+
+# Libraries that appear in the manifest or the census but are not performance
+# arms and write no bench records. Counting one of these among the expected BENCH
+# arms makes every condition on the host a MISSING-UNEXPLAINED cell (36 on a
+# one-host dataset: one per threads x routine x regime x lda_pad x incx group) and
+# sets exit bit 4 on a perfectly clean dataset -- which would have made every real
+# P2 run look broken while gate P2 demands zero MISSING-UNEXPLAINED, i.e. the one
+# flag saying "you have a coverage hole" would have been the one flag guaranteed
+# to be lying.
+#
+#   roofline   run-matrix.sh censuses the peak_fma cross-check as an arm, because
+#              an absent denominator is a gap needing a stated reason like any
+#              other. It writes roofline-*.ndjson, not bench-*.ndjson.
+#   reference  netlib libblas. build-libs.sh builds it as a correctness control
+#              and records it built:true/runnable:true; run-matrix.sh skips it
+#              explicitly -- "correctness control, never timed".
+#   host       not a library at all. run-matrix.sh uses the census arm slots for a
+#              host-level `forced_invalid_host` record when GBB_FORCE_INVALID_HOST
+#              overrides a refusal, writing library=host/target=host. Same failure
+#              mode as the other two, reachable whenever that override is used.
+#
+# Both were found by the P1 fixtures, roofline first and reference only after an
+# adversarial pass noticed the fix had been applied to one library and not the
+# class. Prefer widening this set to special-casing at a use site: the question
+# "does this library produce bench records" has one answer, and it belongs here.
+NON_BENCH_LIBRARIES = frozenset({"roofline", "reference", "host"})
+
+# Every record carries the role run-matrix.sh derived for the host it came from.
+# Instrument checks (castor/pollux: DGX Spark GB10, Cortex-X925 + A725, SVE2 at
+# VL=128) are real SVE2 silicon and exercise the whole pipeline, but they are not
+# Neoverse and not Graviton, and CLAUDE.md requires they be quarantined "by
+# construction, not by discipline". The producers separate them structurally --
+# distinct output directory, run_id prefix and S3 prefix -- and both bench.c and
+# roofline.c tell the reader "the analysis excludes anything that does not say
+# campaign". Until now the analysis did no such thing: it never read the field.
+# One `aws s3 sync` of a bucket holding both prefixes, or one tarball unpacked
+# into the wrong directory, and GB10 numbers pool into the Graviton dataset in
+# silence -- and because the pool feeds the measured-peak denominator, a faster
+# instrument host also silently defeats standing order 1's headroom check.
+# A record with no role at all predates the field and is taken at its word.
+DEFAULT_ROLE = "campaign"
 
 REGIMES = ("small", "medium", "large")
+
+# The three producers spell "no coretype was forced" three different ways, and an
+# arm is identified by (library, target, coretype) everywhere in this file:
+#
+#   build-libs.sh   manifest arm record   "coretype":null
+#   run-matrix.sh   census arm_outcome    "coretype":""      (run_arm's $ct is empty)
+#   bench.c         bench record          "coretype":"unforced"  (GBB_CORETYPE default)
+#
+# Untranslated, those are three different arms. The manifest's and the census's
+# versions then have no cells, so the coverage census reported the shipped arm as
+# MISSING-UNEXPLAINED and set exit bit 4 on a perfectly clean dataset, while
+# cross_pairs() emitted a phantom second "by target" pair whose every cell was NO
+# DATA. Canonicalise on read, at the one place every record passes through.
+CANON_UNFORCED = "unforced"
+_UNFORCED_SPELLINGS = frozenset({"", "null", "none", "nil", "unforced"})
+
+
+def canon_coretype(v):
+    if v is None:
+        return CANON_UNFORCED
+    s = str(v).strip()
+    return CANON_UNFORCED if s.lower() in _UNFORCED_SPELLINGS else s
 
 
 # ---- regime boundaries ----------------------------------------------------
@@ -200,9 +295,11 @@ class Inputs:
     bad_lines: int = 0
     bad_env_files: list = field(default_factory=list)
     missing_families: list = field(default_factory=list)
+    escalation_acks: list = field(default_factory=list)
+    foreign_roles: dict = field(default_factory=lambda: defaultdict(int))
 
 
-def load(results_dir: pathlib.Path) -> Inputs:
+def load(results_dir: pathlib.Path, role: str = DEFAULT_ROLE) -> Inputs:
     """Read every file family, tolerating absence and partial writes.
 
     A host terminated mid-write used to take the whole analysis down: the bench
@@ -241,17 +338,40 @@ def load(results_dir: pathlib.Path) -> Inputs:
                 continue
             # Dispatch on record shape, not on filename: results collected from
             # several hosts get concatenated by hand more often than not.
+            # The role gate comes before the shape dispatch, so a foreign record
+            # cannot reach any list. Counted rather than merely dropped: a
+            # directory holding two roles means someone's collection path is
+            # broken, and silently analysing the correct subset would leave that
+            # broken path in service.
+            got_role = r.get("role", role)
+            if got_role != role:
+                d.foreign_roles[got_role] += 1
+                continue
             rec = r.get("record")
             if rec == "arm":
+                r["coretype"] = canon_coretype(r.get("coretype"))
                 d.manifest_arms.append(r)
             elif rec == "toolchain":
                 d.toolchains.append(r)
             elif rec == "arm_outcome":
+                r["coretype"] = canon_coretype(r.get("coretype"))
                 d.outcomes.append(r)
             elif "metric" in r:
                 d.roof.append(r)
             elif "routine" in r:
+                r["coretype"] = canon_coretype(r.get("coretype"))
                 d.bench.append(r)
+            elif rec == "escalation_ack":
+                # GBB_ESCALATION_ACK let a sweep proceed on a host that
+                # capture-env.sh had refused (standing order 8). Before this
+                # branch the record matched no shape and was counted as a corrupt
+                # line -- so the one artifact documenting that the campaign's
+                # loudest interlock had been overridden was filed as data
+                # corruption, at a severity that sets no exit bit. The underlying
+                # condition is still detected independently from env-*.json, which
+                # is what sets the bit; this makes the override itself legible
+                # rather than making it invisible.
+                d.escalation_acks.append(r)
             elif r.get("failed"):
                 d.arm_failures.append(r)
             else:
@@ -287,6 +407,11 @@ class Host:
     invalid: list = field(default_factory=list)  # timings from here are not comparable
     escalate: list = field(default_factory=list)  # standing order 8
     notes: list = field(default_factory=list)
+    # Distinct from both `escalate` and `notes`: the check that standing order 8
+    # relies on could not be performed. Not an escalation, because absent evidence
+    # is not evidence of absence -- but not a note either, because it must set the
+    # provenance bit rather than scroll past in a list nobody greps.
+    provenance_gaps: list = field(default_factory=list)
     cpus_affinity: int | None = None
     forcing: str = "not_probed"
 
@@ -462,7 +587,8 @@ def build_hosts(inp: Inputs) -> dict:
     # run-matrix.sh stamps the instance onto the manifest so the finding is
     # attributable to a host rather than to the dataset.
     for m in inp.manifest_arms:
-        if m.get("sve_kernels") != "no":
+        sve = m.get("sve_kernels")
+        if sve not in ("no", "unknown"):
             continue
         inst = m.get("instance") or "unknown"
         h = hosts.get(inst)
@@ -470,6 +596,23 @@ def build_hosts(inp: Inputs) -> dict:
             # No SVE on this host means no SVE kernels is the correct outcome,
             # and an unstamped/unknown instance is a provenance gap, not this
             # finding -- section 7 owns that.
+            continue
+        if sve == "unknown":
+            # build-libs.sh defines `unknown` as "we could not look" -- no nm, or
+            # no readable archive -- and NOT as "the symbols are fine". Testing
+            # `!= "no"` treated it as fine, so the quiet trigger for standing
+            # order 8 switched itself off in exactly the case where the check
+            # could not be performed. That is the wrong direction to fail in on
+            # the campaign's central hardware axis. It is not an escalation
+            # either, because absent evidence is not evidence of absence: it is a
+            # provenance hole, and standing order 5 says a number without
+            # provenance is not admissible.
+            h.provenance_gaps.append(
+                f"{inst}: whether the {m.get('library')}/{m.get('target')} build contains SVE "
+                f"kernel symbols is UNKNOWN -- build-libs.sh could not read the archive. On a "
+                f"host that reports SVE this leaves standing order 8's quiet trigger unchecked; "
+                f"re-run build-libs.sh with nm available before trusting any SVE-coretype arm."
+            )
             continue
         h.escalate.append(
             f"{inst}: the {m.get('library')}/{m.get('target')} build contains no SVE kernel "
@@ -559,6 +702,13 @@ def build_cells(bench, hosts, exc: Excluded):
         arm = arm_of(r)
         gf = r.get("gflops")
         ver = r.get("verified")
+        # incx is part of the condition, not a footnote. run_level1 runs the same
+        # (routine, m, n, k, lda_pad) at stride 1 and stride 4, so without incx
+        # here the two collapse into one cell and the min-within-run rule keeps
+        # the slower of the two -- deleting the stride axis the campaign names as
+        # the arm64 tree's weakest point. Records written before bench.c carried
+        # the field default to 1, which is correct for every level-3 routine and
+        # merges the old level-1 pairs exactly as they used to merge.
         cond = (
             inst,
             r.get("threads"),
@@ -567,20 +717,30 @@ def build_cells(bench, hosts, exc: Excluded):
             r.get("n"),
             r.get("k"),
             r.get("lda_pad"),
+            r.get("incx", 1),
         )
-        if ver is False:
-            exc.verified_false.append(r)
-            exc.dropped.add((cond, arm))
-            continue
         if not isinstance(gf, (int, float)) or isinstance(gf, bool):
             exc.no_gflops += 1
             exc.dropped.add((cond, arm))
             continue
+        # Order matters, and it used to be the other way round. A real
+        # measurement can never be 0; bench.c emits 0 to say the timer was
+        # outrun -- and at src/bench.c:381 the same branch also forces
+        # `verified` to false, because it never ran the verification. So a
+        # timer-outrun record arrives with BOTH markers set, and testing `ver is
+        # False` first classified every one of them as a wrong answer. That made
+        # this branch unreachable on real data and printed "WRONG ANSWER,
+        # excluded" against a kernel that had merely finished too fast to time,
+        # sending the reader after a numerical bug that does not exist. Both
+        # paths exclude the record either way, so the only thing at stake is
+        # which diagnosis the anomaly table shows -- which is the whole value of
+        # the table. The more specific claim wins.
         if gf == 0:
-            # A real measurement can never be 0; bench.c emits 0 to say the
-            # timer was outrun. Excluding it is what stops two dead arms
-            # printing `parity`.
             exc.zero_gflops.append(r)
+            exc.dropped.add((cond, arm))
+            continue
+        if ver is False:
+            exc.verified_false.append(r)
             exc.dropped.add((cond, arm))
             continue
         h = hosts.get(inst)
@@ -852,16 +1012,17 @@ def report_hosts(hosts, bench_instances, out):
 
 
 def cell_groups(cells):
-    """(instance, threads, routine, regime, lda_pad) -> {arm: [conditions]}
+    """(instance, threads, routine, regime, lda_pad, incx) -> {arm: [conditions]}
 
-    lda_pad is in the key, not just in the condition. bench.c puts both strides
-    into one regime, and a median taken across a mix of tight and padded records
-    is a statement about neither -- the same conflation as the max()-over-the-cell
-    bug, one level up. Section 3 is where the two strides are compared."""
+    lda_pad and incx are in the key, not just in the condition. bench.c puts both
+    leading dimensions into one regime and both element strides into one routine,
+    and a median taken across a mix of them is a statement about neither -- the
+    same conflation as the max()-over-the-cell bug, one level up. Section 3 is
+    where the two leading dimensions are compared against each other."""
     g = defaultdict(lambda: defaultdict(list))
     for cond, arm in cells:
-        inst, thr, routine, m, pad = cond[0], cond[1], cond[2], cond[3], cond[6]
-        g[(inst, thr, routine, regime(m or 0), pad)][arm].append(cond)
+        inst, thr, routine, m, pad, incx = cond[0], cond[1], cond[2], cond[3], cond[6], cond[7]
+        g[(inst, thr, routine, regime(m or 0), pad, incx)][arm].append(cond)
     return g
 
 
@@ -886,13 +1047,14 @@ def report_deficit_by_routine(cells, groups, hosts, explain, args, out):
         tag = "" if (h and h.admissible) else "  [HOST-NOT-ADMISSIBLE]"
         for k in sorted((k for k in groups if k[0] == inst), key=skey):
             arms = groups[k]
-            _, thr, routine, reg, pad = k
+            _, thr, routine, reg, pad, incx = k
             present_refs = [a for a in arms if a in refs]
             if not present_refs:
                 for arm in sorted((a for a in arms if a[0] == "openblas"), key=arm_label):
                     st, why = explain(inst, ("armpl", "native", "unforced"), thr)
                     out(
                         f"  {inst!s:14s} t={thr!s:<4} {routine!s:6s} {reg:6s} pad={pad!s:<3} "
+                        f"incx={incx!s:<2} "
                         f"{arm_label(arm):30s} NO DATA — reference arm absent "
                         f"({st}: {why or 'no reason recorded'})"
                     )
@@ -909,6 +1071,7 @@ def report_deficit_by_routine(cells, groups, hosts, explain, args, out):
                 mark = " SHIPPED" if is_shipped(arm) else ""
                 out(
                     f"  {inst!s:14s} t={thr!s:<4} {routine!s:6s} {reg:6s} pad={pad!s:<3} "
+                    f"incx={incx!s:<2} "
                     f"{arm_label(arm):30s} "
                     f"ob={fmt_val(s['mean_a'])} ref={fmt_val(s['mean_b'])} ({arm_label(ref)}) "
                     f"deficit={fmt_pct(med)} band={100 * s['band']:4.1f}% "
@@ -921,6 +1084,7 @@ def report_deficit_by_routine(cells, groups, hosts, explain, args, out):
                         "routine": routine,
                         "regime": reg,
                         "lda_pad": pad,
+                        "incx": incx,
                         "arm": arm_label(arm),
                         "reference_arm": arm_label(ref),
                         "shipped_arm": is_shipped(arm),
@@ -997,13 +1161,13 @@ def report_target_cross(cells, groups, hosts, explain, inp, args, out):
                 arms = groups[k]
                 conds = sorted(set(arms.get(arm_a, [])) | set(arms.get(arm_b, [])), key=skey)
                 rows = per_size(cells, conds, arm_a, arm_b, args.min_effect)
-                _, thr, routine, reg, pad = k
+                _, thr, routine, reg, pad, incx = k
                 if rows:
                     comparable += 1
                     s = summarise(rows, args, "V1-set", "V2-set")
                     out(
                         f"  {inst!s:14s} t={thr!s:<4} {routine!s:6s} {reg:6s} pad={pad!s:<3} "
-                        f"by={mech:8s} "
+                        f"incx={incx!s:<2} by={mech:8s} "
                         f"V1={fmt_val(s['mean_a'])} V2={fmt_val(s['mean_b'])} "
                         f"delta={fmt_pct(s['median_delta'])} band={100 * s['band']:4.1f}% "
                         f"sizes={s['n_sizes']:<2} (+{s['n_a_ahead']}/-{s['n_b_ahead']}) "
@@ -1026,6 +1190,7 @@ def report_target_cross(cells, groups, hosts, explain, inp, args, out):
                         "routine": routine,
                         "regime": reg,
                         "lda_pad": pad,
+                        "incx": incx,
                         "mechanism": mech,
                         "arm_v1": arm_label(arm_a),
                         "arm_v2": arm_label(arm_b),
@@ -1062,7 +1227,7 @@ def report_target_cross(cells, groups, hosts, explain, inp, args, out):
                     shown += 1
                     out(
                         f"  {inst!s:14s} t={k[1]!s:<4} {k[2]!s:6s} {k[3]:6s} pad={k[4]!s:<3} "
-                        f"by={mech2:8s} NO DATA — {arm_label(missing)} absent "
+                        f"incx={k[5]!s:<2} by={mech2:8s} NO DATA — {arm_label(missing)} absent "
                         f"({st}: {why or 'no reason recorded'}); {arm_label(other)} present"
                     )
                 if len(deferred) > shown:
@@ -1085,8 +1250,8 @@ def report_lda_penalty(cells, hosts, args, out):
     tight = {}
     padded = {}
     for (cond, arm), c in cells.items():
-        inst, thr, routine, m, n, k, pad = cond
-        base = (inst, arm, thr, routine, m, n, k)
+        inst, thr, routine, m, n, k, pad, incx = cond
+        base = (inst, arm, thr, routine, m, n, k, incx)
         if pad == 0:
             tight[base] = c
         elif pad:
@@ -1099,7 +1264,7 @@ def report_lda_penalty(cells, hosts, args, out):
             cp = padded[pad][base]
             if ct is None:
                 continue
-            inst, arm, thr, routine, m, _n, _k = base
+            inst, arm, thr, routine, m, _n, _k, incx = base
             pen = rel(ct.value, cp.value)
             band = band_for(ct, cp, args.min_effect)
             h = hosts.get(inst)
@@ -1126,6 +1291,7 @@ def report_lda_penalty(cells, hosts, args, out):
                     "routine": routine,
                     "m": m,
                     "lda_pad": pad,
+                    "incx": incx,
                     "regime": regime(m or 0),
                     "tight": ct.value,
                     "padded": cp.value,
@@ -1162,19 +1328,28 @@ def report_regime_profile(deficits, cross, args, out):
     for d in deficits:
         if d.get("median_deficit") is None:
             continue
-        by[(d["instance"], d["threads"], d["arm"], d["routine"], d["lda_pad"], d["reference_arm"])][
-            d["regime"]
-        ] = d
+        by[
+            (
+                d["instance"],
+                d["threads"],
+                d["arm"],
+                d["routine"],
+                d["lda_pad"],
+                d["incx"],
+                d["reference_arm"],
+            )
+        ][d["regime"]] = d
     if not by:
         out("      no reference-arm deficits to profile")
     for k in sorted(by, key=skey):
-        inst, thr, arm, routine, pad, ref = k
+        inst, thr, arm, routine, pad, incx, ref = k
         r = by[k]
         vals = {reg: (r[reg]["median_deficit"] if reg in r else None) for reg in REGIMES}
         gap = None if vals["small"] is None or vals["large"] is None else vals["small"] - vals["large"]
         thin = [reg for reg in REGIMES if reg not in r]
         out(
-            f"      {inst!s:14s} t={thr!s:<4} {arm:30s} {routine!s:6s} pad={pad!s:<3} vs {ref:22s} "
+            f"      {inst!s:14s} t={thr!s:<4} {arm:30s} {routine!s:6s} pad={pad!s:<3} "
+            f"incx={incx!s:<2} vs {ref:22s} "
             f"small={fmt_pct(vals['small'])} medium={fmt_pct(vals['medium'])} "
             f"large={fmt_pct(vals['large'])}  small-large={fmt_pct(gap)}"
             + (f"  MISSING:{','.join(thin)}" if thin else "")
@@ -1186,6 +1361,7 @@ def report_regime_profile(deficits, cross, args, out):
                 "arm": arm,
                 "routine": routine,
                 "lda_pad": pad,
+                "incx": incx,
                 "reference_arm": ref,
                 "small": vals["small"],
                 "medium": vals["medium"],
@@ -1209,18 +1385,20 @@ def report_regime_profile(deficits, cross, args, out):
                 c["arm_v2"],
                 c["routine"],
                 c["lda_pad"],
+                c["incx"],
             )
         ][c["regime"]] = c
     if not by2:
         out("      no comparable target-cross cell in any regime")
     for k in sorted(by2, key=skey):
-        inst, thr, mech, a1, _a2, routine, pad = k
+        inst, thr, mech, a1, _a2, routine, pad, incx = k
         r = by2[k]
         vals = {reg: (r[reg]["median_delta"] if reg in r else None) for reg in REGIMES}
         gap = None if vals["small"] is None or vals["large"] is None else vals["small"] - vals["large"]
         thin = [reg for reg in REGIMES if reg not in r]
         out(
-            f"      {inst!s:14s} t={thr!s:<4} by={mech:8s} {routine!s:6s} pad={pad!s:<3} {a1:24s} "
+            f"      {inst!s:14s} t={thr!s:<4} by={mech:8s} {routine!s:6s} pad={pad!s:<3} "
+            f"incx={incx!s:<2} {a1:24s} "
             f"small={fmt_pct(vals['small'])} medium={fmt_pct(vals['medium'])} "
             f"large={fmt_pct(vals['large'])}  small-large={fmt_pct(gap)}"
             + (f"  MISSING:{','.join(thin)}" if thin else "")
@@ -1232,6 +1410,7 @@ def report_regime_profile(deficits, cross, args, out):
                 "mechanism": mech,
                 "routine": routine,
                 "lda_pad": pad,
+                "incx": incx,
                 "arm_v1": a1,
                 "small": vals["small"],
                 "medium": vals["medium"],
@@ -1282,6 +1461,24 @@ def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, args, out):
         add(".", "file_family_absent", f"no {fam}-*.ndjson/json in results/ — coverage fact, see section 7")
     if inp.bad_lines:
         add("!", "unparseable_lines", f"{inp.bad_lines} unparseable/unclassifiable NDJSON lines were skipped")
+    for a in inp.escalation_acks:
+        add(
+            "!!",
+            "escalation_acked",
+            f"{a.get('host') or a.get('run_id') or 'unknown'}: capture-env.sh refused this host and "
+            f"GBB_ESCALATION_ACK overrode the refusal to let the sweep run. Note given: "
+            f"{a.get('note')!r}. Standing order 8 outweighs every kernel question in the repo, so "
+            f"the override is reported here whether or not the condition is still detectable.",
+        )
+    for role, n in sorted(inp.foreign_roles.items(), key=lambda kv: str(kv[0])):
+        add(
+            "!!",
+            "role_excluded",
+            f"{n} records with role={role!r} were dropped before analysis: this directory holds "
+            f"more than one role. They are excluded correctly, but a collection path that mixes "
+            f"instrument checks with campaign data is broken and stays broken until it is fixed. "
+            f"Instrument hosts are not Neoverse and not Graviton (CLAUDE.md).",
+        )
 
     for inst in sorted(hosts, key=str):
         h = hosts[inst]
@@ -1289,6 +1486,8 @@ def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, args, out):
             add("!!", "escalate", r)
         for r in h.invalid:
             add("!!", "host_invalid", r)
+        for r in h.provenance_gaps:
+            add("!!", "sve_kernels_unknown", r)
         for r in h.notes:
             add(".", "host_note", r)
 
@@ -1515,8 +1714,14 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
     for cond, arm in cells:
         conds_by_inst[cond[0]].add(cond)
         arms_by_inst[cond[0]].add(arm)
-    expected_arms = {(m.get("library"), m.get("target"), m.get("coretype")) for m in inp.manifest_arms}
+    expected_arms = {
+        (m.get("library"), m.get("target"), m.get("coretype"))
+        for m in inp.manifest_arms
+        if m.get("library") not in NON_BENCH_LIBRARIES
+    }
     for o in inp.outcomes:
+        if o.get("library") in NON_BENCH_LIBRARIES:
+            continue
         if o.get("instance") in conds_by_inst or not conds_by_inst:
             expected_arms.add((o.get("library"), o.get("target"), o.get("coretype")))
 
@@ -1527,7 +1732,7 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
         arms = sorted(arms_by_inst[inst] | expected_arms, key=arm_label)
         cellset = defaultdict(list)
         for cond in conds:
-            cellset[(cond[1], cond[2], regime(cond[3] or 0), cond[6])].append(cond)
+            cellset[(cond[1], cond[2], regime(cond[3] or 0), cond[6], cond[7])].append(cond)
         for arm in arms:
             for ck, clist in sorted(cellset.items(), key=skey):
                 thr = ck[0]
@@ -1557,6 +1762,7 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
                             "routine": ck[1],
                             "regime": ck[2],
                             "lda_pad": ck[3],
+                            "incx": ck[4],
                             "status": status,
                             "measured_conditions": have,
                             "expected_conditions": len(clist),
@@ -1613,6 +1819,142 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
         ],
         "inadmissible_hosts": inadmissible,
     }
+
+
+# ---- 8. replicates ---------------------------------------------------------
+
+
+def replicate_passes(inp):
+    """instance_type -> {instance_id -> {run_id, ...}}, read from env-*.json.
+
+    A replicate is the same instance_type on a different instance_id. Both fields
+    are already recorded by capture-env.sh, so this needs no new field and fails
+    safe in the direction that matters: a re-run on the same box shares its
+    instance_id and is correctly not counted as a second pass. run_id is the join
+    key because it is the only field bench records and env files share."""
+    passes = defaultdict(lambda: defaultdict(set))
+    for e in inp.envs:
+        rid, itype, iid = e.get("run_id"), e.get("instance_type"), e.get("instance_id")
+        if rid and itype and iid:
+            passes[itype][iid].add(rid)
+    return passes
+
+
+def _direction(code):
+    """+1 / -1 / 0 for a verdict that makes a claim, None for one that does not."""
+    return {"V1-SET-AHEAD": 1, "V2-SET-AHEAD": -1, "NULL": 0}.get(code)
+
+
+def report_replicates(inp, hosts, explain, args, out):
+    """Each pass analysed alone, then the verdicts compared.
+
+    Deliberately NOT a pooled statistic. P3 spends the second pass to find out
+    whether the first one reproduces; medianing the two would answer a different
+    and much weaker question -- and would do it while looking tidier, which is
+    worse. Every number below comes from one pass and is labelled with its box."""
+    out("\n" + "=" * 78)
+    out("8. REPLICATES  — does the headline survive a second physical machine")
+    out("=" * 78)
+    out("A replicate is the same instance_type on a different instance_id. The passes are")
+    out("compared, never pooled: a median across them would report a number neither pass")
+    out("measured, and would hide the one thing the second pass was bought to test.")
+
+    passes = replicate_passes(inp)
+    payload = []
+    for inst in sorted(passes, key=str):
+        boxes = passes[inst]
+        n_runs = sum(len(v) for v in boxes.values())
+        if len(boxes) < 2:
+            why = f"{len(boxes)} instance_id across {n_runs} run_id(s) — " + (
+                "a re-run on the same physical box is not an independent pass"
+                if n_runs > 1
+                else "one pass only"
+            )
+            out(f"  {inst!s:14s} NO-REPLICATE         {why}")
+            payload.append(
+                {
+                    "instance": inst,
+                    "status": "NO-REPLICATE",
+                    "why": why,
+                    "instance_ids": sorted(boxes, key=str),
+                    "run_ids": sorted((r for v in boxes.values() for r in v), key=str),
+                    "passes": [],
+                }
+            )
+            continue
+
+        per = []
+        for iid in sorted(boxes, key=str):
+            rids = boxes[iid]
+            bench = [r for r in inp.bench if r.get("run_id") in rids]
+            # A fresh Excluded per pass: exc is a report of what this file dropped,
+            # and adding the same dropped record to the campaign-level tally once
+            # per pass would inflate section 5's counts.
+            pcells = build_cells(bench, hosts, Excluded())
+            pcross = report_target_cross(
+                pcells, cell_groups(pcells), hosts, explain, inp, args, lambda _line: None
+            )
+            v = compute_verdict(pcross, hosts, args)
+            per.append(
+                {
+                    "instance_id": iid,
+                    "run_ids": sorted(rids, key=str),
+                    "cells": len(pcells),
+                    "verdict_code": v["code"],
+                    "median_delta": v["median_delta"],
+                    "cells_comparable": v["cells_comparable"],
+                }
+            )
+            out(
+                f"  {inst!s:14s} {iid!s:22s} runs={','.join(sorted(map(str, rids))):24s} "
+                f"cells={len(pcells):<5} comparable={v['cells_comparable']:<4} "
+                f"median={fmt_pct(v['median_delta'])} {v['code']}"
+            )
+
+        codes = {p["verdict_code"] for p in per}
+        dirs = {_direction(p["verdict_code"]) for p in per}
+        if len(codes) == 1:
+            status = "REPRODUCES"
+            note = f"both passes: {next(iter(codes))}"
+        elif None not in dirs and len(dirs) > 1:
+            status = "DIVERGES-DIRECTION"
+            note = (
+                f"the passes do not reproduce: {', '.join(sorted(codes))}. These are "
+                f"different answers to the campaign's question, from the same instance "
+                f"type on different boxes; neither is publishable as the headline."
+            )
+        else:
+            status = "DIVERGES-INCONCLUSIVE"
+            note = (
+                f"the passes do not reproduce: {', '.join(sorted(codes))}. At least one "
+                f"pass reached no directional verdict, so the disagreement is about "
+                f"whether the effect was measurable, not about its sign."
+            )
+        out(f"  {inst!s:14s} {status:20s} {note}")
+
+        deltas = [p["median_delta"] for p in per if p["median_delta"] is not None]
+        spread = (max(deltas) - min(deltas)) if len(deltas) > 1 else None
+        if spread is not None:
+            # Reported, never gated on. Two boxes of the same instance type differ
+            # in ways this campaign does not control, and turning that into a
+            # pass/fail would be tuning the analysis. The claim under test is the
+            # verdict; the spread is context for reading it.
+            out(f"  {inst!s:14s} pass-to-pass spread of the median delta: {fmt_pct(spread)}")
+        payload.append(
+            {
+                "instance": inst,
+                "status": status,
+                "why": note,
+                "instance_ids": sorted(boxes, key=str),
+                "run_ids": sorted((r for v in boxes.values() for r in v), key=str),
+                "median_delta_spread": spread,
+                "passes": per,
+            }
+        )
+
+    if not payload:
+        out("  no env-*.json carries both instance_type and instance_id: replicates unknowable")
+    return payload
 
 
 # ---- verdict ---------------------------------------------------------------
@@ -1713,7 +2055,7 @@ def compute_verdict(cross, hosts, args):
     }
 
 
-def report_verdict(verdict, lda, regimes, coverage, anomalies, exit_code, args, out):
+def report_verdict(verdict, lda, regimes, coverage, anomalies, replicates, exit_code, args, out):
     out("\n" + "=" * 78)
     out("DECISION")
     out("=" * 78)
@@ -1732,6 +2074,17 @@ def report_verdict(verdict, lda, regimes, coverage, anomalies, exit_code, args, 
     poisonous = [a for a in anomalies if a["severity"] == "!!"]
     if poisonous:
         out(f"  VERDICT-CAVEAT: {len(poisonous)} hard anomalies in section 5.")
+    diverged = [r for r in replicates if r["status"].startswith("DIVERGES")]
+    if diverged:
+        # Printed as a caveat on the verdict line rather than folded into it: the
+        # pooled verdict above is still what the pooled data says, and overwriting
+        # it here would hide which of the two claims is being reported.
+        out(
+            f"  VERDICT-CAVEAT: the headline does not reproduce on "
+            f"{', '.join(str(r['instance']) for r in diverged)} — independent passes on "
+            f"different physical boxes disagree (section 8). The line above is the pooled "
+            f"reading and should not be published while that holds."
+        )
 
     # Consequences are printed only for findings the data actually shows. The
     # old guide stated all of them unconditionally, which is why the gate could
@@ -1754,7 +2107,10 @@ def report_verdict(verdict, lda, regimes, coverage, anomalies, exit_code, args, 
             f"  CONSEQUENCE: deficit concentrated in the small regime in {len(small_led)} profiles "
             f"(median small-large {100 * med:+.1f}%) — the missing GEMM_SMALL_* path."
         )
-    out(f"  EXIT: {exit_code} (0 clean; 2 poisoned/inadmissible, 4 coverage hole, 8 provenance, OR-ed)")
+    out(
+        f"  EXIT: {exit_code} (0 clean; 2 poisoned/inadmissible, 4 coverage hole, "
+        f"8 provenance, 16 does-not-reproduce, OR-ed)"
+    )
 
 
 # ---- main ------------------------------------------------------------------
@@ -1818,15 +2174,52 @@ def parse_args(argv=None):
         default=DEFAULT_MAX_LISTED,
         help=f"cap on items printed per list (default {DEFAULT_MAX_LISTED})",
     )
+    ap.add_argument(
+        "--role",
+        default=DEFAULT_ROLE,
+        help=(
+            f"analyse only records carrying this role (default {DEFAULT_ROLE}). "
+            f"Instrument-check hosts are quarantined by construction; pass --role instrument "
+            f"to look at them deliberately, never to pool them."
+        ),
+    )
     ap.add_argument("--json", type=pathlib.Path, default=None, help="write the machine-readable report here")
     return ap.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
-    inp = load(args.results)
+    inp = load(args.results, role=args.role)
     if not inp.bench:
         print(f"no benchmark records found under {args.results}", file=sys.stderr)
+        # Still write the report. Returning before this made exit code 1 the one
+        # exit code no gate could assert on -- gates/p1.sh treats a missing report
+        # as a scenario failure, so "nothing loaded" and "the analysis crashed"
+        # were indistinguishable to the only consumer that matters. The payload is
+        # deliberately the same schema with empty sections rather than a special
+        # shape, so a caller can read exit_code without branching on the schema.
+        if args.json:
+            args.json.write_text(
+                json.dumps(
+                    {
+                        "schema": "gbb-decompose/1",
+                        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "results_dir": str(args.results),
+                        "inputs": {
+                            "files": dict(sorted(inp.files.items())),
+                            "missing_file_families": inp.missing_families,
+                            "bench_records": 0,
+                            "unparseable_lines": inp.bad_lines,
+                            "foreign_roles": dict(inp.foreign_roles),
+                        },
+                        "verdict": {"code": "NO-DATA", "why": "no bench records were loaded"},
+                        "exit_code": 1,
+                    },
+                    indent=2,
+                    default=str,
+                )
+                + "\n"
+            )
         return 1
 
     hosts = build_hosts(inp)
@@ -1859,6 +2252,7 @@ def main(argv=None):
     anomalies, coverage_table, unver_cells = report_anomalies(inp, cells, hosts, exc, scaling, args, out)
     report_scaling(scaling, out)
     coverage = report_coverage(cells, inp, explain, hosts, exc, args, out)
+    replicates = report_replicates(inp, hosts, explain, args, out)
     verdict = compute_verdict(cross, hosts, args)
 
     exit_code = 0
@@ -1872,10 +2266,25 @@ def main(argv=None):
         exit_code |= 4
     if any(a["kind"] == "arch_selected_mismatch" for a in anomalies):
         exit_code |= 2
-    if any(a["kind"] in ("no_provenance", "blas_sha_conflict", "env_unparseable") for a in anomalies):
+    if any(
+        a["kind"] in ("no_provenance", "blas_sha_conflict", "env_unparseable", "sve_kernels_unknown")
+        for a in anomalies
+    ):
         exit_code |= 8
+    if any(a["kind"] in ("escalation_acked", "role_excluded") for a in anomalies):
+        # Both mean the dataset is not what the directory claims it is: a host the
+        # provenance check refused, or two roles in one place. Same class as an
+        # inadmissible host, so the same bit.
+        exit_code |= 2
+    if any(r["status"].startswith("DIVERGES") for r in replicates):
+        # Its own bit. A non-reproducing headline is not a poisoned record, not a
+        # coverage hole and not a provenance gap: every arm ran, every arm is
+        # accounted for, and the two passes disagree anyway. Folding it into 2
+        # would make "the data is unusable" and "the finding is not real" the same
+        # signal to the gate.
+        exit_code |= 16
 
-    report_verdict(verdict, lda, regimes, coverage, anomalies, exit_code, args, out)
+    report_verdict(verdict, lda, regimes, coverage, anomalies, replicates, exit_code, args, out)
     print("\n".join(lines))
 
     if args.json:
@@ -1903,6 +2312,9 @@ def main(argv=None):
                 "run_ids": run_ids,
                 "unparseable_lines": inp.bad_lines,
                 "unparseable_env_files": [{"file": n, "why": w} for n, w in inp.bad_env_files],
+                "role": args.role,
+                "foreign_roles": dict(inp.foreign_roles),
+                "escalation_acks": len(inp.escalation_acks),
                 "arms": sorted({arm_label(a) for _c, a in cells}),
                 "excluded": {
                     "verified_false": len(exc.verified_false),
@@ -1927,6 +2339,7 @@ def main(argv=None):
             "verification_coverage": coverage_table,
             "unverified_cells": unver_cells,
             "coverage": coverage,
+            "replicates": replicates,
             "exit_code": exit_code,
         }
         args.json.write_text(json.dumps(payload, indent=2, default=str) + "\n")
