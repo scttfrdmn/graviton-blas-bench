@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # The only pinned third-party dependency surface in this repo is the set of
+  # GitHub Actions. OpenBLAS and BLIS are cloned at a ref by
+  # scripts/build-libs.sh, which is deliberately under campaign control rather
+  # than under Dependabot's -- bumping the measured library mid-campaign would
+  # invalidate cross-host comparability.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(ci)"

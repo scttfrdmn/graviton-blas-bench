@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/scttfrdmn/graviton-blas-bench/security/advisories/new
+    about: Report privately via GitHub Security Advisories, not a public issue.
+  - name: Measurement result or finding
+    url: https://github.com/scttfrdmn/graviton-blas-bench/discussions
+    about: Discussing what a number means, rather than reporting a defect.

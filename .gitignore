@@ -1,0 +1,34 @@
+# ---- C build output ------------------------------------------------------
+bin/
+*.o
+*.so
+*.so.*
+*.a
+
+# ---- benchmark output ----------------------------------------------------
+# Measurements and provenance records are collected per host and archived out
+# of band; they are not committed.
+results/
+*.ndjson
+env-*.json
+*.buildlog
+
+# ---- Python --------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.ruff_cache/
+.venv/
+
+# ---- macOS ---------------------------------------------------------------
+.DS_Store
+
+# ---- editors -------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- local environment ---------------------------------------------------
+.env
+*.local

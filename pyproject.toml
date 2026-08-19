@@ -1,0 +1,30 @@
+# The analysis is deliberately stdlib-only: it has to run on a bare EC2 host
+# with nothing but python3 installed, and a pinned dependency set is one more
+# thing that could differ between the host that collected a result and the host
+# that analysed it. This file configures the linter, not a package.
+
+[tool.ruff]
+# 110, not the usual 88. decompose.py prints fixed-width report tables 78
+# columns wide, and the f-strings that build them -- plus function-body
+# indentation -- do not fit in 88. Wrapping them would break the alignment of
+# the output the campaign is read from, which is a worse outcome than a long
+# source line.
+line-length = 110
+target-version = "py310"
+extend-exclude = ["results"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "W",    # warnings
+    "I",    # import sorting
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "RUF",
+]
+
+[tool.ruff.format]
+quote-style = "double"

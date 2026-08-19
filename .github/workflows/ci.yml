@@ -1,0 +1,109 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The harness is built and run on arm64 exclusively, so CI is arm64. An x86
+  # runner would compile it but would not exercise anything this campaign cares
+  # about.
+  c:
+    name: c harness (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install BLAS for the link check
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev numactl
+
+      - name: make roofline
+        run: make roofline
+
+      - name: roofline runs and reports a plausible number
+        # Standing order 2: the FMA chain gets optimized away if you let it.
+        # A green compile proves nothing here -- the binary has to emit a
+        # number that sanity_check() did not abort on.
+        run: |
+          GBB_THREADS=2 OMP_NUM_THREADS=2 ./bin/gbb-roofline | tee roofline.ndjson
+          python3 - <<'PY'
+          import json, sys
+          recs = [json.loads(l) for l in open("roofline.ndjson") if l.strip()]
+          peak = next(r for r in recs if r["metric"] == "peak_fma")
+          g = peak["gflops_f64"]
+          print(f"single-core peak_fma f64 = {g:.2f} GFLOP/s")
+          if not (0.1 < g < 200.0):
+              sys.exit(f"implausible peak_fma: {g} GFLOP/s -- see standing order 2")
+          bw = next(r for r in recs if r["metric"] == "bandwidth")
+          print(f"triad = {bw['triad_gbs']:.2f} GB/s")
+          PY
+
+      - name: bench.c compiles and links against a real BLAS
+        run: make openblas OPENBLAS_DIR=/usr VARIANT=ci-system
+
+      - name: harness build flags are unchanged
+        # Standing order 6: the harness must not be the thing that differs
+        # between arms.
+        run: bash gates/check-build-flags.sh
+
+  shell:
+    name: shell
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            bash -n "$f" || { echo "::error file=$f::bash -n failed"; fail=1; }
+          done < <(find . -name '*.sh' -not -path './.git/*')
+          exit $fail
+      - uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+
+  python:
+    name: python
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pipx install ruff
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+      - name: py_compile
+        run: |
+          while IFS= read -r f; do
+            python -m py_compile "$f"
+          done < <(find . -name '*.py' -not -path './.git/*')
+
+  gate-p0:
+    name: gate p0
+    needs: [c, shell, python]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev
+      - run: bash gates/p0.sh
