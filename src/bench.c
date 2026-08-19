@@ -348,6 +348,17 @@ static int is_sentinel(const char *s) {
 }
 static long g_batch = 1;   /* set by TIMED_LOOP */
 
+/* Element stride, emitted in every record. Level 3 is always unit stride; only
+   run_level1 varies it, and it does so by running the SAME (routine, m, n, k,
+   lda_pad) twice. Without this field on the record the two strides are
+   indistinguishable downstream, and decompose.py's condition key -- which is
+   exactly (instance, threads, routine, m, n, k, lda_pad) -- collapsed them into
+   one cell and kept the slower of the two. That silently deleted the incx axis,
+   which the campaign singles out as where the arm64 tree is weakest. Set by
+   run_level1 and reset by it, on the same file-scope-global convention as
+   g_batch. */
+static int g_incx = 1;
+
 static void emit(const char *routine, int m, int n, int k, int lda_pad,
                  double *samples, int reps, double flops, int verified,
                  const char *note) {
@@ -383,6 +394,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"thread_backend\":\"%s\",\"pin_policy\":\"%s\","
            "\"arch_selected\":\"%s\",\"role\":\"%s\",\"threads\":%d,"
            "\"routine\":\"%s\",\"m\":%d,\"n\":%d,\"k\":%d,\"lda_pad\":%d,"
+           "\"incx\":%d,"
            "\"reps\":%d,\"batch\":%ld,\"calls\":%ld,"
            "\"timer_overhead_ns\":%.3f,\"timer_res_ns\":%.3f,"
            "\"t_min\":%.9g,\"t_p50\":%.9g,\"t_p90\":%.9g,"
@@ -391,6 +403,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            g_blas_sha, g_coretype, g_thread_backend, g_pin_policy,
            g_arch_selected, g_role, g_threads,
            routine, m, n, k, lda_pad,
+           g_incx,
            reps, g_batch, (long)reps * g_batch,
            g_timer_overhead * 1e9, g_timer_res * 1e9,
            tmin, p50, p90,
@@ -573,8 +586,10 @@ static void run_level1(const Case *c, const char *which, int incx) {
     }
     (void)sink;
     char note[32]; snprintf(note, sizeof note, "incx=%d", incx);
+    g_incx = incx;
     emit(which, n,0,0,0, samples, nreps, case_flops(which,n,0,0),
          VERIFIED_UNCHECKED, note);
+    g_incx = 1;
     free(samples); free(x); free(y);
 }
 
