@@ -27,6 +27,7 @@ for f in LICENSE README.md CHANGELOG.md CLAUDE.md .gitignore Makefile \
          src/bench.c src/roofline.c src/coreprobe.c \
          scripts/build-libs.sh scripts/capture-env.sh scripts/run-matrix.sh \
          analysis/decompose.py tests/run-matrix-stubs.sh \
+         tests/arch-selected-assert.sh \
          .github/workflows/ci.yml scripts/bootstrap-github.sh; do
   if [ -f "$f" ]; then ok "$f"; else bad "$f missing"; fi
 done
@@ -94,6 +95,22 @@ if bash tests/run-matrix-stubs.sh >/tmp/gbb-p0-stubs.log 2>&1; then
 else
   bad "run-matrix stub suite -- see /tmp/gbb-p0-stubs.log"
   grep -A2 'FAIL' /tmp/gbb-p0-stubs.log | head -30
+fi
+
+# ---- 5c. bench.c refuses a label it cannot confirm ------------------------
+# Compiles bench.c against a stub that exports openblas_get_corename and asserts
+# the in-process check fires. Same class of defect as 5b and the same reason it
+# matters: an arm that runs under the wrong coretype label produces numbers that
+# pass every downstream check.
+if bash tests/arch-selected-assert.sh >/tmp/gbb-p0-arch.log 2>&1; then
+  if grep -q '^SKIP' /tmp/gbb-p0-arch.log; then
+    printf '  \033[33mSKIP\033[0m  %s\n' "$(head -1 /tmp/gbb-p0-arch.log)"
+  else
+    ok "arch_selected assertion ($(grep -o 'pass=[0-9]*' /tmp/gbb-p0-arch.log | tail -1) assertions)"
+  fi
+else
+  bad "arch_selected assertion -- see /tmp/gbb-p0-arch.log"
+  grep -A2 'FAIL' /tmp/gbb-p0-arch.log | head -20
 fi
 
 # ---- 6. build flags are the ones we promised -----------------------------

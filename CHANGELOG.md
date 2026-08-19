@@ -85,6 +85,30 @@ change can be compared.
 - `tests/run-matrix-stubs.sh` is now 61 assertions, up from 33: the role
   interlock, a forged IMDS type failing to promote a non-Graviton host, the
   declared-alias path, per-variant `arch_selected`, and the manifest stamping.
+- **`bench.c` now verifies its own coretype label and refuses to measure under
+  one it cannot confirm.** `arch_selected` was inherited from
+  `GBB_ARCH_SELECTED`, measured by `gbb-coreprobe-<variant>` in a *separate
+  process* — which can resolve a different `libopenblas` by rpath or be handed a
+  different environment, so the label was a claim about a library that may not be
+  the one doing the work. The measuring process now asks the loaded image
+  directly via `dlsym(RTLD_DEFAULT, "openblas_get_corename")`; a disagreement
+  exits 4 before any record is written. Looked up rather than linked so the
+  compilation stays byte-identical across arms: a `-D` would make the harness
+  differ per arm (standing order 6), and a weak declaration would need
+  `weak_import` on Mach-O and so trade a per-arm difference for a per-platform
+  one. The runner censuses exit 4 as `mislabelled` rather than `runtime_failed` —
+  a retry reproduces it, and the useful fact is that the label and the artifact
+  disagree — and `decompose.py` raises it as a hard anomaly with exit bit 2,
+  because every forced-coretype label on that host came from the same probe.
+  `tests/arch-selected-assert.sh` covers all four paths against a stub, in
+  `gates/p0.sh`.
+- Spend policy for P2 and P3 recorded in `CLAUDE.md`: spot for P2, on-demand for
+  P3, and P3 run **twice** on different `instance_id`s. One clean pass is ~$96,
+  so a second independent pass buys more than a 3× discount on the first buys.
+  A replicate is identifiable with no new field — same `instance_type`, different
+  `instance_id` — which fails safe, since a re-run on the same box shares the
+  `instance_id` and is correctly not counted as one. Gate P3 now requires the
+  headline to reproduce between passes.
 
 ### Changed — affects comparability of numbers
 
@@ -213,6 +237,20 @@ change can be compared.
   statement, so `$v` expanded while `v` was a declared-but-unset local. Under
   `set -u` that aborts the function, and inside a command substitution the abort
   is invisible: the caller got `""` and labelled the arm `unknown`.
+- **Two more silent-abort command substitutions of the same class, found by
+  sweeping for the pattern rather than the trigger.** A `$( )` wrapping anything
+  that can fail swallows the failure and yields an empty string, and every one of
+  these assigned to a variable the sweep then acted on. `envq` returned `""` for
+  every field if `python3` was absent or `env-*.json` was truncated by a host
+  that died mid-write — `HAS_SVE=""` silently drops every SVE coretype on a host
+  that has SVE, and `CORES=""` collapses the thread ladder to one rung, so the
+  run completes looking like a clean dataset that happens to contain no SVE arms.
+  The precondition is now checked once and loudly, and the fields that decide
+  *what gets measured* go through `envq_req`, which stops rather than defaults.
+  Separately, the inline `python3 -c` that looked up `DYNAMIC_OMP`'s `blas_sha`
+  sat inside an `env` line, so a failure ran the arm with a blank `blas_sha` — a
+  record identifying no library. It is hoisted, and the arm is refused with a
+  census reason instead of defaulting to `unknown`.
 - `us-east-2` was documented as a fallback region carrying all five families. It
   has no `hpc7g` at all. `hpc7g.16xlarge` exists in exactly three regions —
   `us-east-1`, `eu-west-1`, `ap-northeast-1` — one AZ each, and neither of the

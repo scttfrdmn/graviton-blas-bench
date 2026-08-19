@@ -27,6 +27,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <float.h>
+#include <dlfcn.h>   /* RTLD_DEFAULT: see corename_fn() */
 
 /* ---- timing contract --------------------------------------------------- */
 /* A measurement is SAMPLES outer samples, each of which times a BATCH of
@@ -316,6 +317,35 @@ static const char *g_host, *g_instance, *g_library, *g_target, *g_build,
 static const char *g_blas_sha, *g_coretype, *g_thread_backend, *g_pin_policy,
                   *g_role;
 static int g_threads;
+
+/* Looked up at runtime rather than linked, for two reasons.
+ *
+ * One: bench.c is compiled with identical flags for every arm -- standing order 6
+ * forbids otherwise and gates/p0.sh checks it -- and this symbol exists only in
+ * the OpenBLAS-linked binaries. A -D would make the harness differ across arms.
+ * A weak declaration would avoid that on ELF but needs weak_import on Mach-O, so
+ * it would trade a per-arm difference for a per-platform one. dlsym needs
+ * neither: the same source, the same flags, and the answer comes from whatever
+ * was actually loaded.
+ *
+ * Two, and the real point: the runner probes the coretype in a SEPARATE PROCESS
+ * before the arm runs, and a separate process is not the artifact that produces
+ * the numbers -- it can resolve a different libopenblas by rpath, or be handed a
+ * different environment. RTLD_DEFAULT searches this process's own loaded images,
+ * so what comes back is a property of the library about to do the work rather
+ * than a claim inherited over an environment variable. Same principle as
+ * measured-peak-over-theoretical, and as reading SVE kernel symbols out of the
+ * installed archive instead of trusting the variables passed to the build:
+ * verify the artifact, not the intent. */
+static char *(*corename_fn(void))(void) {
+    return (char *(*)(void))dlsym(RTLD_DEFAULT, "openblas_get_corename");
+}
+
+/* Sentinels the runner passes when the question does not apply or could not be
+ * answered. Never assert against these: they are not corenames. */
+static int is_sentinel(const char *s) {
+    return !strcmp(s, "n/a") || !strcmp(s, "unknown") || !strcmp(s, "unprobed");
+}
 static long g_batch = 1;   /* set by TIMED_LOOP */
 
 static void emit(const char *routine, int m, int n, int k, int lda_pad,
@@ -589,7 +619,38 @@ int main(int argc, char **argv) {
     g_library       = env_or("GBB_LIBRARY", "unknown");
     g_target        = env_or("GBB_TARGET", "unknown");
     g_build         = env_or("GBB_BUILD", "unknown");
-    g_arch_selected = env_or("GBB_ARCH_SELECTED", "unknown");
+    /* Verify the artifact, not the intent. OPENBLAS_CORETYPE is a request that
+       force_coretype() may silently ignore, and GBB_ARCH_SELECTED is the
+       runner's answer measured elsewhere. Where the library under test can be
+       asked directly, its answer wins and the runner's is checked against it.
+       A disagreement is fatal: it means the records this process is about to
+       write would be labelled with a property of some other library or some
+       other environment, and standing order 10 makes a mislabelled arm worse
+       than a missing one -- a failed run is a gap, a plausible wrong answer is
+       not. */
+    const char *claimed = env_or("GBB_ARCH_SELECTED", "unknown");
+    char *(*get_corename)(void) = corename_fn();
+    if (get_corename) {
+        const char *actual = get_corename();
+        g_arch_selected = (actual && *actual) ? actual : "unknown";
+        if (!is_sentinel(claimed) && strcmp(claimed, g_arch_selected) != 0) {
+            fprintf(stderr,
+                "gbb: FATAL: arch_selected disagrees between the runner's probe and this "
+                "process. The runner passed GBB_ARCH_SELECTED=%s; the libopenblas actually "
+                "linked here reports %s. One of them describes a different library or a "
+                "different environment, so every record this arm would write is "
+                "mislabelled. Refusing to measure. Check that gbb-coreprobe-%s and this "
+                "binary resolve the same libopenblas by rpath, and that OPENBLAS_CORETYPE "
+                "was exported to both.\n",
+                claimed, g_arch_selected, g_target ? g_target : "?");
+            exit(4);
+        }
+    } else {
+        /* No OpenBLAS linked, so the question does not apply to this arm. The
+           runner passes "n/a" for ArmPL and BLIS; anything else here would be a
+           label with nothing behind it. */
+        g_arch_selected = claimed;
+    }
     g_blas_sha       = env_or("GBB_BLAS_SHA", "unknown");
     g_coretype       = env_or("GBB_CORETYPE", "unforced");
     g_thread_backend = env_or("GBB_THREAD_BACKEND", "unknown");

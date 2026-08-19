@@ -264,6 +264,39 @@ v = json.load(open(sys.argv[1])).get(sys.argv[2])
 print("" if v is None else "true" if v is True else "false" if v is False else v)
 PY
 }
+
+# A command substitution swallows the failure of what it wraps. If python3 is
+# absent, or ENVFILE is truncated because capture-env.sh died mid-write, every
+# envq below returns "" and the sweep proceeds: HAS_SVE="" silently drops every
+# SVE coretype on a host that has SVE, CORES="" produces a one-rung thread
+# ladder, and the run finishes looking like a complete dataset that happens to
+# contain no SVE arms. That is the absent-vs-null confusion standing order 11
+# exists to prevent, arriving through the shell rather than through the census.
+# So the precondition is checked once, loudly, before any caller can mistake a
+# read failure for a missing key. After this, "" from envq means the key really
+# is absent or null.
+command -v python3 >/dev/null 2>&1 \
+  || die "python3 not found. Every provenance field this sweep stamps into its
+     records is read from $ENVFILE with it, and without it they would all be
+     stamped empty while the sweep ran to completion."
+envq_selftest="$(envq instance_type 2>/dev/null)" || envq_selftest="__FAILED__"
+[ "$envq_selftest" != "__FAILED__" ] \
+  || die "capture-env.sh produced $ENVFILE but it cannot be read as a JSON object.
+     Every provenance field would be stamped empty while the sweep ran to
+     completion."
+
+# envq_req <key> -- for the fields that decide what gets measured rather than
+# merely describing it. An empty one is a stop, not a default: a wrong thread
+# ladder or a missing SVE axis is not visible in the output it produces.
+envq_req() {
+  local v
+  v="$(envq "$1")"
+  [ -n "$v" ] || die "capture-env.sh recorded no '$1' in $ENVFILE. That field decides what this
+     sweep measures, so defaulting it would produce a dataset that is wrong
+     rather than one that is merely short."
+  printf '%s' "$v"
+}
+
 INSTANCE="$(envq instance_type)"; [ -n "$INSTANCE" ] || INSTANCE=unknown
 # Two independent IMDS reads must agree. The role interlock above read the
 # instance type itself rather than waiting for capture-env.sh, precisely so that
@@ -279,11 +312,11 @@ if [ -n "$IMDS_TYPE" ] && [ "$INSTANCE" != "$IMDS_TYPE" ]; then
   log "WARNING: instance type '$INSTANCE' from capture-env != '$IMDS_TYPE' from the"
   log "         role interlock. Instrument run, so this is noted and not fatal."
 fi
-CORES="$(envq cores_total)"
+CORES="$(envq_req cores_total)"
 CPUS_AFFINITY="$(envq cpus_affinity)"
 FORCING="$(envq openblas_coretype_forcing)"
-HAS_SVE="$(envq has_sve)"
-HAS_SVE2="$(envq has_sve2)"
+HAS_SVE="$(envq_req has_sve)"
+HAS_SVE2="$(envq_req has_sve2)"
 export GBB_INSTANCE="$INSTANCE"
 ship
 
@@ -614,7 +647,20 @@ run_arm() {
       ${PIN_CMD[$T]} "$BIN/$exe" all >> "$OUT" 2>>"$STDERRLOG"
   rc=$?
   after=$(wc -l < "$OUT")
-  if [ $rc -ne 0 ]; then
+  if [ $rc -eq 4 ]; then
+    # bench.c's own arch_selected check refused the arm: the libopenblas it
+    # loaded reports a different corename than the probe this runner ran in a
+    # separate process. That is not a flake and must not be censused as one --
+    # a retry would reproduce it, and the useful fact is that the label and the
+    # artifact disagree. Distinct status so decompose.py can separate "this arm
+    # is noisy" from "this arm cannot be labelled".
+    log "  REFUSED: bench.c reports arch_selected != '${cteff:-unknown}' -- see $STDERRLOG"
+    census "$lib" "$tgt" "$ct" "$cteff" "$T" mislabelled "$rc" "$((after - before))" \
+      "$backend" "${PIN_DESC[$T]}" \
+      "bench.c's in-process openblas_get_corename() disagrees with the probe's
+       '${cteff:-unknown}'; the arm would have been measured under a label
+       belonging to a different library or environment (standing order 10)"
+  elif [ $rc -ne 0 ]; then
     log "  exited $rc (SIGILL=132 means this kernel set needs ISA the host lacks)"
     census "$lib" "$tgt" "$ct" "$cteff" "$T" runtime_failed "$rc" "$((after - before))" \
       "$backend" "${PIN_DESC[$T]}" "harness exited $rc; see $STDERRLOG"
@@ -686,17 +732,35 @@ done < <(manifest_arms)
 # subtracted in the analysis rather than left in the comparison.
 OMP_EXE=gbb-openblas-DYNAMIC_OMP
 OMP_EFF="$(probe_variant DYNAMIC_OMP)"
-if [ -x "$BIN/$OMP_EXE" ]; then
+# Hoisted out of the `env` line it used to sit in. Inline, a failure of this
+# python -- a truncated manifest, a JSON error -- expanded to "" and the arm ran
+# and was recorded with a blank blas_sha, which is a record that identifies no
+# library and is inadmissible under standing order 5. Inside a command
+# substitution on an `env` line nothing reports that; the arm simply succeeds.
+OMP_SHA="$(python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    r=json.loads(l)
+    if r.get("record")=="arm" and r.get("target")=="DYNAMIC_OMP":
+        print(r.get("blas_sha") or ""); break
+else: print("")' "$MANIFEST" 2>/dev/null || true)"
+if [ -x "$BIN/$OMP_EXE" ] && [ -z "$OMP_SHA" ]; then
+  # Refused, not defaulted to "unknown". A DYNAMIC_OMP_BOUND arm exists only to
+  # be differenced against DYNAMIC_OMP, and that difference is meaningless if we
+  # cannot show both were the same library.
+  for T in $THREADS; do
+    census openblas DYNAMIC_OMP_BOUND unforced "$OMP_EFF" "$T" \
+      unrunnable 0 0 openmp "${PIN_CMD[$T]};omp_bind=close" \
+      "no blas_sha for the DYNAMIC_OMP arm in $MANIFEST, so this arm could not be
+       shown to be the same library as the arm it is differenced against"
+  done
+  log "skip openblas/DYNAMIC_OMP_BOUND: no blas_sha for DYNAMIC_OMP in the manifest"
+elif [ -x "$BIN/$OMP_EXE" ]; then
   for T in $THREADS; do
     before=$(wc -l < "$OUT")
     log "run library=openblas target=DYNAMIC_OMP_BOUND threads=$T"
     # shellcheck disable=SC2086
     env GBB_LIBRARY=openblas GBB_TARGET=DYNAMIC_OMP_BOUND \
-        GBB_BLAS_SHA="$(python3 -c 'import json,sys
-for l in open(sys.argv[1]):
-    r=json.loads(l)
-    if r.get("record")=="arm" and r.get("target")=="DYNAMIC_OMP": print(r.get("blas_sha") or "unknown"); break
-else: print("unknown")' "$MANIFEST")" \
+        GBB_BLAS_SHA="$OMP_SHA" \
         GBB_CORETYPE=unforced GBB_THREAD_BACKEND=openmp \
         GBB_PIN_POLICY="${PIN_CMD[$T]};omp_bind=close,omp_places=cores" \
         GBB_BUILD="$GBB_BUILD" GBB_THREADS="$T" \

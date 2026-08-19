@@ -47,8 +47,9 @@ something. 2, 4 and 8 are bit flags and are OR-ed together; 1 is returned alone.
   2  poisoned records or inadmissible hosts: a failed verification, a 0.00
      GFLOP/s record, a non-performance governor, SMT, heterogeneous cores, a
      cgroup CPU quota, OPENBLAS_CORETYPE forcing proved unavailable, SVE
-     detection having failed on a host that has SVE, or an OpenBLAS build with no
-     SVE kernel symbols in it on a host that has SVE
+     detection having failed on a host that has SVE, an OpenBLAS build with no SVE
+     kernel symbols in it on a host that has SVE, or an arm that refused to
+     measure because its coretype label and its loaded library disagreed
   4  unexplained coverage hole: an expected (arm, condition) cell is absent --
      wholly, or short some of its sizes -- and neither the build manifest, the run
      census, nor an exclusion this file made accounts for it
@@ -126,8 +127,13 @@ UNRECOGNISED = "UNRECOGNISED"
 LSCPU_DEFAULTED = "lscpu produced no topology"
 
 # Census statuses that mean the arm ran, and therefore explain nothing about a
-# cell it failed to produce. run-matrix.sh emits four: measured, runtime_failed,
-# build_failed, unrunnable. Only the last three are explanations.
+# cell it failed to produce. run-matrix.sh emits five: measured, runtime_failed,
+# build_failed, unrunnable, mislabelled. Only the last four are explanations.
+#
+# `mislabelled` is the one that must never be read as a flake: bench.c's
+# in-process openblas_get_corename() disagreed with the probe the runner ran in a
+# separate process, so the arm refused to measure rather than write records under
+# a label belonging to a different library. A retry reproduces it.
 CENSUS_SUCCESS = frozenset({"measured", "ok"})
 
 REGIMES = ("small", "medium", "large")
@@ -1255,6 +1261,23 @@ def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, args, out):
 
     for name, why in inp.bad_env_files:
         add("!!", "env_unparseable", f"{name}: {why}. That host's provenance is unreadable.")
+
+    # A refused-because-mislabelled arm is not a coverage hole to be explained and
+    # moved past. It means the coretype label and the library that would have done
+    # the work disagreed on this host, so every OTHER forced-coretype arm here is
+    # suspect too -- the same probe produced all their labels.
+    for o in inp.outcomes:
+        if (o.get("status") or "") != "mislabelled":
+            continue
+        add(
+            "!!",
+            "arch_selected_mismatch",
+            f"{o.get('instance') or 'unknown'}: {o.get('library')}/{o.get('target')} "
+            f"coretype={o.get('coretype') or 'unforced'!r} refused to measure -- bench.c's "
+            f"in-process corename disagreed with the runner's probe "
+            f"({o.get('coretype_effective') or 'unknown'!r}). Every forced-coretype label on "
+            f"this host comes from that same probe and is therefore unconfirmed.",
+        )
     for fam in inp.missing_families:
         add(".", "file_family_absent", f"no {fam}-*.ndjson/json in results/ — coverage fact, see section 7")
     if inp.bad_lines:
@@ -1847,6 +1870,8 @@ def main(argv=None):
         # partial counts: a cell short of sizes with no exclusion of this file's
         # own accounting for the absence is the same hole one level down.
         exit_code |= 4
+    if any(a["kind"] == "arch_selected_mismatch" for a in anomalies):
+        exit_code |= 2
     if any(a["kind"] in ("no_provenance", "blas_sha_conflict", "env_unparseable") for a in anomalies):
         exit_code |= 8
 

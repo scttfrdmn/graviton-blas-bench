@@ -11,7 +11,11 @@
 
 CC      ?= gcc
 CFLAGS  ?= -O2 -g -Wall -Wextra -std=c11
-LDLIBS  ?= -lm -lpthread
+# -ldl for the RTLD_DEFAULT lookup in bench.c (see corename_fn there). glibc
+# folded dlsym into libc at 2.34, so this is redundant on Amazon Linux 2023 and
+# Ubuntu 22.04+, and harmless where it is. Listed in LDLIBS rather than on the
+# OpenBLAS recipes so every arm links the same set -- standing order 6.
+LDLIBS  ?= -lm -lpthread -ldl
 
 BIN     := bin
 SRC     := src
