@@ -313,6 +313,58 @@ support opposite conclusions.
   two. The `family-swamped` fixture plants the effect on TRSM/TRMM/SYMM with GEMM
   at parity across four transposes, which is the shape the 94-vs-5 kernel gap
   predicts and the shape raw row counting drowns.
+- **The same defect, third appearance, this time on the regime axis — and it
+  cuts both ways.** The campaign *verdict* still counted raw cells after
+  `coherent_subsets()` stopped doing so. Before the #2 densification the three
+  regimes contributed 20 cells each and the count was balanced by accident, so
+  nothing showed; after it they contribute 160/110/20. Both failure directions
+  then exist: an effect confined to small+medium clears a 60% majority on cell
+  count alone and reads as a campaign-level `V1-SET-AHEAD`, while an effect
+  confined to the large regime cannot reach 60% however large it is, because
+  large is ~6% of the cells — and large is where the DDR generation and the L3
+  step show, so that second failure would have silently removed the memory-side
+  finding from the campaign's reach. The verdict majority is therefore over
+  `(routine_family, regime)`-balanced weight: each group contributes one unit,
+  divided among its own cells. Raw counts are still printed beside the balanced
+  fraction.
+- **A balanced majority is necessary for a directional headline and not
+  sufficient.** Balancing stops the ladder voting, but it also means a family
+  with 12 cells weighs as much as one with 240 — so an effect on three small
+  families clears 60% of balanced weight while moving the dataset's median by
+  +0.2%. Publishing `V1-SET-AHEAD, median +0.2%` off that would be the
+  max-over-cell defect in its final form: a global claim sourced from a minority
+  of the work. A directional verdict now additionally requires the median over
+  *all* comparable cells to clear `--min-effect`, signed — a V1 majority whose
+  global median runs the other way is not a V1 headline either. Below the floor
+  the verdict is `MIXED` and says where the effect is instead. `family-swamped`
+  asserts both halves on one dataset: the majority that must be believed, and
+  the global median that must not be published as one.
+- **A majority threshold can be decided by floating-point summation order.**
+  Balanced weight is a sum of reciprocals — a 24-cell group is 24 × (1/24),
+  which is not exactly 1.0 in binary. A dataset that lands exactly on the
+  threshold by construction (five small-regime families, three of them
+  one-sided: 3.0/5.0 = 0.60) then has its verdict decided by the order the
+  weights happened to be added, and the two directions of one comparison can
+  disagree with each other. `full-routine-set` is that dataset and it went from
+  green to red on nothing but a ladder edit. Every majority comparison goes
+  through `meets()`, which carries `MAJORITY_EPS = 1e-9` of slack: far below any
+  difference the campaign could resolve, far above the accumulated error, and it
+  settles the tie in favour of the hand-arithmetic answer, which is the one the
+  policy is written in.
+- **A wrong answer was blocked from the headline by a coverage threshold, which
+  was never the guard — it only happened to be one.** `verify-fail` plants a V1
+  arm that returns wrong `dgemm` results; standing order 4 says that poisons the
+  record. The exclusion worked, the anomaly printed, and the *verdict* was
+  refused only because the excluded cells pushed the non-comparable fraction over
+  `--max-nodata-fraction`. The #2 densification took dgemm's total exclusion from
+  40% of the cross down to 29%, under the 34% threshold, and the fixture went
+  green on `NULL … publish the negative result` off a kernel returning wrong
+  answers. `compute_verdict()` now refuses NULL while any routine stands excluded
+  for a verification failure, on principle rather than on arithmetic: a wrong
+  answer is not a slow answer, the comparison in that routine did not happen, and
+  it is precisely where a kernel difference was most likely — a kernel that gets
+  the answer wrong is a kernel doing something different. A null is a claim about
+  the whole design, and the excluded part is the part that cannot support it.
 - **A comparison key that omits an axis lets each target shop along it.** The
   same max-over-cell defect that size shopping produced returns for any axis the
   key does not name, and transposes are the next one: with `transa`/`transb`
@@ -385,6 +437,36 @@ support opposite conclusions.
   build is holding, and every refusal names the holder's pid, host and start time
   so a stale lock is diagnosable rather than merely annoying
   (`GBB_FORCE_UNLOCK=1`, `GBB_IGNORE_BUILD_LOCK=1`).
+- **The small end of the ladder is not cheap, and the cost model said it was.**
+  The spend policy's "densify below 2048 freely" rested on a reps cap bounding
+  the small end — and `bench.c` has no reps cap. `MIN_SECONDS` targets a fixed
+  amount of *real BLAS work* per measurement, so it buys as many calls as it
+  takes: an `n=8` case cost the same wall clock as an `n=1024` one, and the
+  "~4× the cases, ~1.6–2× the wall clock" step did not survive contact with that.
+  The `~$96/pass` figure it produced is retired rather than rescaled. The floor is
+  now per regime — `MIN_SECONDS_SMALL = 0.05` below n=256, still ~500k calls at
+  n=8, which is four orders of magnitude clear of the ~31 ns `now()` bracket the
+  original 0.30 was assumed to be defending (it was not: `MIN_BATCH_SECONDS` does
+  that, and 0.30 entered the file uncommented). Every record carries the
+  `min_seconds` it was measured under, so a mixed dataset is detectable rather
+  than merely inconsistent. The corollary is that **wall-clock is anti-correlated
+  with arm quality**: the cheap/expensive boundary is wherever 6 calls exceed the
+  floor, which moves with thread count and with how fast the arm is, so the
+  generic `ARMV8` arm at 1 thread will be the single most expensive arm in the
+  campaign. Instrument the *slowest* arm of the first P2 iteration, not a
+  representative one, or the extrapolation lands low.
+- **A penalty is a property of the stride, so the pad axis has to be attributed
+  per pad.** With one extra pad value, "tight versus padded" was one comparison
+  and pooling was unobservable. With `LDA_PADS_EXTRA = {1, 4, 8, 64}` a section 3
+  that averaged every padded stride against pad 0 would report one penalty per
+  size and lose the only thing the four pads were added to see — an arm can hurt
+  at pad 8 and be flat at pad 64, and which one it is *is* the packing finding.
+  `lda-penalty` therefore plants a penalty at pads 1/4/8 and leaves pad 64 flat on
+  the same arm, and asserts both. Relatedly, pad 0 must never appear in an
+  extra-pad table: the base sweep already emits every routine at pad 0, so a 0
+  there would emit a second record for the same condition in the same run, which
+  min-within-run would then silently resolve — a duplicated case masquerading as a
+  quietly different sample. `gates/p1.sh` checks both tables on both sides.
 - **The alarming dispatch outcome is narrower than the above.** Generic `ARMV8`
   selected on a host that *has* SVE would mean the SVE detection itself failed;
   `NO_SVE` set at build time would mean the SVE kernels were never compiled in.
@@ -451,13 +533,23 @@ rather than on a human's reading:
 | `V1-SET-AHEAD` | the V1 kernel set wins on `c8g`/`c9g` → closing the N2 gap is justified and needs no new kernel code, only kernel selection |
 | `V2-SET-AHEAD` | the N2 mapping was the right call → publish the negative result and drop the SVE angle |
 | `NULL` | the two sets are at parity within `--min-effect` → also a negative result, and a reportable one |
-| `MIXED` | neither set wins a majority of cells → the answer is routine- or regime-specific, not global |
+| `MIXED` | no `(family, regime)`-balanced majority, **or** a balanced majority whose global median is inside `--min-effect` → the answer is routine-, regime- or transpose-specific, not global, and the `MIXED` line says which |
 | `INCONCLUSIVE` | too few cells are comparable to support any of the above |
 | `NO-DATA` | the cross never ran; nothing in this dataset answers the question |
 
 `NULL` and `NO-DATA` are deliberately distinct verdicts. "The kernel sets are
 equivalent" and "we never measured them against each other" are the two claims
 easiest to confuse and they support opposite conclusions.
+
+The majority behind a directional verdict is over `(routine_family, regime)`
+**balanced** weight, not raw cells — the number of cells a routine or a regime
+contributes is a property of `bench.c`'s ladder, not of the hardware — and a
+directional verdict additionally requires the median over all comparable cells to
+clear `--min-effect` with the right sign. Both requirements have to hold, and
+either one failing gives `MIXED` with the effect *located*. `NULL` also carries a
+second bar: it is refused while any routine stands excluded for a failed
+verification, because a wrong answer means that routine never compared. See the
+hazard notes.
 
 Anything that should qualify the verdict is printed beneath it as a
 `VERDICT-CAVEAT:` line — contributing cells that rest on `verified=null`

@@ -52,8 +52,36 @@
  * (8192-cube DGEMM at one thread is ~37 s per call) still land on
  * ABS_MIN_SAMPLES, so they cost what they cost today; the added samples are
  * paid for only where a call is cheap.
+ *
+ * THE FLOOR IS PER REGIME, and 0.30 was never argued for. It arrived in the
+ * scaffold as a bare #define with no comment, and the batching commit did not
+ * choose it -- that commit found it was a documented contract not being MET (an
+ * n=8 measurement ran ~12 us against a declared 0.3 s floor, because MAX_REPS
+ * capped it) and made it true. Making a number true is not the same as deciding
+ * it is right. At n=8 a 0.30 s floor is ~3e6 calls, which measures this file's
+ * dispatch as much as the kernel, and it costs the same as an n=1024 case -- so
+ * "densify the small end freely" was false as long as it stood.
+ *
+ * MIN_SECONDS_SMALL is 0.05 for the SMALL ladder. Four things had to clear
+ * before lowering it, since a timing floor is exactly the kind of constant that
+ * is load-bearing for reasons nobody wrote down:
+ *
+ *   - The ~31 ns now() bracket is defended by MIN_BATCH_SECONDS, NOT by this
+ *     constant. The batch is still ~1 ms, so the bracket is still 0.003% of a
+ *     sample. This is the whole reason the reduction is safe.
+ *   - MIN_SAMPLES still does not bind: 0.05 s of 1 ms batches is ~51 samples.
+ *   - Graviton has no turbo and no SMT, so there is no frequency ramp that a
+ *     long window is needed to get past. On x86 this argument would fail.
+ *   - Fewer calls per measurement is the SAFE direction for TRI_OFFDIAG's
+ *     destructive-operand bound below, not the dangerous one.
+ *
+ * Sample count already varies ~100x across the ladder (3 at n=8192, ~301 at
+ * n=8), so a per-regime floor introduces no non-uniformity that was not already
+ * there. What must stay uniform is the COMPARISON, and it does: the same case on
+ * two arms is batched to the same ~1 ms sample, so both arms get the same count.
  */
 #define MIN_SECONDS          0.30      /* of real BLAS work per measurement  */
+#define MIN_SECONDS_SMALL    0.05      /* ... in the SMALL regime; see above  */
 #define MIN_BATCH_SECONDS    1.0e-3    /* inner batch duration floor         */
 #define CAL_MIN_SECONDS      1.0e-4    /* calibration interval floor         */
 #define MAX_BATCH            1000000L  /* backstop, not normally reached     */
@@ -348,6 +376,13 @@ static int is_sentinel(const char *s) {
 }
 static long g_batch = 1;   /* set by TIMED_LOOP */
 
+/* The MIN_SECONDS floor in force for the case being measured. Set by sweep()
+   from the regime, read by TIMED_LOOP, and emitted in every record so a record
+   states its own timing contract rather than leaving it to be inferred from the
+   size. Same file-scope-global convention as g_batch and g_incx: TIMED_LOOP is a
+   macro and cannot take another argument without editing all nine call sites. */
+static double g_min_seconds = MIN_SECONDS;
+
 /* Element stride, emitted in every record. Level 3 is always unit stride; only
    run_level1 varies it, and it does so by running the SAME (routine, m, n, k,
    lda_pad) twice. Without this field on the record the two strides are
@@ -396,6 +431,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"routine\":\"%s\",\"m\":%d,\"n\":%d,\"k\":%d,\"lda_pad\":%d,"
            "\"incx\":%d,"
            "\"reps\":%d,\"batch\":%ld,\"calls\":%ld,"
+           "\"min_seconds\":%.3f,"
            "\"timer_overhead_ns\":%.3f,\"timer_res_ns\":%.3f,"
            "\"t_min\":%.9g,\"t_p50\":%.9g,\"t_p90\":%.9g,"
            "\"gflops\":%.6f,\"gflops_p50\":%.6f,\"verified\":%s,\"note\":\"%s\"}\n",
@@ -405,6 +441,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            routine, m, n, k, lda_pad,
            g_incx,
            reps, g_batch, (long)reps * g_batch,
+           g_min_seconds,
            g_timer_overhead * 1e9, g_timer_res * 1e9,
            tmin, p50, p90,
            gf, gf_p50,
@@ -439,7 +476,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
         long _bs = (long)(MIN_BATCH_SECONDS / _one) + 1;                        \
         if (_bs > MAX_BATCH) _bs = MAX_BATCH;                                   \
         double _per = (double)_bs * _one;                                       \
-        int _ns = (int)(MIN_SECONDS / _per) + 1;                                \
+        int _ns = (int)(g_min_seconds / _per) + 1;                              \
         if (_ns < MIN_SAMPLES) _ns = MIN_SAMPLES;                               \
         if (_ns > MAX_SAMPLES) _ns = MAX_SAMPLES;                               \
         int _fit = (int)(MAX_MEASURE_SECONDS / _per);                            \
@@ -605,11 +642,37 @@ static void run_level1(const Case *c, const char *which, int incx) {
    each host is recorded in results/env-<run_id>.json by capture-env.sh, which is
    what a reader needs to see where these boundaries actually fell on that host.
    Changing these requires asking Scott (CLAUDE.md, "Ask before"). */
-static const int SIZES_SMALL[]  = { 8, 16, 24, 32, 48, 64, 96, 128, 192, 256 };
-static const int SIZES_MEDIUM[] = { 384, 512, 768, 1024, 1536 };
+static const int SIZES_SMALL[]  = { 8, 16, 24, 32, 40, 48, 56, 64,
+                                    80, 96, 112, 128, 160, 192, 224, 256 };
+static const int SIZES_MEDIUM[] = { 320, 384, 448, 512, 640, 768, 896, 1024,
+                                    1280, 1536 };
 static const int SIZES_LARGE[]  = { 2048, 3072, 4096, 6144, 8192 };
 
-static void sweep(const char *routine, const int *sizes, int nsizes, int lda_pad) {
+/* Leading-dimension padding, as EXTRA sweeps on top of the tight pad=0 pass
+   above. 0 is deliberately absent from both arrays: the base sweep already
+   emits it, and a second pad=0 pass would write two records for one condition
+   -- which decompose.py's duplicate-sample hazard is about, and which would let
+   the luckier of the two survive as the cell value.
+
+   Two ladders because a pad is a fixed number of elements while the cost of an
+   extra column grows with n: 64 elements of padding on an 8192-square operand is
+   cheap in relative terms and expensive in absolute seconds, and the large
+   regime is where the campaign's wall clock lives (CLAUDE.md, spend policy). */
+static const int LDA_PADS_EXTRA[]       = { 1, 4, 8, 64 };  /* small + medium */
+static const int LDA_PADS_EXTRA_LARGE[] = { 8 };            /* large only     */
+
+/* Routines that carry the lda_pad axis. dgemm because packing quality is the
+   hypothesis; dtrsm and dsymm because they are two of the three routines in the
+   94-vs-5 N2 kernel gap and an alignment effect confined to them is exactly the
+   shape that gap predicts. Not sgemm/dsyrk/dtrmm/dgemv: pads and transposes
+   probe the same hypothesis by different mechanisms, so a full cross is largely
+   redundant, and the axis assignment is fixed in CLAUDE.md rather than left to
+   whoever edits this next. */
+static const char *PADDED_ROUTINES[] = { "dgemm", "dtrsm", "dsymm" };
+
+static void sweep(const char *routine, const int *sizes, int nsizes, int lda_pad,
+                  double min_seconds) {
+    g_min_seconds = min_seconds;
     for (int i = 0; i < nsizes; i++) {
         Case c = { routine, sizes[i], sizes[i], sizes[i], lda_pad };
         if      (!strcmp(routine,"dgemm")) run_dgemm(&c);
@@ -678,29 +741,43 @@ int main(int argc, char **argv) {
     const char *only = (argc > 1) ? argv[1] : "all";
     #define WANT(r) (!strcmp(only,"all") || !strcmp(only,(r)))
 
+    #define NSMALL  (int)(sizeof SIZES_SMALL /sizeof(int))
+    #define NMEDIUM (int)(sizeof SIZES_MEDIUM/sizeof(int))
+    #define NLARGE  (int)(sizeof SIZES_LARGE /sizeof(int))
+
     /* Level 3 across all three regimes, tight leading dimension. */
     const char *l3[] = { "dgemm","sgemm","dtrsm","dtrmm","dsyrk","dsymm" };
     for (unsigned i = 0; i < sizeof l3/sizeof *l3; i++) {
         if (!WANT(l3[i])) continue;
-        sweep(l3[i], SIZES_SMALL,  (int)(sizeof SIZES_SMALL /sizeof(int)), 0);
-        sweep(l3[i], SIZES_MEDIUM, (int)(sizeof SIZES_MEDIUM/sizeof(int)), 0);
-        sweep(l3[i], SIZES_LARGE,  (int)(sizeof SIZES_LARGE /sizeof(int)), 0);
+        sweep(l3[i], SIZES_SMALL,  NSMALL,  0, MIN_SECONDS_SMALL);
+        sweep(l3[i], SIZES_MEDIUM, NMEDIUM, 0, MIN_SECONDS);
+        sweep(l3[i], SIZES_LARGE,  NLARGE,  0, MIN_SECONDS);
     }
 
     /* Padded leading dimension: isolates packing-kernel quality from the
        inner kernel. A library whose packing is good should barely notice. */
-    if (WANT("dgemm")) {
-        sweep("dgemm", SIZES_MEDIUM, (int)(sizeof SIZES_MEDIUM/sizeof(int)), 8);
-        sweep("dgemm", SIZES_LARGE,  (int)(sizeof SIZES_LARGE /sizeof(int)), 8);
+    for (unsigned i = 0; i < sizeof PADDED_ROUTINES/sizeof *PADDED_ROUTINES; i++) {
+        const char *r = PADDED_ROUTINES[i];
+        if (!WANT(r)) continue;
+        for (unsigned p = 0; p < sizeof LDA_PADS_EXTRA/sizeof(int); p++) {
+            sweep(r, SIZES_SMALL,  NSMALL,  LDA_PADS_EXTRA[p], MIN_SECONDS_SMALL);
+            sweep(r, SIZES_MEDIUM, NMEDIUM, LDA_PADS_EXTRA[p], MIN_SECONDS);
+        }
+        for (unsigned p = 0; p < sizeof LDA_PADS_EXTRA_LARGE/sizeof(int); p++)
+            sweep(r, SIZES_LARGE, NLARGE, LDA_PADS_EXTRA_LARGE[p], MIN_SECONDS);
     }
 
     if (WANT("dgemv")) {
-        sweep("dgemv", SIZES_MEDIUM, (int)(sizeof SIZES_MEDIUM/sizeof(int)), 0);
-        sweep("dgemv", SIZES_LARGE,  (int)(sizeof SIZES_LARGE /sizeof(int)), 0);
+        sweep("dgemv", SIZES_MEDIUM, NMEDIUM, 0, MIN_SECONDS);
+        sweep("dgemv", SIZES_LARGE,  NLARGE,  0, MIN_SECONDS);
     }
 
-    /* Level 1, unit and non-unit stride. */
+    /* Level 1, unit and non-unit stride. Sets g_min_seconds explicitly rather
+       than inheriting whatever the last sweep() left there: these cases do not
+       go through sweep(), and a floor that depends on which routines the caller
+       asked for would make the record's own min_seconds field a lie. */
     if (WANT("daxpy") || WANT("ddot")) {
+        g_min_seconds = MIN_SECONDS;
         int lens[] = { 1024, 16384, 262144, 4194304 };
         for (unsigned i = 0; i < sizeof lens/sizeof *lens; i++) {
             Case c = { NULL, lens[i], 0, 0, 0 };

@@ -109,9 +109,12 @@ change can be compared.
   putting untested reclaim handling on the critical path. Costed at **$500–650 for
   three expanded passes** (30–37 instance-hours each); the earlier ~$96/pass figure
   described the pre-expansion routine table and is **retired rather than
-  reconciled**. Sweep time is not proportional to case count — `MAX_REPS` caps the
-  small end and `MIN_REPS` floors the large end, so the #2 expansion is ~4× the
-  cases and ~1.6–2× the wall clock. Three passes rather than two because two passes
+  reconciled**. $500–650 is a **planning basis to be replaced by a measured
+  number**: the sentence that stood here — "sweep time is not proportional to case
+  count, `MAX_REPS` caps the small end and `MIN_REPS` floors the large end, so the
+  expansion is ~4× the cases and ~1.6–2× the wall clock" — was written against a
+  timing model `6a8089f` had already removed. See the `MIN_SECONDS` entry below.
+  Three passes rather than two because two passes
   have no breakdown point — the median of two is the mean, and a single bad pass
   moves the answer with nothing to outvote it. The passes must be independent,
   which means three separate launches days apart with the instance terminated
@@ -455,9 +458,79 @@ change can be compared.
 - **`MIN_SECONDS` is now actually honoured.** The old `MAX_REPS=200` cap meant an
   n=8 measurement ran for ~12 µs against a documented 0.3 s floor. Verified: work
   per measurement is now 0.28–0.30 s from n=8 to n=2048.
+- **Denser size ladders and an `lda_pad` axis — #2 landing-order item 2.** Small is
+  16 sizes (`8..256`), medium 10 (`320..1536`), large 5 (`2048..8192`);
+  `LDA_PADS_EXTRA = {1, 4, 8, 64}` for small and medium and
+  `LDA_PADS_EXTRA_LARGE = {8}`, carried by `PADDED_ROUTINES = dgemm, dtrsm, dsymm`
+  per the approved axis assignment. **544 small cases per arm**, verified against a
+  real run rather than by arithmetic: dgemv 15, daxpy 8, ddot 8, sgemm/dtrmm/dsyrk
+  31 each, dgemm/dtrsm/dsymm 140 each. Pad 0 is deliberately absent from both extra
+  tables — the base sweep already emits it, and a 0 there would write a second
+  record for the same condition in the same run, which min-within-run would
+  silently resolve. `gates/p1.sh` now checks both pad tables and `PADDED_ROUTINES`
+  against `bench.c` the way it already checked the size ladders, and asserts pad 0
+  is absent on both sides.
+- **`MIN_SECONDS` is per regime: 0.05 s below n=256, 0.30 s above.** Nothing
+  defended 0.30 — it entered the scaffold as a bare `#define` (`11677e2`) and
+  `6a8089f` only made the declared contract true, listing it as a contract that was
+  documented and not met. It is not what protects the ~31 ns `now()` bracket;
+  `MIN_BATCH_SECONDS = 1e-3` is, and it is unchanged, so a sample is still ~1 ms and
+  the bracket still 0.003% of it. At 0.05 s an n=8 case is still ~500k calls and
+  ~51 samples, `MIN_SAMPLES = 8` still binds nothing, and the destructive-operand
+  bound on TRSM/TRMM gets tighter rather than looser. At 0.30 s it was three million
+  calls at n=8, measuring harness dispatch as much as the kernel. **Every record now
+  carries the `min_seconds` it was measured under**, so records from before and after
+  this change are distinguishable rather than merely inconsistent — which is what
+  this section of the changelog exists for.
 
 ### Fixed
 
+- **The campaign verdict counted raw cells, so `bench.c`'s ladder was a voter —
+  the max-over-cell defect's third appearance, and the first on the regime axis.**
+  `coherent_subsets()` had been normalised per routine family; `compute_verdict()`
+  had not. Before the ladder densification the three regimes contributed 20 cells
+  each and the count was balanced by accident, so nothing showed; after it they
+  contribute 160/110/20 and both failure directions exist. An effect confined to
+  small+medium clears a 60% majority on cell count alone and reads as a
+  campaign-level `V1-SET-AHEAD`; an effect confined to the large regime cannot reach
+  60% however large it is, because large is ~6% of the cells — and large is where
+  the DDR generation and the L3 step show, so the second failure would have silently
+  removed the memory-side finding from the campaign's reach. The verdict majority is
+  now over `(routine_family, regime)`-balanced weight, one unit per group divided
+  among its cells, with raw counts still printed alongside. Killed by
+  `v1-ahead-small` under mutation.
+- **A balanced majority alone could publish a global claim from a minority of the
+  work.** Balancing stops the ladder voting, but a 12-cell family then weighs as
+  much as a 240-cell one, so three small families clear 60% of balanced weight while
+  the dataset's median moves +0.2%. A directional verdict now also requires the
+  median over *all* comparable cells to clear `--min-effect`, signed; below it the
+  verdict is `MIXED` and names where the effect is. Escalated as a policy choice
+  rather than fixed in place, and decided by Scott. `family-swamped` asserts both
+  halves — with the floor removed it reports `V1-SET-AHEAD` on a dataset whose two
+  GEMM families really are at parity.
+- **A majority threshold was decided by floating-point summation order.** Balanced
+  weight is a sum of reciprocals, so a 24-cell group is 24 × (1/24), which is not
+  exactly 1.0. `full-routine-set` lands exactly on 3.0/5.0 = 0.60 by construction and
+  went red on nothing but a ladder edit, with the two directions of one comparison
+  able to disagree. All majority comparisons now go through `meets()` with
+  `MAJORITY_EPS = 1e-9` — far below any resolvable difference, far above the
+  accumulated error, and it settles the tie the way the policy's own arithmetic does.
+- **A kernel returning wrong answers could publish "publish the negative result".**
+  `verify-fail` excluded the arm and printed the anomaly correctly; the *verdict* was
+  refused only because the excluded cells pushed the non-comparable fraction over
+  `--max-nodata-fraction`. The densification took dgemm's total exclusion from 40% of
+  the cross to 29%, under the 34% threshold, and the fixture went green on `NULL`.
+  The threshold was never the guard. `compute_verdict()` now refuses `NULL` while any
+  routine stands excluded for a failed verification, on principle: a wrong answer is
+  not a slow answer, that routine never compared, and it is where a kernel difference
+  was most likely. The threshold was **not** retuned. Per-pass verdicts get the same
+  guard from each pass's own exclusions.
+- **Section 3 could have pooled the pad axis unobserved.** With one extra pad value
+  "tight versus padded" was a single comparison, so a per-pad attribution had nothing
+  to distinguish it from an averaged one. `lda-penalty` now plants 18% at pads 1/4/8
+  and leaves pad 64 flat *on the same arm*, and asserts both; pooling every padded
+  stride against pad 0 fails it. A penalty is a property of the stride, and which
+  stride it is is the packing finding.
 - **A timer-outrun record was reported as a wrong answer.** `bench.c:381` sets
   *both* `gflops = 0` and `verified = false` on the same record when the timer is
   outrun, because it never ran the verification — so a timer-outrun record arrives

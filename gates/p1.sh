@@ -103,10 +103,78 @@ EOF
     bad "$name drifted — bench.c has [$from_c], synth.py has [$from_py]"
   fi
 }
+
+# The same check for a table of strings. The pad axis is two integer tables and
+# one list of routine names, and the names are the half that decides which
+# routines get pads at all -- a drift there would leave the fixture planting
+# padded cells for a routine bench.c never pads, or vice versa, and either way
+# section 3's coverage arithmetic (see reference-arm-partial's 24) is measuring a
+# design that was not run.
+strings_check() {
+  local name="$1" cvar="$2" pyvar="$3"
+  local from_c from_py
+  from_c=$(
+    "$PY" - "$cvar" <<'EOF'
+import re, sys, pathlib
+var = sys.argv[1]
+src = pathlib.Path("src/bench.c").read_text()
+m = re.search(r"\b" + re.escape(var) + r"\b\s*\[[^\]]*\]\s*=\s*\{([^}]*)\}", src)
+if not m:
+    sys.exit("no match")
+print(",".join(sorted(re.findall(r'"([^"]*)"', m.group(1)))))
+EOF
+  )
+  from_py=$(
+    "$PY" - "$pyvar" <<'EOF'
+import sys, importlib.util, pathlib
+spec = importlib.util.spec_from_file_location("synth", pathlib.Path("tools/synth.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+print(",".join(sorted(str(v) for v in getattr(mod, sys.argv[1]))))
+EOF
+  )
+  if [ -z "$from_c" ]; then
+    bad "$name: could not read $cvar out of src/bench.c"
+  elif [ "$from_c" = "$from_py" ]; then
+    ok "$name: $from_py"
+  else
+    bad "$name drifted — bench.c has [$from_c], synth.py has [$from_py]"
+  fi
+}
 ladder_check "small sizes"  "SIZES_SMALL"  "SIZES_SMALL"
 ladder_check "medium sizes" "SIZES_MEDIUM" "SIZES_MEDIUM"
 ladder_check "large sizes"  "SIZES_LARGE"  "SIZES_LARGE"
 ladder_check "level-1 lengths" "lens" "LEVEL1_LENS"
+ladder_check "lda pads (small+medium)" "LDA_PADS_EXTRA" "LDA_PADS_EXTRA"
+ladder_check "lda pads (large)" "LDA_PADS_EXTRA_LARGE" "LDA_PADS_EXTRA_LARGE"
+strings_check "padded routines" "PADDED_ROUTINES" "PADDED_ROUTINES"
+
+# pad 0 must not appear in either extra-pad table. The base sweep already emits
+# every routine at pad 0, so a 0 here would emit a second record for the same
+# condition in the same run -- which min-within-run would then silently resolve,
+# turning a duplicated case into a quietly different sample. Asserted on both
+# sides because the hazard is in bench.c and the fixture copies it.
+if pad0=$("$PY" - <<'EOF'
+import importlib.util, pathlib, re, sys
+spec = importlib.util.spec_from_file_location("synth", pathlib.Path("tools/synth.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+src = pathlib.Path("src/bench.c").read_text()
+bad = []
+for var in ("LDA_PADS_EXTRA", "LDA_PADS_EXTRA_LARGE"):
+    m = re.search(r"\b" + var + r"\b\s*\[[^\]]*\]\s*=\s*\{([^}]*)\}", src)
+    if m and 0 in [int(x, 0) for x in re.findall(r"0x[0-9a-fA-F]+|\d+", m.group(1))]:
+        bad.append(f"src/bench.c:{var}")
+    if 0 in [int(x) for x in getattr(mod, var)]:
+        bad.append(f"tools/synth.py:{var}")
+print("; ".join(bad) if bad else "no extra-pad table contains 0")
+sys.exit(1 if bad else 0)
+EOF
+); then
+  ok "pad 0 is absent from the extra-pad tables: $pad0"
+else
+  bad "pad 0 appears in an extra-pad table ($pad0) — the base sweep emits that condition too"
+fi
 
 # ---- 3. every scenario ----------------------------------------------------
 head_ "3. planted scenarios"

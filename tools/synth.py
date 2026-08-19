@@ -49,10 +49,18 @@ from dataclasses import dataclass, field
 # Copied, not imported -- there is nothing to import from a C file. If bench.c's
 # ladders change (which requires asking Scott) these must change with them, and
 # gates/p1.sh cross-checks the two lists so the copy cannot rot silently.
-SIZES_SMALL = (8, 16, 24, 32, 48, 64, 96, 128, 192, 256)
-SIZES_MEDIUM = (384, 512, 768, 1024, 1536)
+SIZES_SMALL = (8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256)
+SIZES_MEDIUM = (320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536)
 SIZES_LARGE = (2048, 3072, 4096, 6144, 8192)
 LEVEL1_LENS = (1024, 16384, 262144, 4194304)
+
+# The lda_pad axis, likewise copied. 0 is absent from both by construction: the
+# base pad=0 sweep already emits it, and a second pass would be a duplicate
+# sample for one condition. PADDED_ROUTINES is the axis assignment fixed in
+# CLAUDE.md -- pads on dgemm plus the two N2-gap routines, not on everything.
+LDA_PADS_EXTRA = (1, 4, 8, 64)
+LDA_PADS_EXTRA_LARGE = (8,)
+PADDED_ROUTINES = ("dgemm", "dtrsm", "dsymm")
 REGIMES = ("small", "medium", "large")
 
 
@@ -378,11 +386,19 @@ def conditions(routines, level1, transposes=()):
                             out.append((r, m, m, m, 0, 1, ta, tb))
                         else:
                             out.append((r, m, m, 0, 0, 1, ta, tb))
-    if "dgemm" in routines:
-        for sizes in (SIZES_MEDIUM, SIZES_LARGE):
+    for r in PADDED_ROUTINES:
+        if r not in routines:
+            continue
+        gm = r in gemmish
+        for sizes, pads in (
+            (SIZES_SMALL, LDA_PADS_EXTRA),
+            (SIZES_MEDIUM, LDA_PADS_EXTRA),
+            (SIZES_LARGE, LDA_PADS_EXTRA_LARGE),
+        ):
             for m in sizes:
-                for ta, tb in pairs:
-                    out.append(("dgemm", m, m, m, 8, 1, ta, tb))
+                for pad in pads:
+                    for ta, tb in pairs if gm else ((None, None),):
+                        out.append((r, m, m, m if gm else 0, pad, 1, ta, tb))
     if "dgemv" in routines:
         for sizes in (SIZES_MEDIUM, SIZES_LARGE):
             for m in sizes:
@@ -1982,9 +1998,24 @@ def sc_family_swamped():
                     "trans:NN:V1",
                 ],
             },
-            # The whole point: 22% on three of four families is not a null.
+            # The whole point: 22% on three of four families is not a null. And it
+            # is not a campaign-level V1-SET-AHEAD either -- three families out of
+            # four clear the balanced majority while the median over every
+            # comparable cell stays inside the parity band, because the two GEMM
+            # families really are at parity and they are most of the work. That is
+            # the effect-size floor, and it is asserted here rather than in a
+            # scenario of its own because this is the dataset that has both halves:
+            # a balanced majority that must be believed, and a global median that
+            # must not be published as one. Both directional codes are named, so a
+            # mutant that flips the sign fails too.
             {"kind": "stdout_absent", "text": "publish the negative result"},
-            {"kind": "verdict_code", "not_one_of": ["NULL"]},
+            {"kind": "verdict_code", "one_of": ["MIXED"]},
+            {"kind": "verdict_code", "not_one_of": ["NULL", "V1-SET-AHEAD", "V2-SET-AHEAD"]},
+            # The sentence the floor exists to print: located, with the number, and
+            # explicitly not global. A MIXED reached by some other route would not
+            # say this.
+            {"kind": "stdout_contains", "text": "below the 5% floor"},
+            {"kind": "stdout_contains", "text": "not a campaign-level direction"},
             # The MIXED line reports family weight, not row count -- a reader shown
             # "22% of cells" would conclude the effect is marginal when it is 3 of 4
             # families, and that sentence is what the campaign's answer to "where"
@@ -2218,28 +2249,48 @@ def sc_lda_penalty():
     """A leading-dimension penalty, which section 3 exists to find and no fixture
     planted. The same gain was applied to pad=0 and pad=8 everywhere, so `padding
     hurts` and `padding helps` were never produced and the packing-kernel
-    CONSEQUENCE line was unreachable."""
+    CONSEQUENCE line was unreachable.
+
+    The penalty is planted per pad, not uniformly across the pad axis, because
+    with #2's LDA_PADS_EXTRA there now IS a pad axis: pads 1/4/8 hurt and pad 64
+    is flat, on the same arm. A uniform plant would pass against a section 3 that
+    pooled every padded stride into one comparison against pad=0, which is the
+    obvious way to write it and would report one averaged penalty per size --
+    losing the only thing the four pads were added to see."""
+    hurts = {1: 0.82, 4: 0.82, 8: 0.82}  # pad 64 absent: flat by construction
     return Scenario(
         name="lda-penalty",
         description=(
-            "Every OpenBLAS arm is 18% slower at a padded leading dimension than at a "
-            "tight one, with ArmPL flat. That isolates packing-kernel quality from the "
-            "inner kernel, which is the only thing section 3 is for."
+            "Every OpenBLAS arm is 18% slower at lda_pad 1, 4 and 8 than at a tight "
+            "leading dimension, flat at pad 64, with ArmPL flat everywhere. That "
+            "isolates packing-kernel quality from the inner kernel, which is the only "
+            "thing section 3 is for, and it must be attributed per pad."
         ),
         hosts=[_host()],
         arms=[
-            Arm("openblas", "DYNAMIC", "unforced", gain_pad={8: 0.82}),
-            Arm("openblas", "DYNAMIC", V1, gain_pad={8: 0.82}, in_manifest=False),
-            Arm("openblas", "DYNAMIC", V2, gain_pad={8: 0.82}, in_manifest=False),
-            Arm("openblas", V1, "unforced", gain_pad={8: 0.82}),
-            Arm("openblas", V2, "unforced", gain_pad={8: 0.82}),
+            Arm("openblas", "DYNAMIC", "unforced", gain_pad=hurts),
+            Arm("openblas", "DYNAMIC", V1, gain_pad=hurts, in_manifest=False),
+            Arm("openblas", "DYNAMIC", V2, gain_pad=hurts, in_manifest=False),
+            Arm("openblas", V1, "unforced", gain_pad=hurts),
+            Arm("openblas", V2, "unforced", gain_pad=hurts),
             Arm("armpl", "native", "unforced", thread_backend="openmp"),
         ],
         expect=[
             {
                 "kind": "lda_verdict",
                 "arm_contains": "openblas",
+                "lda_pad_in": [1, 4, 8],
                 "expect": "padding hurts",
+                "min_rows": 4,
+            },
+            # The same arm, the pad that was left flat. Fails a section 3 that
+            # pools pads: averaging 0.82, 0.82, 0.82 and 1.0 against pad=0 would
+            # call every pad "padding hurts", including this one.
+            {
+                "kind": "lda_verdict",
+                "arm_contains": "openblas",
+                "lda_pad_in": [64],
+                "expect": "within band",
                 "min_rows": 4,
             },
             # ArmPL is flat by construction, so its rows must come back `within
@@ -2602,14 +2653,24 @@ def sc_reference_arm_partial():
             # and losing the reference must not lose the comparison that matters.
             {"kind": "cross_verdicts_where", "routine": "dtrsm", "expect": "V1-set-ahead", "min_rows": 2},
             # And the hole is reported as a hole. The census says this arm ran, so
-            # nothing in results/ accounts for the six absent dtrsm cells: by
-            # standing order 11 that is MISSING-UNEXPLAINED and bit 4, not a
-            # silently narrower table. Asserted with the count, because "some hole
+            # nothing in results/ accounts for the absent dtrsm cells: by standing
+            # order 11 that is MISSING-UNEXPLAINED and bit 4, not a silently
+            # narrower table. Asserted with the count, because "some hole
             # somewhere" would also be satisfied by a coverage model that had lost
             # track of which arm was missing.
+            #
+            # 24, and the arithmetic is the pad axis: a coverage cell is
+            # (instance, arm, threads, routine, regime, lda_pad, incx), dtrsm is in
+            # PADDED_ROUTINES, and this fixture runs two thread counts. So
+            # 2 threads x (small 5 pads + medium 5 pads + large 2 pads) = 24, where
+            # 5 is pad 0 plus LDA_PADS_EXTRA and 2 is pad 0 plus
+            # LDA_PADS_EXTRA_LARGE. It was 6 before #2 landed the pad axis
+            # (2 threads x 3 regimes x pad 0 alone), and it moves again if either
+            # pad tuple or PADDED_ROUTINES changes -- which is the point of
+            # asserting the number rather than ">= 1".
             {"kind": "exit_bits_set", "bits": [4]},
             {"kind": "exit_bits_clear", "bits": [2, 8, 16]},
-            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 6},
+            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 24},
         ],
     )
 
@@ -3162,12 +3223,24 @@ def check_one(exp, report, stdout, exit_code, root):
         rows = [r for r in (report.get("lda_penalty") or []) if r.get("penalty") is not None]
         if "arm_contains" in exp:
             rows = [r for r in rows if exp["arm_contains"] in str(r.get("arm"))]
+        if "lda_pad_in" in exp:
+            # The pad axis is filterable because a penalty is a property of the
+            # stride, not of the arm: one arm can hurt at pad 8 and be flat at
+            # pad 64, and an expectation that could not say which pad it meant
+            # would have to be satisfied by every pad or by none.
+            pads = {int(p) for p in exp["lda_pad_in"]}
+            rows = [r for r in rows if r.get("lda_pad") in pads]
         if len(rows) < exp.get("min_rows", 1):
             return False, f"{len(rows)} lda rows with a penalty, want >= {exp.get('min_rows', 1)}"
         bad = [r for r in rows if r.get("verdict") != exp["expect"]]
         return not bad, (
             f"{len(rows) - len(bad)}/{len(rows)} lda rows are {exp['expect']!r}"
-            + ("; wrong: " + ", ".join(f"{r['arm']}@{r['m']}={r['verdict']}" for r in bad[:5]) if bad else "")
+            + (
+                "; wrong: "
+                + ", ".join(f"{r['arm']}@n={r['m']},pad={r['lda_pad']}={r['verdict']}" for r in bad[:5])
+                if bad
+                else ""
+            )
         )
 
     if kind == "cross_nodata_where":

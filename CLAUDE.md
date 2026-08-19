@@ -98,10 +98,21 @@ adjusted**: it described the pre-expansion routine table, and reconciling the tw
 numbers would only invite someone to compare them. One expanded pass across all
 five hosts is **30–37 instance-hours**, and three of them land at **$500–650**.
 
-The expansion is ~4× the case count and only ~1.6–2× the wall clock, because sweep
-time is not proportional to cases: `MAX_REPS` caps the small end at microseconds
-while `MIN_REPS` floors the large end, so one `n=8192` DGEMM case costs more than a
-whole small ladder. Densify below 2048 freely; be selective above.
+**$500–650 is the planning basis, and it is to be replaced by a measured number,
+not defended.** The paragraph that used to stand here said the expansion was ~4×
+the cases and only ~1.6–2× the wall clock, because `MAX_REPS` capped the small end
+and `MIN_REPS` floored the large end — and `bench.c` has neither of those any more
+(`6a8089f` removed them). `MIN_SECONDS` targets a fixed amount of *work* per
+measurement, so it buys as many calls as it takes and an `n=8` case cost the same
+wall clock as an `n=1024` one. "Densify below 2048 freely" rested entirely on the
+cap and does not survive its absence; the per-regime floor
+(`MIN_SECONDS_SMALL = 0.05` below n=256) restores most of the small-end economy but
+does not restore the premise. So the extra small and medium cases add close to
+linearly, and the real multiplier is unknown until it is measured.
+
+Measure it on the **slowest** arm of the first P2 iteration, not a representative
+one — see §Wall-clock is anti-correlated with arm quality for why a representative
+arm extrapolates low.
 
 - **Everything runs on-demand, including P2.** Spot was the earlier decision and is
   reversed: ~$100 of saving is not worth putting untested reclaim handling on the
@@ -185,6 +196,65 @@ Item 1 landed with the family normalisation, the key extension, the transpose ax
 in the coherence guard, and the intersection rule; `transpose-shopping`,
 `family-swamped`, `replicate-majority` and `replicate-loss-unexplained` are the
 fixtures, each mutation-validated.
+
+### The axis assignment — decided 2026-08-19, do not widen it
+
+The cross is **pads × {NN, TN}**, not the full cross and not NN-only. Transposes
+and pads probe the same hypothesis — packing quality — by different mechanisms, so
+`pad=64 × TT` teaches nothing beyond `pad=64 × NN` plus `pad=0 × TT`. But NN-only
+is a notch too thin: TN is the transposed-A path through `gemm_tcopy_*` rather than
+`gemm_ncopy_*`, and alignment interacts differently with the two. Two
+pad-carrying transposes is the smallest set covering both packing routines.
+
+| axis | carried by | not carried by |
+|---|---|---|
+| transposes | `dgemm`, `sgemm` — NN/TN/NT/TT small+medium, NN/TN large | TRSM/TRMM, which already carry side/uplo/trans/diag; opening that space is a separate question the campaign does not need |
+| `lda_pad` | `dgemm` at {NN, TN}; `dtrsm`, `dsymm` at their default setting | `sgemm`, `dsyrk`, `dtrmm`, `dgemv`, complex, BF16 |
+| conjugate-transpose | `zgemm`/`cgemm` at **NN and CN** | everything real |
+| neither | BF16 — it is a kernel-selection question | |
+
+`zgemm` at NN only would be the same error as `dgemm` at NN only, one level down:
+conjugate-transpose is a distinct code path and it is what most complex research
+code actually issues. That is **1005 cases per arm** against 156 today (6.4×), of
+which 544 are small, 350 medium, 95 large and 16 level-1.
+
+### Wall-clock is anti-correlated with arm quality
+
+The cheap/expensive boundary is not a size. It is wherever ~6 calls exceed the
+`MIN_SECONDS` floor — `t_call ≈ 0.1 s` — and that size moves with thread count and
+with how fast the arm is: single-threaded around n≈800 for DGEMM, at 192 threads
+closer to n≈2000. So the **slowest** arm is the most expensive one, and the generic
+`ARMV8` arm at one thread on `c9g` is likely the single most expensive arm in the
+campaign — and it is one the campaign specifically wants. Instrument per-case
+wall-clock on the slowest arm of the first P2 iteration, never on a representative
+one, or the extrapolation to P3 lands low.
+
+### `MIN_SECONDS` is per regime, and 0.30 was never argued for
+
+Checked before changing it, per Scott. **Nothing defends `MIN_SECONDS = 0.30`.** It
+arrived unargued in the scaffold (`11677e2`, a bare `#define` with no comment) and
+the timing audit (`6a8089f`) did not choose it — the audit's own message lists it
+as a *contract that was documented but not met*: "an n=8 measurement ran ~12 us
+against a documented 0.3 s floor, because `MAX_REPS=200` capped it." The audit made
+the declared floor true; it never asked whether the declared floor was right.
+
+The 31 ns `now()` bracketing is defended by **`MIN_BATCH_SECONDS = 1e-3`**, which
+is independent of `MIN_SECONDS` and unchanged: the batch is still ~1 ms, so the
+bracket is still 0.003% of a sample. Four other checks all clear:
+
+- `MIN_SAMPLES = 8` still binds nothing — 0.05 s of 1 ms batches is ~51 samples.
+- No turbo and no SMT on Graviton, so there is no frequency ramp needing a long
+  window. (On x86 there would be, and this argument would not hold.)
+- The destructive-operand bound on TRSM/TRMM gets *tighter*, not looser: fewer
+  calls per measurement is the safe direction for `TRI_OFFDIAG`'s monotone bound.
+- Sample count already varies 100× across the ladder (3 at `n=8192`, ~301 at
+  `n=8`), so a per-regime floor does not introduce a non-uniformity that was not
+  there. What must stay uniform is the *comparison*, and it does: the same case on
+  two arms is batched to the same ~1 ms sample, so both arms get the same count.
+
+So the small regime takes **0.05 s** and medium/large keep 0.30 s. That is ~136 s
+back per (arm × thread point) at 544 small cases, and it stops spending three
+million calls at `n=8` measuring harness dispatch.
 
 ## Ask before
 

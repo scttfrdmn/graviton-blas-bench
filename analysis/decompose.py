@@ -121,6 +121,24 @@ DEFAULT_WIN_FRACTION = 0.60
 # Fraction of comparable cells that must agree for a campaign-level verdict.
 DEFAULT_VERDICT_MAJORITY = 0.60
 
+# Slack on every majority comparison. Balanced weighting makes each (family,
+# regime) group contribute one unit of weight *as a sum of reciprocals* — a
+# 24-cell group is 24 * (1/24), which is not exactly 1.0 in binary. A dataset
+# that lands exactly on the threshold by construction (five small-regime
+# families, three of them one-sided: 3.0/5.0 = 0.60) therefore has its verdict
+# decided by summation order rather than by the data, and the two directions of
+# a comparison can disagree with each other. One part in 10^9 is far below any
+# difference the campaign could resolve and far above the accumulated error of
+# summing a few thousand reciprocals, so it decides the tie in favour of the
+# hand-arithmetic answer, which is the one the policy is written in.
+MAJORITY_EPS = 1e-9
+
+
+def meets(value: float, threshold: float) -> bool:
+    """value >= threshold, with MAJORITY_EPS of slack. See MAJORITY_EPS."""
+    return value >= threshold - MAJORITY_EPS
+
+
 # Comparable cells a single axis value (one routine, one regime, one instance)
 # must hold before it is allowed to block the NULL branch. 3 for the same reason
 # as DEFAULT_MIN_SIZES: two cells agreeing is not a localised effect.
@@ -2280,12 +2298,17 @@ def report_replicates(inp, hosts, explain, pass_explain, args, out):
             bench = [r for r in inp.bench if r.get("run_id") in rids]
             # A fresh Excluded per pass: exc is a report of what this file dropped,
             # and adding the same dropped record to the campaign-level tally once
-            # per pass would inflate section 5's counts.
-            pcells = build_cells(bench, hosts, Excluded())
+            # per pass would inflate section 5's counts. Kept rather than discarded
+            # because compute_verdict() reads it to refuse a null over a wrong
+            # answer, and a pass whose own arm got a routine wrong must be refused
+            # on that pass's evidence -- not on the campaign's, and not at all.
+            # It is never merged into `exc`; only read.
+            pexc = Excluded()
+            pcells = build_cells(bench, hosts, pexc)
             pcross = report_target_cross(
                 pcells, cell_groups(pcells), hosts, explain, pass_explain, inp, args, lambda _line: None
             )
-            v = compute_verdict(pcross, hosts, args)
+            v = compute_verdict(pcross, hosts, pexc, args)
             # Arms this pass lost. Reported here and nowhere else: section 7 lists
             # an absence only when the arm produced no cells at all, and an arm that
             # ran on two passes and died on the third produces cells -- so the
@@ -2494,7 +2517,7 @@ def coherent_subsets(cross, args):
         if not total_w:
             continue
         for direction, side in (("V1", "v1"), ("V2", "v2")):
-            if t[side] / total_w < args.verdict_majority:
+            if not meets(t[side] / total_w, args.verdict_majority):
                 continue
             d = deltas[(axis, value, side)]
             found.append(
@@ -2513,11 +2536,49 @@ def coherent_subsets(cross, args):
     return found
 
 
-def compute_verdict(cross, hosts, args):
+def compute_verdict(cross, hosts, exc: Excluded, args):
     """One line, computed. The previous version's decision guide was
     unconditional literal text, so `grep -q parity` and `grep -q "publish the
-    negative result"` both passed on a dataset with zero comparisons."""
+    negative result"` both passed on a dataset with zero comparisons.
+
+    The majority is over (routine_family, regime)-BALANCED weight, not over raw
+    cells, for the same reason coherent_subsets() normalises by family: a raw
+    count makes bench.c's ladder a voter. This is the third appearance of that
+    defect and the first one on the regime axis, and the #2 ladder densification
+    is what surfaced it. Before it, the three regimes each contributed 20 cells
+    to the default fixture -- balanced by accident, so nothing showed. After it
+    they contribute 160/110/20, and the consequences are both directions of
+    wrong: an effect confined to small+medium clears a 60% majority on cell count
+    alone and reads as a campaign-level V1-SET-AHEAD, while an effect confined to
+    the large regime cannot reach 60% no matter how large it is, because large is
+    ~6% of the cells. The large regime is where the DDR generation and the L3 step
+    show, so that second failure would have silently removed the memory-side
+    finding from the campaign's reach.
+
+    So each (family, regime) group contributes one unit of weight, divided among
+    its cells. Raw counts are still printed beside the fraction: the balanced
+    fraction is what decides, and the reader can see both. Asserted in both
+    directions by the fixtures -- a rule that could manufacture a direction out of
+    a genuine null would be worse than the false negative it fixes.
+
+    `exc` is read for one thing only: which routines an arm got WRONG. A wrong
+    answer is not a slow answer. The kernel computed something other than the
+    reference function, so the comparison in that routine did not happen -- and it
+    is precisely where a kernel difference was most likely, because a kernel that
+    gets the answer wrong is a kernel doing something different. So NULL is
+    refused while any routine stands excluded for a verification failure: "no
+    difference anywhere" is a claim about the whole design, and the excluded part
+    is the part that cannot support it. This used to be left to
+    --max-nodata-fraction, which was never the guard, it only happened to be one:
+    the #2 densification took dgemm's total exclusion from 40% of the cross down
+    to 29%, under the 34% threshold, and the verify-fail fixture went green on
+    "publish the negative result" off a kernel returning wrong answers. Standing
+    order 4 says a failed verification poisons the record; this is that order at
+    the one branch where the poison would have been published as a finding."""
     tally = defaultdict(int)
+    weight = defaultdict(float)
+    group_cells = defaultdict(int)
+    comparable_cells = []
     per_ir = defaultdict(lambda: defaultdict(int))
     fam_cells = defaultdict(int)
     deltas = []
@@ -2542,7 +2603,10 @@ def compute_verdict(cross, hosts, args):
         tally[bucket] += 1
         per_ir[(c["instance"], c["regime"])][bucket] += 1
         if bucket in ("v1_wins", "v2_wins", "parity"):
-            fam_cells[c.get("routine_family") or routine_family(c.get("routine"))] += 1
+            fam = c.get("routine_family") or routine_family(c.get("routine"))
+            fam_cells[fam] += 1
+            group_cells[(fam, c["regime"])] += 1
+            comparable_cells.append((bucket, fam, c["regime"]))
             if c["median_delta"] is not None:
                 deltas.append(c["median_delta"])
             if not c["verified"]:
@@ -2553,9 +2617,30 @@ def compute_verdict(cross, hosts, args):
 
     total = sum(tally.values())
     comparable = tally["v1_wins"] + tally["v2_wins"] + tally["parity"]
+    for bucket, fam, regime in comparable_cells:
+        weight[bucket] += 1.0 / group_cells[(fam, regime)]
+    weight_total = sum(weight.values())
+
+    def share(bucket):
+        """Balanced share of the comparable weight. Falls back to the raw
+        fraction only when there is no weight at all, which means no comparable
+        cells, which the INCONCLUSIVE branch above has already caught."""
+        return (weight[bucket] / weight_total) if weight_total else 0.0
+
     med = statistics.median(deltas) if deltas else None
     band_pct = 100 * args.min_effect
     subsets = coherent_subsets(cross, args)
+    poisoned = sorted({r.get("routine") for r in exc.verified_false} - {None})
+
+    def located():
+        """The coherent subsets, rendered. Shared by every branch that reports a
+        located effect, so a reader never has to learn two phrasings for it."""
+        return "; ".join(
+            f"{s['axis']} {s['value']}: {s['direction']} set ahead in {s['wins']}/{s['comparable']} cells "
+            f"({100 * s['weight'] / s['weight_total']:.0f}% of family weight)"
+            + (f" (median {100 * s['median_delta']:+.1f}%)" if s["median_delta"] is not None else "")
+            for s in subsets[: args.max_listed]
+        )
 
     if total == 0:
         code = "NO-DATA"
@@ -2570,39 +2655,73 @@ def compute_verdict(cross, hosts, args):
             f"{args.v1_set}-set measurement (no_data={tally['no_data']}, "
             f"inconclusive={tally['inconclusive']}, inadmissible-host={tally['inadmissible']})"
         )
-    elif tally["v1_wins"] / comparable >= args.verdict_majority:
-        code = "V1-SET-AHEAD"
+    elif meets(share("v1_wins"), args.verdict_majority) or meets(share("v2_wins"), args.verdict_majority):
+        # A balanced majority is necessary for a directional headline and not
+        # sufficient. It answers "how much of the experiment moved", and the
+        # second question — "did the experiment move" — is an effect size, so it
+        # is asked as one rather than as a second cell count.
+        #
+        # This is the guard the ladder densification made load-bearing. Balancing
+        # by (family, regime) is what stops the ladder voting, but it also means a
+        # family with 12 cells weighs as much as one with 240, so an effect on
+        # three small families clears 60% of balanced weight while moving the
+        # dataset's median by +0.24%. Publishing "V1-SET-AHEAD, median +0.2%" off
+        # that would be the max-over-cell defect in its final form: a global claim
+        # sourced from a minority of the work. The floor is --min-effect, the same
+        # one the parity band uses, and it is signed — a V1 majority whose median
+        # runs the other way is not a V1 headline either.
+        direction = "V1" if meets(share("v1_wins"), args.verdict_majority) else "V2"
+        bucket = "v1_wins" if direction == "V1" else "v2_wins"
+        signed = (med or 0.0) if direction == "V1" else -(med or 0.0)
+        if med is not None and signed >= args.min_effect:
+            code = f"{direction}-SET-AHEAD"
+            tail = (
+                f"above the {band_pct:.0f}% floor"
+                if direction == "V1"
+                else ("against the V1 set; the NEON choice was right, publish the negative result")
+            )
+            line = (
+                f"VERDICT: {code} — median {100 * med:+.1f}% over {tally[bucket]}/{comparable} "
+                f"comparable cells ({100 * share(bucket):.0f}% of balanced weight), {tail}"
+            )
+        else:
+            code = "MIXED"
+            shown = f"{100 * med:+.2f}%" if med is not None else "undefined"
+            line = (
+                f"VERDICT: MIXED — the {direction} set carries {100 * share(bucket):.0f}% of balanced "
+                f"weight but only {tally[bucket]}/{comparable} comparable cells, and the median across "
+                f"all of them is {shown}, below the {band_pct:.0f}% floor. So the effect is located, "
+                f"not global: {located()}. A balanced majority over a minority of the work is not a "
+                f"campaign-level direction"
+            )
+    elif meets(share("parity"), args.verdict_majority) and not subsets and poisoned:
+        # Parity everywhere the comparison ran, and a routine that never ran
+        # because an arm got it wrong. See the docstring: this is refused as a
+        # null on principle, not on a coverage threshold.
+        code = "INCONCLUSIVE"
         line = (
-            f"VERDICT: V1-SET-AHEAD — median {100 * med:+.1f}% over {tally['v1_wins']}/{comparable} "
-            f"comparable cells, above the {band_pct:.0f}% floor"
+            f"VERDICT: INCONCLUSIVE — {tally['parity']}/{comparable} comparable cells are at parity, "
+            f"but {', '.join(poisoned[: args.max_listed])} was excluded for WRONG ANSWERS "
+            f"(section 5), so the routine most likely to differ is the one that did not compare. "
+            f"A null is a claim about the whole design; fix the correctness failure and re-run "
+            f"before reading this as parity"
         )
-    elif tally["v2_wins"] / comparable >= args.verdict_majority:
-        code = "V2-SET-AHEAD"
-        line = (
-            f"VERDICT: V2-SET-AHEAD — median {100 * med:+.1f}% over {tally['v2_wins']}/{comparable} "
-            f"comparable cells, against the V1 set; the NEON choice was right, publish the negative result"
-        )
-    elif tally["parity"] / comparable >= args.verdict_majority and not subsets:
+    elif meets(share("parity"), args.verdict_majority) and not subsets:
         code = "NULL"
         line = (
             f"VERDICT: NULL — {args.v1_set}-set and {args.v2_set}-set at parity in "
-            f"{tally['parity']}/{comparable} comparable cells; publish the negative result"
+            f"{tally['parity']}/{comparable} comparable cells "
+            f"({100 * share('parity'):.0f}% of balanced weight); publish the negative result"
         )
-    elif tally["parity"] / comparable >= args.verdict_majority:
+    elif meets(share("parity"), args.verdict_majority):
         # A parity majority with a coherent minority is not a null. See
         # coherent_subsets(): the majority here is an artefact of how many cells
         # the unaffected routines contribute, so reporting NULL would publish a
         # negative result over a real, located effect.
         code = "MIXED"
-        where = "; ".join(
-            f"{s['axis']} {s['value']}: {s['direction']} set ahead in {s['wins']}/{s['comparable']} cells "
-            f"({100 * s['weight'] / s['weight_total']:.0f}% of family weight)"
-            + (f" (median {100 * s['median_delta']:+.1f}%)" if s["median_delta"] is not None else "")
-            for s in subsets[: args.max_listed]
-        )
         line = (
             f"VERDICT: MIXED — {tally['parity']}/{comparable} comparable cells are at parity, but the "
-            f"difference is located, not absent: {where}. Not a null: the effect is confined to a "
+            f"difference is located, not absent: {located()}. Not a null: the effect is confined to a "
             f"minority of cells, and cell counts follow bench.c's size ladder, not the hardware"
         )
     else:
@@ -2610,7 +2729,9 @@ def compute_verdict(cross, hosts, args):
         line = (
             f"VERDICT: MIXED — {tally['v1_wins']} cells favour the V1 set, {tally['v2_wins']} the V2 "
             f"set, {tally['parity']} at parity, of {comparable} comparable; no majority at "
-            f"{100 * args.verdict_majority:.0f}%"
+            f"{100 * args.verdict_majority:.0f}% of balanced weight "
+            f"(V1 {100 * share('v1_wins'):.0f}%, V2 {100 * share('v2_wins'):.0f}%, "
+            f"parity {100 * share('parity'):.0f}%)"
         )
     # A directional headline that rests on any intersected comparison is not a
     # full-replication claim, and must not be able to be read as one. The code
@@ -2641,6 +2762,7 @@ def compute_verdict(cross, hosts, args):
         "median_delta": med,
         "min_effect": args.min_effect,
         "unverified_cells": unverified,
+        "poisoned_routines": poisoned,
         "coherent_subsets": subsets,
         "by_instance_regime": [
             {"instance": i, "regime": r, **dict(per_ir[(i, r)])} for (i, r) in sorted(per_ir, key=skey)
@@ -2920,7 +3042,7 @@ def main(argv=None):
     report_scaling(scaling, out)
     coverage = report_coverage(cells, inp, explain, hosts, exc, args, out)
     replicates = report_replicates(inp, hosts, explain, pass_explain, args, out)
-    verdict = compute_verdict(cross, hosts, args)
+    verdict = compute_verdict(cross, hosts, exc, args)
 
     exit_code = 0
     if exc.verified_false or exc.zero_gflops or exc.forced_coretype:
