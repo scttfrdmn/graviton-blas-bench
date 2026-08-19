@@ -94,30 +94,50 @@ until it finds something.
 
 Decided 2026-08-19, after costing the design as built. One clean pass across all
 five hosts is ~18.6 instance-hours and ~$96 on-demand, which is low enough to
-change the question: the right use of the next $100 is a **second independent
-pass**, not a 3× discount on the first.
+change the question: the right use of the next $200 is **two further independent
+passes**, not a 3× discount on the first.
 
-- **P2 runs on spot.** Several iterations, throwaway data, harness debugging. A
-  reclaim costs a restart, not integrity, and the iteration-count uncertainty
-  lives here. ~$47 against ~$148 on-demand.
-- **P3 runs on-demand, twice.** A spot reclaim mid-sweep means arms *within one
-  host's dataset* were measured on different physical hardware — a between-host
-  variable smuggled inside what the analysis treats as one host. Per-arm S3
-  shipping makes that data survivable, not comparable. `us-east-1a` single-AZ
-  bare metal on a new instance type is also the thinnest spot pool obtainable,
-  and `c9g.metal-48xl` capacity is already the campaign's gating risk.
-- **The second P3 pass is a replicate, not a retry.** Relaunch days apart so the
-  metal lands on different physical machines. A 20–31% effect from one pass on
-  one box per family is thin; the same effect reproduced across two independent
-  passes is the strongest available defence of the headline.
-- **A replicate needs no new field and must not be pooled.** Two passes are
+- **P2 runs on spot, on `c8g.metal-48xl`.** Several iterations, throwaway data,
+  harness debugging. A reclaim costs a restart, not integrity, and the
+  iteration-count uncertainty lives here. ~$47 at four iterations, against ~$148
+  on-demand. The host is not the cheap one on purpose: `c8g` is where the central
+  cross lives, and debugging P2 anywhere else would leave the most important
+  analysis path untested until P3.
+- **P3 runs on-demand, three times.** A spot reclaim mid-sweep means arms
+  *within one host's dataset* were measured on different physical hardware — a
+  between-host variable smuggled inside what the analysis treats as one host.
+  Per-arm S3 shipping makes that data survivable, not comparable. `us-east-1a`
+  single-AZ bare metal on a new instance type is also the thinnest spot pool
+  obtainable, and `c9g.metal-48xl` capacity is already the campaign's gating risk.
+- **Three, because two passes have no breakdown point.** The median of two *is*
+  the mean: one bad pass moves it, and there is no way to tell which pass was
+  bad. Three passes reject one bad pass by majority. The campaign's whole output
+  is a number that will be argued with, so the step from no protection to
+  protection against one bad pass is not incremental.
+- **The passes must be independent, which means three separate launches.** Three
+  sweeps back-to-back on one launched instance are correlated samples — same
+  physical box, same DRAM, same neighbours, same thermal history — and a median
+  across them protects against nothing structural. Launch each pass separately,
+  days apart, on a fresh instance, and terminate between passes. A loop inside
+  one instance's lifetime is a repeat measurement, not a replicate, and must not
+  be counted as one.
+- **Keep the pass count uniform across all five hosts.** If budget pressure
+  forces a cut, the third pass matters most on `c8g`/`c9g` (where the central
+  cross lives) and least on `c6g` — but cut only under force: mixed pass counts
+  mean the pooling rule has to handle them, and that is more code in the place
+  you least want it.
+- **A replicate needs no new field and must not be pooled.** Passes are
   identifiable as the same `instance_type` with different `instance_id`, both
   already recorded by `capture-env.sh`. This fails safe: a re-run on the *same*
   box carries the same `instance_id` and is correctly not counted as a replicate.
   `decompose.py` must compare passes rather than median across them — pooling
   would silently convert the campaign's strongest evidence into slightly tighter
-  error bars.
-- Budget: P2 spot ~$47 + P3 on-demand ×2 ~$192 = **~$239**, ~$359 at 1.5×
+  error bars. With three passes, agreement by majority is what the third pass was
+  bought for, so section 8 reports `REPRODUCES-MAJORITY` when a majority carry
+  one directional verdict and every dissenter is non-directional. Two passes
+  disagreeing in *direction* is still a divergence at any pass count: no majority
+  makes a contradiction publishable.
+- Budget: P2 spot ~$47 + P3 on-demand ×3 ~$288 = **~$335**, ~$503 at 1.5×
   contingency. `hpc7g` is on-demand-only and has no metal size, so its tenancy
   stays inside the measurement; it gets the repeat runs and the p50/p90 spread is
   read accordingly.
@@ -138,8 +158,8 @@ under `gates/` that exits 0/1 and prints its evidence.
 |---|---|
 | `gates/p0.sh` | CI green on a clean clone; `make roofline` builds; `bash -n` clean |
 | `gates/p1.sh` | expected-arm census present and read from `manifest-*.ndjson` + `census-*.ndjson`; every planted effect recovered; the planted **null** reported as a null, not a weak hit, and distinguishable from a missing arm |
-| `gates/p2.sh` | complete NDJSON set from one host; `decompose.py` clean bar genuine findings; `topology-*.txt` recorded; every arm in `census-*.ndjson` either `measured` or carrying a stated reason — zero `MISSING-UNEXPLAINED` |
-| `gates/p3.sh` | five hosts collected **twice**, each pass on a different `instance_id`; every `env-*.json` present; `blas_sha` identical across hosts and passes; the headline reproduces between passes within the parity band; no unresolved section-5 anomalies |
+| `gates/p2.sh` | complete NDJSON set from one `c8g.metal-48xl` spot host; `decompose.py` clean bar genuine findings; `topology-*.txt` recorded; every arm in `census-*.ndjson` either `measured` or carrying a stated reason — zero `MISSING-UNEXPLAINED` |
+| `gates/p3.sh` | five hosts collected **three times**, each pass on a different `instance_id` from a separately launched instance; every `env-*.json` present; `blas_sha` identical across hosts and passes; the headline reproduces across passes (`REPRODUCES` or `REPRODUCES-MAJORITY`, never `DIVERGES-*`); no unresolved section-5 anomalies |
 | `gates/p4.sh` | report answers "is the N2 gap worth closing", supported by section 2, stated as a null if that is what the data says |
 
 P1 is implemented by `tools/synth.py`, which writes complete result sets whose

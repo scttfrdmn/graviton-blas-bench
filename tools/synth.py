@@ -281,6 +281,19 @@ class HostSpec:
     # "only on pass 3", and host_scale moves both sides of the cross together and so
     # leaves every ratio unchanged.
     pass_boost: dict = field(default_factory=dict)  # target or coretype name -> multiplier
+    # Arms that produced nothing on THIS pass, censused `runtime_failed` with the
+    # stated reason. Keyed like pass_boost, and per host for the same reason: Arm is
+    # shared across a scenario's passes and cannot say "only on pass 3". This is the
+    # realistic shape of a three-launch P3 -- the passes are independent, so a
+    # crash on one of them takes out that pass's arm and not the campaign's.
+    failed_arms: dict = field(default_factory=dict)  # target or coretype name -> reason
+
+    def failure_reason(self, arm):
+        """Why this arm produced no records on this pass, or None if it ran."""
+        for token, reason in self.failed_arms.items():
+            if token in (arm.target, arm.coretype):
+                return reason
+        return None
 
     def core_clusters(self):
         if self.clusters is not None:
@@ -383,7 +396,7 @@ def bench_records(sc: Scenario, host: HostSpec):
             other = (lib, swap.get(tgt, tgt), swap.get(ct, ct))
             gain_of[a.key] = next((b for b in sc.arms if b.key == other), a)
     for arm in sc.arms:
-        if not arm.measured:
+        if not arm.measured or host.failure_reason(arm) is not None:
             continue
         eff = gain_of[arm.key]
         sha = arm_sha(sc, host, arm)
@@ -700,6 +713,11 @@ def census_records(sc: Scenario, host: HostSpec, bench):
     for arm in sc.arms:
         if arm.omit_census:
             continue
+        # An arm that died on this pass only. run-matrix.sh censuses it
+        # `runtime_failed` with the harness exit status, which is an explanation:
+        # standing order 11 wants the gap to carry a reason even when the same arm
+        # ran fine on the other two passes.
+        failed = host.failure_reason(arm)
         for threads in host.threads:
             n = sum(
                 1
@@ -725,12 +743,12 @@ def census_records(sc: Scenario, host: HostSpec, bench):
                     # field the aliasing finding is read off.
                     "coretype_effective": arm_effective(host, arm),
                     "threads": threads,
-                    "status": arm.census_status,
-                    "exit_code": 0 if arm.census_status == "measured" else 4,
+                    "status": "runtime_failed" if failed else arm.census_status,
+                    "exit_code": 134 if failed else (0 if arm.census_status == "measured" else 4),
                     "records": n,
                     "thread_backend": arm.thread_backend,
                     "pin_policy": "taskset -c 0" if threads == 1 else f"numactl -C 0-{threads - 1}",
-                    "reason": arm.census_reason,
+                    "reason": failed or arm.census_reason,
                 }
             )
     return recs
@@ -1549,6 +1567,75 @@ def sc_replicate_diverges():
             {"kind": "replicate_status", "instance": "c7g.metal", "expect": "DIVERGES-DIRECTION"},
             {"kind": "exit_bits_set", "bits": [16]},
             {"kind": "stdout_contains", "text": "does not reproduce"},
+        ],
+    )
+
+
+def sc_replicate_majority():
+    """Three independent passes, two agreeing and one that reached no verdict.
+
+    This is what the spend policy's third pass is *for*, so the analysis has to
+    read it as success. Two passes agree on a +22% V1-set headline; on the third,
+    both V1-set arms died (`runtime_failed`, censused with a reason), so that pass
+    has no comparable cells and no direction. A majority that is directional and
+    uncontradicted is `REPRODUCES-MAJORITY` and exit bit 16 stays clear -- if a
+    non-directional dissent counted as divergence, going from two passes to three
+    would make the gate HARDER to pass, which is backwards for a change bought to
+    make the headline more defensible.
+
+    The line it must not cross is `replicate-diverges` and `lucky-pass`: a dissent
+    that carries the OPPOSITE direction is still a divergence at any pass count,
+    because no majority makes a contradiction publishable. Those two scenarios hold
+    that end, this one holds this end, and the pair is what makes the rule a rule
+    rather than a preference for the answer we want.
+
+    It also found the cost of a partial pass, which was not obvious before the
+    fixture existed: sections 1-7 pool passes, so the V1 arms having 2 samples where
+    the V2 arms have 3 makes all 72 pooled cells unequal-N, and the campaign-level
+    verdict reads INCONCLUSIVE while section 8 shows +22.1% and +21.9% on the two
+    complete passes. Asserted here as it stands, with the caveat that names the
+    cause; changing the pooling to intersect passes per comparison would be an
+    aggregation-policy decision rather than a fix."""
+    reason = "harness exited 134 on this pass; see /opt/gbb/stderr.log"
+    return Scenario(
+        name="replicate-majority",
+        description=(
+            "Three separately launched passes. Two agree on a +22% V1-set headline; on the "
+            "third the V1-set arms crashed, so it reaches no direction. The majority is "
+            "uncontradicted, which is what the third pass was bought for: not a divergence."
+        ),
+        hosts=[
+            _host(instance_id="i-000000000000000a", run_id="synth-c7g-pass1"),
+            _host(instance_id="i-000000000000000b", run_id="synth-c7g-pass2", host_scale=1.03),
+            _host(
+                instance_id="i-000000000000000c",
+                run_id="synth-c7g-pass3",
+                failed_arms={V1: reason},
+            ),
+        ],
+        arms=_arms(v1_gain=flat(1.22)),
+        expect=[
+            {"kind": "replicate_status", "instance": "c7g.metal", "expect": "REPRODUCES-MAJORITY"},
+            {"kind": "stdout_contains", "text": "2 of 3 passes: V1-SET-AHEAD"},
+            # The dissenting pass is named rather than averaged away. "read the
+            # dissenting pass before publishing" is the whole content of the
+            # majority rule; a status without the box is not actionable.
+            {"kind": "stdout_contains", "text": "i-000000000000000c"},
+            {"kind": "exit_bits_clear", "bits": [4, 16]},
+            # The POOLED verdict is INCONCLUSIVE, and that is the finding, not a
+            # fixture artefact: sections 1-7 median across passes, so an arm present
+            # on two passes and absent on the third makes every pooled cell
+            # unequal-N. Two independent passes agree at +22% and the campaign-level
+            # line says "no comparable measurement" — the same false-negative shape
+            # as C11, reached by a different route. Asserted as it stands rather than
+            # fixed here: restricting each comparison to the passes where both arms
+            # ran is an aggregation-policy change and Scott's call.
+            {"kind": "verdict_code", "one_of": ["INCONCLUSIVE"]},
+            {"kind": "stdout_contains", "text": "do not read a pooled"},
+            # Standing order 11 on a per-pass failure: the crash carries its reason
+            # into the report, not just into the census file. Section 7 cannot do
+            # this — the arm has cells, from the other two passes.
+            {"kind": "stdout_contains", "text": "harness exited 134 on this pass"},
         ],
     )
 
@@ -2428,6 +2515,94 @@ def sc_topology_defaulted():
     )
 
 
+def sc_probe_inapplicable():
+    """The DYNAMIC_ARCH probe did not run because the DYNAMIC build failed, so
+    there was nothing to probe.
+
+    The other half of `probe-unavailable`, and the guard on exit bit 8. Both hosts
+    report `openblas_dynamic_probe_status=not_attempted` with a null selection; the
+    difference is whether the probe *should* have run. Here it could not have:
+    `capture-env.sh` sets `not_attempted` when `GBB_OPENBLAS_DYNAMIC_DIR` is unset
+    or absent, and a failed `build_openblas DYNAMIC` leaves that directory absent
+    while the manifest and the census both record the failure and its reason.
+
+    An exit bit that fires on a condition already fully explained elsewhere is an
+    exit bit people learn to ignore, and bit 8 is load-bearing for the
+    highest-leverage arm in the campaign. So the inapplicable case is a note plus a
+    section 7 explained absence, and bit 8 stays clear -- while `probe-unavailable`
+    keeps proving it still fires when the build was there and the probe was not.
+
+    Faithful to the producers in the part that matters: a failed DYNAMIC build
+    takes the forced-coretype arms with it, because they are that binary run under
+    a different OPENBLAS_CORETYPE. So the coretype half of the cross does not exist
+    on this host at all, and the static TARGET= arms carry the comparison alone --
+    which is also why this asserts a verdict: losing a mechanism must not lose the
+    experiment."""
+    reason = "build failed, see /opt/gbb/openblas-DYNAMIC.buildlog"
+    arms = [a for a in _arms(v1_gain=flat(1.22)) if a.target != "DYNAMIC"]
+    arms.append(
+        Arm(
+            "openblas",
+            "DYNAMIC",
+            "unforced",
+            measured=False,
+            manifest_built=False,
+            manifest_reason=reason,
+            census_status="build_failed",
+            census_reason=reason,
+            # Not decoration, and the second half of what this scenario tests.
+            # build-libs.sh's sve_kernels() prints `unknown` when it finds no
+            # libopenblas.a to run nm over, and a build that failed leaves none --
+            # so `built:false` and `sve_kernels:unknown` always arrive together
+            # from the real producer, and every failed OpenBLAS build on an SVE
+            # host used to raise a provenance gap telling the reader to install nm.
+            sve_kernels="unknown",
+        )
+    )
+    return Scenario(
+        name="probe-inapplicable",
+        description=(
+            "The DYNAMIC build failed, so the DYNAMIC_ARCH probe had nothing to read. The "
+            "absent selection is explained by the build failure, not a provenance gap: bit 8 "
+            "must stay clear here and fire in probe-unavailable."
+        ),
+        hosts=[
+            _host(
+                dynamic_probe_status="not_attempted",
+                dynamic_selection=None,
+                forcing="not_probed",
+                warnings=(
+                    "DYNAMIC_ARCH probe not attempted (GBB_OPENBLAS_DYNAMIC_DIR unset or "
+                    "absent). openblas_dynamic_selection is null: the standing-order-8 "
+                    "generic-ARMV8 check was NOT performed on this host.",
+                ),
+            )
+        ],
+        arms=arms,
+        expect=[
+            {"kind": "anomaly_kind_absent", "kind_name": "dynamic_probe_unavailable"},
+            # Same guard, second trigger: an arm that never built has no archive to
+            # read, so `sve_kernels:unknown` here is the build failure restated and
+            # not an unchecked standing-order-8 trigger. Nothing was mislabelled
+            # because nothing ran.
+            {"kind": "anomaly_kind_absent", "kind_name": "sve_kernels_unknown"},
+            {"kind": "exit_bits_clear", "bits": [2, 4, 8, 16]},
+            {"kind": "stdout_contains", "text": "there was no DYNAMIC_ARCH library to probe"},
+            {"kind": "stdout_contains", "text": "there was no archive to read"},
+            # The reason has to reach the report, not just the classifier: standing
+            # order 11 is that a gap carries a reason, and section 7's
+            # explained-absences block is where the inapplicable case lives.
+            {"kind": "stdout_contains", "text": "openblas-DYNAMIC.buildlog"},
+            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 0},
+            # Not an escalation, for the same reason as probe-unavailable.
+            {"kind": "anomaly_kind_absent", "kind_name": "escalate"},
+            # And the static-target cross still answers the question.
+            {"kind": "cross_verdicts_where", "routine": "dgemm", "expect": "V1-set-ahead", "min_rows": 4},
+            {"kind": "verdict_code", "one_of": ["V1-SET-AHEAD"]},
+        ],
+    )
+
+
 SCENARIOS = {
     f.__name__[3:].replace("_", "-"): f
     for f in (
@@ -2453,6 +2628,7 @@ SCENARIOS = {
         sc_peak_absent,
         sc_replicate_reproduces,
         sc_replicate_diverges,
+        sc_replicate_majority,
         sc_replicate_same_box,
         sc_blas_sha_conflict,
         sc_incx_axis,
@@ -2472,6 +2648,7 @@ SCENARIOS = {
         sc_reference_arm_partial,
         sc_manifest_shapes,
         sc_probe_unavailable,
+        sc_probe_inapplicable,
         sc_topology_defaulted,
     )
 }

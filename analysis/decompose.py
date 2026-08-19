@@ -36,11 +36,14 @@ number. Everything else was renumbered around them.
   6. scaling          GFLOP/s vs threads against the measured all-core peak.
   7. coverage census  every expected cell classified. MISSING-UNEXPLAINED is the
                       one that matters: a hole nothing accounts for.
-  8. replicates       P3 runs each host family twice on different physical boxes.
-                      The passes are COMPARED, never pooled: the whole point of
-                      the second pass is whether the first one reproduces, and a
-                      median across the two would convert the campaign's strongest
-                      evidence into slightly tighter error bars.
+  8. replicates       P3 runs each host family three times, each pass a separate
+                      launch on a different physical box. The passes are COMPARED,
+                      never pooled: the whole point of the extra passes is whether
+                      the first one reproduces, and a median across them would
+                      convert the campaign's strongest evidence into slightly
+                      tighter error bars. Three rather than two because the median
+                      of two is the mean; three rejects one bad pass, which is
+                      reported as REPRODUCES-MAJORITY.
 
   VERDICT             one machine-greppable line computed from the data.
 
@@ -80,7 +83,7 @@ import pathlib
 import statistics
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 # ---- named thresholds -----------------------------------------------------
@@ -134,6 +137,27 @@ DEFAULT_MAX_NODATA_FRACTION = 0.34
 # V2 target and the campaign may need to name a different pair.
 DEFAULT_V1_SET = "NEOVERSEV1"
 DEFAULT_V2_SET = "NEOVERSEV2"
+
+# SVE kernel counts per kernel set, counted in the OpenBLAS tree (KERNEL.<set>
+# and the includes it pulls in), not measured here. The section 2 header used to
+# hardcode the V1/V2 pair's counts and print them whatever --v1-set/--v2-set
+# said, which quietly attributed 99 kernels to ARMV8SVE the moment the sharper
+# ARMV8SVE-vs-NEOVERSEV2 cross was run. A set that was never counted gets no
+# number claimed for it: an unlabelled axis is recoverable, a wrong count is not.
+SVE_KERNEL_SETS = {
+    "NEOVERSEV1": "NEOVERSEV1 = 99 SVE kernels",
+    "ARMV8SVE": "ARMV8SVE = 94 SVE kernels (where an unrecognised SVE part lands)",
+    "NEOVERSEN2": "NEOVERSEN2 = 5 SVE kernels",
+    "NEOVERSEV2": "NEOVERSEV2 -> KERNEL.NEOVERSEN2 = 5 SVE kernels",
+    "ARMV8": "ARMV8 = 0 SVE kernels",
+    "NEOVERSEN1": "NEOVERSEN1 = 0 SVE kernels",
+}
+
+# Independent passes the spend policy buys per instance_type. Three, because the
+# median of two is the mean: one bad pass moves it and nothing says which pass
+# was bad. Reported, and asserted by gates/p3.sh; never an exit bit here, since a
+# one-pass P2 dataset is legitimately short of it.
+DEFAULT_REPLICATE_PASSES = 3
 
 # Cap on how many individual items any one list in the report prints.
 DEFAULT_MAX_LISTED = 20
@@ -432,11 +456,50 @@ def _int_or_none(v):
     return v if isinstance(v, int) and not isinstance(v, bool) else None
 
 
+def dynamic_build_absent(inp: Inputs) -> set:
+    """instance_types where there was no openblas/DYNAMIC build for the probe to read.
+
+    The bit-8 guard. `openblas_dynamic_probe_status` covers two situations that
+    must not share an exit bit:
+
+      * the probe SHOULD have run and did not -- GBB_OPENBLAS_DYNAMIC_DIR unset by
+        a harness slip, the directory gone, the probe binary failing to link
+        against a library that is right there. That is a real provenance hole:
+        the as-shipped arm is the highest-leverage part of this campaign and
+        nothing here can say what DYNAMIC_ARCH selected. Bit 8 is for this.
+      * there was no DYNAMIC build at all, because it failed. Then the missing
+        selection is entirely accounted for by a census record that already
+        carries the failure and its reason, and section 7 reports it as an
+        explained absence. Firing bit 8 here reports one failure twice and makes
+        the bit routine -- and a bit that fires routinely is a bit people stop
+        reading, which costs the bit entirely.
+
+    Instance-scoped from both producers. run-matrix.sh stamps `instance` onto
+    build-libs.sh's manifest lines and censuses a not-built arm once per thread
+    count, so both sources are attributable to a host; the analysis concatenates
+    every host's files into one stream, so an unscoped test would let one host's
+    failed build suppress the gap on the other four. `present` wins any conflict:
+    if anything says the build was there, the probe should have run.
+    """
+    absent, present = set(), set()
+    for m in inp.manifest_arms:
+        if (m.get("library"), m.get("target")) != ("openblas", "DYNAMIC"):
+            continue
+        (present if m.get("built") else absent).add(m.get("instance") or "unknown")
+    for o in inp.outcomes:
+        if (o.get("library"), o.get("target")) != ("openblas", "DYNAMIC"):
+            continue
+        inst = o.get("instance") or "unknown"
+        (absent if (o.get("status") or "") == "build_failed" else present).add(inst)
+    return absent - present
+
+
 def build_hosts(inp: Inputs) -> dict:
     """One Host per instance TYPE -- that is what `instance` is in the records.
     Two hosts of the same type merge, and the merge is pessimistic: any
     invalidating fact on either invalidates the type for this dataset."""
     hosts: dict[str, Host] = {}
+    no_dynamic_build = dynamic_build_absent(inp)
     for e in inp.envs:
         inst = e.get("instance_type") or "unknown"
         h = hosts.setdefault(inst, Host(instance=inst))
@@ -489,7 +552,17 @@ def build_hosts(inp: Inputs) -> dict:
         # the probe broke, so it fell silent exactly when detection failed.
         status = e.get("openblas_dynamic_probe_status")
         sel = e.get("openblas_dynamic_selection")
-        if status != "ok":
+        if status != "ok" and inst in no_dynamic_build:
+            # Structurally inapplicable: no DYNAMIC build existed, so there was
+            # nothing to probe. Recorded, but not a provenance gap -- see
+            # dynamic_build_absent() for why this must not reach bit 8.
+            h.notes.append(
+                f"{who}: openblas_dynamic_probe_status={status!r} and the openblas/DYNAMIC build "
+                f"failed on this host, so there was no DYNAMIC_ARCH library to probe. The absent "
+                f"selection is accounted for by that build failure, which section 7 reports as an "
+                f"explained absence; it is not a separate provenance gap."
+            )
+        elif status != "ok":
             # A provenance gap, not a note, and for the same reason
             # `sve_kernels:unknown` is one: this is the OTHER way the standing-order-8
             # check can fail to happen, and the two were being treated differently
@@ -499,13 +572,16 @@ def build_hosts(inp: Inputs) -> dict:
             # the wrong place for that. run-matrix.sh exports
             # GBB_OPENBLAS_DYNAMIC_DIR before capture-env.sh runs, so `ok` is the
             # normal case on a host whose DYNAMIC build succeeded -- this does not
-            # fire on healthy data.
+            # fire on healthy data. Guarded above by whether the build existed at
+            # all: the bit must fire when the probe should have run and did not,
+            # never when it could not have run.
             h.provenance_gaps.append(
                 (
                     "dynamic_probe_unavailable",
                     f"{who}: openblas_dynamic_probe_status={status!r}; the standing-order-8 "
-                    f"generic-ARMV8 check was NOT performed on this host. Absent evidence about "
-                    f"what DYNAMIC_ARCH selected is not evidence that it selected correctly, and "
+                    f"generic-ARMV8 check was NOT performed on this host, and the openblas/DYNAMIC "
+                    f"build is not recorded as having failed. Absent evidence about what "
+                    f"DYNAMIC_ARCH selected is not evidence that it selected correctly, and "
                     f"standing order 5 says a number without provenance is not admissible.",
                 )
             )
@@ -619,6 +695,22 @@ def build_hosts(inp: Inputs) -> dict:
             # No SVE on this host means no SVE kernels is the correct outcome,
             # and an unstamped/unknown instance is a provenance gap, not this
             # finding -- section 7 owns that.
+            continue
+        if not m.get("built") or not m.get("runnable", True):
+            # The same guard as the DYNAMIC probe's, and needed for the same
+            # reason: build-libs.sh's sve_kernels() prints `unknown` when there is
+            # no archive to read, and a build that failed leaves no archive. So
+            # every failed OpenBLAS build on an SVE host used to raise a
+            # provenance gap and set bit 8 -- telling the reader to re-run with nm
+            # available when nm was fine and the build simply failed. There is
+            # also nothing to poison: an arm that never built never ran, so no
+            # number is mislabelled. The census already carries the failure and
+            # its reason, and section 7 reports it as an explained absence.
+            h.notes.append(
+                f"{inst}: {m.get('library')}/{m.get('target')} reports sve_kernels={sve!r}, but the "
+                f"arm was not built/runnable — there was no archive to read. Explained by the build "
+                f"outcome (section 7), not a standing-order-8 finding: the arm produced no numbers."
+            )
             continue
         if sve == "unknown":
             # build-libs.sh defines `unknown` as "we could not look" -- no nm, or
@@ -1180,11 +1272,16 @@ def cross_pairs(cells, inp, args):
     return out
 
 
+def kernel_set_note(name):
+    """What is known about a kernel set's SVE kernel count, or that nothing is."""
+    return SVE_KERNEL_SETS.get(name, f"{name} = SVE kernel count not recorded in this file")
+
+
 def report_target_cross(cells, groups, hosts, explain, inp, args, out):
     out("\n" + "=" * 78)
     out("2. TARGET CROSS  — same hardware, different OpenBLAS kernel set")
     out("=" * 78)
-    out(f"{args.v1_set} = 99 SVE kernels.  {args.v2_set} -> KERNEL.NEOVERSEN2 = 5 SVE kernels.")
+    out(f"{kernel_set_note(args.v1_set)}.  {kernel_set_note(args.v2_set)}.")
     out("Signed delta of the V1 set against the V2 set, per size, at identical")
     out("(m,n,k,lda_pad). Positive = V1 set ahead. TARGET= and OPENBLAS_CORETYPE are")
     out("compared separately: they are different claims.")
@@ -1923,22 +2020,30 @@ def _direction(code):
 def report_replicates(inp, hosts, explain, args, out):
     """Each pass analysed alone, then the verdicts compared.
 
-    Deliberately NOT a pooled statistic. P3 spends the second pass to find out
-    whether the first one reproduces; medianing the two would answer a different
+    Deliberately NOT a pooled statistic. P3 spends the extra passes to find out
+    whether the first one reproduces; medianing them would answer a different
     and much weaker question -- and would do it while looking tidier, which is
     worse. Every number below comes from one pass and is labelled with its box."""
+    want = args.replicate_passes
     out("\n" + "=" * 78)
-    out("8. REPLICATES  — does the headline survive a second physical machine")
+    out("8. REPLICATES  — does the headline survive another physical machine")
     out("=" * 78)
     out("A replicate is the same instance_type on a different instance_id. The passes are")
     out("compared, never pooled: a median across them would report a number neither pass")
-    out("measured, and would hide the one thing the second pass was bought to test.")
+    out("measured, and would hide the one thing the extra passes were bought to test.")
+    out(f"Spend policy expects {want} separately launched passes per instance_type.")
 
     passes = replicate_passes(inp)
     payload = []
     for inst in sorted(passes, key=str):
         boxes = passes[inst]
         n_runs = sum(len(v) for v in boxes.values())
+        # Reported as a distinct fact from the reproduction status, not folded into
+        # it. "did the headline reproduce" and "did we buy enough passes to ask"
+        # are different claims, and a P2 dataset legitimately has one pass; making
+        # the shortfall a DIVERGES-* status would fire bit 16 on every single-host
+        # run and cost the bit its meaning. gates/p3.sh asserts the count.
+        short = len(boxes) < want
         if len(boxes) < 2:
             why = f"{len(boxes)} instance_id across {n_runs} run_id(s) — " + (
                 "a re-run on the same physical box is not an independent pass"
@@ -1953,6 +2058,8 @@ def report_replicates(inp, hosts, explain, args, out):
                     "why": why,
                     "instance_ids": sorted(boxes, key=str),
                     "run_ids": sorted((r for v in boxes.values() for r in v), key=str),
+                    "passes_expected": want,
+                    "under_replicated": short,
                     "passes": [],
                 }
             )
@@ -1970,6 +2077,25 @@ def report_replicates(inp, hosts, explain, args, out):
                 pcells, cell_groups(pcells), hosts, explain, inp, args, lambda _line: None
             )
             v = compute_verdict(pcross, hosts, args)
+            # Arms this pass lost. Reported here and nowhere else: section 7 lists
+            # an absence only when the arm produced no cells at all, and an arm that
+            # ran on two passes and died on the third produces cells -- so the
+            # failure, and the reason the census recorded for it, appeared in no
+            # section of the report. That is the same "a reason recorded is not a
+            # reason reported" gap as section 7's, at pass granularity, and it is
+            # exactly the fact a three-pass policy needs: it decides whether the
+            # dissenting pass is evidence against the headline or a box to re-run.
+            # It also explains a pooled INCONCLUSIVE: an arm present on two passes
+            # and absent on a third makes every pooled cell unequal-N.
+            lost = {}
+            for o in inp.outcomes:
+                if o.get("run_id") not in rids or o.get("library") in NON_BENCH_LIBRARIES:
+                    continue
+                st = o.get("status") or "unknown"
+                if st in CENSUS_SUCCESS:
+                    continue
+                arm = (o.get("library"), o.get("target"), canon_coretype(o.get("coretype")))
+                lost.setdefault((arm_label(arm), st), o.get("reason") or "no reason recorded")
             per.append(
                 {
                     "instance_id": iid,
@@ -1978,6 +2104,9 @@ def report_replicates(inp, hosts, explain, args, out):
                     "verdict_code": v["code"],
                     "median_delta": v["median_delta"],
                     "cells_comparable": v["cells_comparable"],
+                    "arms_lost": [
+                        {"arm": a, "status": st, "reason": why} for (a, st), why in sorted(lost.items())
+                    ],
                 }
             )
             out(
@@ -1985,12 +2114,42 @@ def report_replicates(inp, hosts, explain, args, out):
                 f"cells={len(pcells):<5} comparable={v['cells_comparable']:<4} "
                 f"median={fmt_pct(v['median_delta'])} {v['code']}"
             )
+            for (a, st), why in sorted(lost.items()):
+                out(f"  {inst!s:14s}   this pass lost {a} ({st}): {why}")
 
         codes = {p["verdict_code"] for p in per}
         dirs = {_direction(p["verdict_code"]) for p in per}
+        # Majority agreement, which is the whole reason P3 buys a third pass. The
+        # median of two passes IS the mean: one bad pass moves it and nothing says
+        # which pass was bad. Three passes reject one. So a strict majority sharing
+        # one directional code, with every dissenter non-directional, is the
+        # intended outcome and must not read as a divergence -- otherwise the third
+        # pass makes the gate *harder* to pass than two did, which is backwards.
+        # A dissenter that carries the OPPOSITE direction is not covered here: two
+        # passes claiming opposite signs stay a divergence at any pass count,
+        # because no majority makes a contradiction publishable.
+        tally = Counter(p["verdict_code"] for p in per)
+        top_code, top_n = tally.most_common(1)[0]
+        majority = (
+            len(per) >= 3
+            and top_n * 2 > len(per)
+            and _direction(top_code) is not None
+            and all(_direction(c) is None for c in codes - {top_code})
+        )
         if len(codes) == 1:
             status = "REPRODUCES"
-            note = f"both passes: {next(iter(codes))}"
+            note = f"all {len(per)} passes: {next(iter(codes))}"
+        elif majority:
+            status = "REPRODUCES-MAJORITY"
+            dissent = ", ".join(
+                f"{p['instance_id']}={p['verdict_code']}" for p in per if p["verdict_code"] != top_code
+            )
+            note = (
+                f"{top_n} of {len(per)} passes: {top_code}. Dissenting and "
+                f"non-directional: {dissent}. The majority is directional and "
+                f"uncontradicted, which is what the third pass was bought for; read "
+                f"the dissenting pass before publishing, do not average it in."
+            )
         elif None not in dirs and len(dirs) > 1:
             status = "DIVERGES-DIRECTION"
             note = (
@@ -2006,6 +2165,12 @@ def report_replicates(inp, hosts, explain, args, out):
                 f"whether the effect was measurable, not about its sign."
             )
         out(f"  {inst!s:14s} {status:20s} {note}")
+        if short:
+            out(
+                f"  {inst!s:14s} UNDER-REPLICATED     {len(boxes)} independent passes, "
+                f"policy is {want}. With two passes the median is the mean: one bad pass "
+                f"moves it and nothing identifies which. Not a divergence, a shortfall."
+            )
 
         deltas = [p["median_delta"] for p in per if p["median_delta"] is not None]
         spread = (max(deltas) - min(deltas)) if len(deltas) > 1 else None
@@ -2023,6 +2188,8 @@ def report_replicates(inp, hosts, explain, args, out):
                 "instance_ids": sorted(boxes, key=str),
                 "run_ids": sorted((r for v in boxes.values() for r in v), key=str),
                 "median_delta_spread": spread,
+                "passes_expected": want,
+                "under_replicated": short,
                 "passes": per,
             }
         )
@@ -2251,6 +2418,42 @@ def report_verdict(verdict, lda, regimes, coverage, anomalies, replicates, exit_
             f"different physical boxes disagree (section 8). The line above is the pooled "
             f"reading and should not be published while that holds."
         )
+    partial = [
+        (r["instance"], p["instance_id"], a["arm"])
+        for r in replicates
+        for p in r.get("passes", [])
+        for a in p.get("arms_lost", [])
+    ]
+    if partial:
+        # Named because the pooled reading goes non-comparable and the verdict line
+        # does not say why. Sections 1-7 median across passes, so an arm measured on
+        # two passes and lost on a third makes every pooled cell unequal-N, and the
+        # campaign-level verdict reads INCONCLUSIVE while two independent passes sit
+        # in section 8 agreeing at +22%. That is a true statement about the pooled
+        # data and a badly misleading headline, so the cause is printed next to it.
+        # Restricting each comparison to the passes where both arms ran would be an
+        # aggregation-policy change, which is Scott's call, not this file's.
+        arms = sorted({a for _i, _b, a in partial})
+        out(
+            f"  VERDICT-CAVEAT: {len(partial)} arm-pass(es) are missing from otherwise complete "
+            f"passes ({', '.join(arms[: args.max_listed])}). Sections 1-7 pool passes, so an arm "
+            f"present on some passes and absent on others makes every pooled cell unequal-N and "
+            f"non-comparable — read section 8's per-pass verdicts, and do not read a pooled "
+            f"INCONCLUSIVE here as parity."
+        )
+    short = [r for r in replicates if r.get("under_replicated")]
+    if short and _direction(verdict["code"]) is not None:
+        # Only when a claim is actually on the table. A NO-DATA or INCONCLUSIVE
+        # line is not being published as a number, and printing this under every
+        # one of them would make it wallpaper -- which is how a caveat stops being
+        # read. Deliberately not an exit bit: see DEFAULT_REPLICATE_PASSES.
+        want = args.replicate_passes
+        out(
+            f"  VERDICT-CAVEAT: {', '.join(str(r['instance']) for r in short)} carry fewer than "
+            f"{want} independent passes (section 8). The line above is a claim from "
+            f"under-replicated data; the spend policy buys {want} passes because two cannot "
+            f"outvote one bad box."
+        )
 
     # Consequences are printed only for findings the data actually shows. The
     # old guide stated all of them unconditionally, which is why the gate could
@@ -2353,6 +2556,13 @@ def parse_args(argv=None):
     )
     ap.add_argument("--v1-set", default=DEFAULT_V1_SET, help=f"kernel set A (default {DEFAULT_V1_SET})")
     ap.add_argument("--v2-set", default=DEFAULT_V2_SET, help=f"kernel set B (default {DEFAULT_V2_SET})")
+    ap.add_argument(
+        "--replicate-passes",
+        type=int,
+        default=DEFAULT_REPLICATE_PASSES,
+        help=f"independent passes the spend policy buys per instance_type; section 8 names "
+        f"the shortfall, it is never an exit bit (default {DEFAULT_REPLICATE_PASSES})",
+    )
     ap.add_argument(
         "--max-listed",
         type=int,

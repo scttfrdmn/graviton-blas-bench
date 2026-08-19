@@ -102,13 +102,24 @@ change can be compared.
   because every forced-coretype label on that host came from the same probe.
   `tests/arch-selected-assert.sh` covers all four paths against a stub, in
   `gates/p0.sh`.
-- Spend policy for P2 and P3 recorded in `CLAUDE.md`: spot for P2, on-demand for
-  P3, and P3 run **twice** on different `instance_id`s. One clean pass is ~$96,
-  so a second independent pass buys more than a 3× discount on the first buys.
-  A replicate is identifiable with no new field — same `instance_type`, different
-  `instance_id` — which fails safe, since a re-run on the same box shares the
-  `instance_id` and is correctly not counted as one. Gate P3 now requires the
-  headline to reproduce between passes.
+- Spend policy for P2 and P3 recorded in `CLAUDE.md`: spot for P2 on
+  `c8g.metal-48xl`, on-demand for P3, and P3 run **three times** on different
+  `instance_id`s. One clean pass is ~$96, so further independent passes buy more
+  than a 3× discount on the first buys; three rather than two because two passes
+  have no breakdown point — the median of two is the mean, and a single bad pass
+  moves the answer with nothing to outvote it. The passes must be independent,
+  which means three separate launches days apart with the instance terminated
+  between them: a loop inside one instance's lifetime is a repeat measurement, not
+  a replicate. The count stays uniform across all five hosts, cut only under
+  capacity pressure and then from `c6g` first, because mixed pass counts push the
+  handling into the pooling rule, which is the last place to want more code. P2's
+  host is `c8g.metal-48xl` despite being the expensive choice: it is where the
+  central cross lives, and debugging the harness on a cheaper host would leave the
+  most important analysis path untested until P3. A replicate is identifiable with
+  no new field — same `instance_type`, different `instance_id` — which fails safe,
+  since a re-run on the same box shares the `instance_id` and is correctly not
+  counted as one. Gate P3 now requires the headline to reproduce across passes,
+  `REPRODUCES` or `REPRODUCES-MAJORITY` and never `DIVERGES-*`.
 
 - CI now runs gate P1, `tests/arch-selected-assert.sh`, and a new P0 section that
   asserts every gate and suite in the tree is wired into CI. P0's requirement is
@@ -149,13 +160,15 @@ change can be compared.
   published dataset. The gate also asserts that synth.py's copies of bench.c's
   size ladders still match bench.c, since a drifted copy makes every fixture a
   faithful test of the wrong experiment.
-- **`decompose.py` section 8, replicate agreement, and exit bit 16.** The two
-  `hpc7g` passes gate P3 requires are now compared rather than pooled. Pooling
+- **`decompose.py` section 8, replicate agreement, and exit bit 16.** The
+  separately launched passes gate P3 requires are now compared rather than pooled.
+  Pooling
   would convert the campaign's strongest evidence — that the headline reproduces
   on a different box of the same type — into slightly tighter error bars on one
   number. Each `(instance_type, instance_id)` is analysed independently and the
-  verdict codes are set against each other: `REPRODUCES`, `DIVERGES-DIRECTION`,
-  `DIVERGES-INCONCLUSIVE`, or `NO-REPLICATE`. Divergence sets exit bit 16 and
+  verdict codes are set against each other: `REPRODUCES`, `REPRODUCES-MAJORITY`,
+  `DIVERGES-DIRECTION`, `DIVERGES-INCONCLUSIVE`, or `NO-REPLICATE`. Divergence sets
+  exit bit 16 and
   prints a `VERDICT-CAVEAT:`. The per-pass delta spread is reported but never
   gated on — the claim is about the direction of the finding, not its magnitude.
 
@@ -242,7 +255,12 @@ change can be compared.
 - **`sve_kernels: unknown` is a provenance gap, not a pass.** The check that
   escalates `no` accepted `unknown` — "the archive could not be inspected" — as
   equivalent to "SVE kernels are present". It now records a provenance gap, raises
-  `sve_kernels_unknown` and sets exit bit 8.
+  `sve_kernels_unknown` and sets exit bit 8 — but only where an archive existed to
+  inspect. `build-libs.sh`'s `sve_kernels()` prints `unknown` whenever there is no
+  `libopenblas.a` to run `nm` over, so a build that failed *always* yields
+  `unknown`; raising a provenance gap there reports a missing archive as an
+  uninspectable one. An arm whose manifest line is not `built`, or is not
+  `runnable`, now gets a note saying there was no archive to read.
 - **A DYNAMIC_ARCH probe that did not run is a provenance gap too, on the same
   axis and for the same reason.** `openblas_dynamic_probe_status` of
   `not_attempted` / `build_failed` / `run_failed` all mean the standing-order-8
@@ -257,7 +275,12 @@ change can be compared.
   `Host.provenance_gaps` now carries `(anomaly_kind, message)` pairs — it held
   bare strings and section 5 stamped every one of them `sve_kernels_unknown`,
   which was true of the only producer at the time and would have mislabelled the
-  second one.
+  second one. It fires only where the probe *should* have run: if the
+  `openblas/DYNAMIC` build itself is absent from the manifest or censused
+  `build_failed` on that instance, there was no library to probe and the report
+  says so as a note instead. An exit bit that fires routinely stops being read,
+  which costs the bit entirely; the structurally-inapplicable case belongs to
+  section 7's explained-absence machinery, not to bit 8.
 - **An explained absence now explains itself in the report, not only in the
   census file.** Standing order 11 says every gap carries a reason; section 7 read
   that reason, used it to classify the gap, and then dropped it for every gap that
@@ -266,6 +289,48 @@ change can be compared.
   explained absence with its reason, and `coverage.explained` carries the same in
   the JSON. The two `excluded` statuses are deliberately not listed: their reason
   is this file's own exclusion, already stated as a hard anomaly in section 5.
+- **`REPRODUCES-MAJORITY` in section 8, for the third pass to be worth buying.**
+  Two passes have no breakdown point — the median of two is the mean, so one bad
+  pass moves the answer — and with only `REPRODUCES` / `DIVERGES-*` available, any
+  third pass that reached no direction (a crashed arm, a partial sweep) would have
+  been read as a divergence. A verdict now reproduces by majority when at least
+  three passes ran, one code holds a strict majority, that code has a direction,
+  and no *other* pass contradicts its direction. The note names the dissenting
+  `instance_id` and says to read that pass rather than average it in. A dissent
+  that points the other way is still `DIVERGES-*` at any pass count.
+- **`--replicate-passes` (default 3), and `UNDER-REPLICATED` as a printed line
+  rather than a status.** The expected pass count comes from the spend policy, so
+  the report states it and names the shortfall. It is deliberately not a status and
+  sets no exit bit: a one-host P2 dataset is under-replicated by construction, and
+  a bit that fires on every P2 run would train the reader to ignore bit 16 before
+  P3 ever produced a real divergence. `passes_expected` and `under_replicated` are
+  in the JSON for a gate to decide about.
+- **Section 8 reports what each pass lost, not just what it concluded.**
+  Section 7's explained-absence listing is pooled across passes, so an arm that
+  failed on exactly one of three passes had its reason recorded and never printed —
+  the same "a reason recorded is not a reason reported" gap as above, at pass
+  granularity. Each pass now lists its own non-successful arms with status and
+  reason, which is the difference between reading `REPRODUCES-MAJORITY` as noise
+  and reading it as "the V1 arms crashed on pass c".
+- **`SVE_KERNEL_SETS` and `kernel_set_note()`.** Section 2's header hardcoded
+  "`NEOVERSEV1` = 99 SVE kernels" and printed it whatever `--v1-set`/`--v2-set`
+  said, so reading the same dataset as `ARMV8SVE` vs `NEOVERSEV2` — which needs no
+  new measurement, both are already forced coretypes on every sve2 host — would
+  have captioned 94 kernels as 99. The counts now come from a table keyed by
+  kernel-set name.
+- Two P1 fixtures, taking `tools/synth.py` to 44 scenarios: `probe-inapplicable`
+  (a host with no `openblas/DYNAMIC` build at all — asserts both bit-8 guards stay
+  silent, both notes appear, and the buildlog reason survives to the report) and
+  `replicate-majority` (three separately launched passes, two agreeing, the third
+  losing its V1-set arms to a crash). Each was validated by mutation: reverting the
+  behaviour it guards turns exactly that scenario red and nothing else.
+  `replicate-majority` also documents a live consequence of the pooling rule —
+  sections 1–7 pool by median across `run_id`s and refuse a cell with unequal N, so
+  one arm lost on one of three passes makes the *pooled* verdict `INCONCLUSIVE`
+  while section 8 shows two passes agreeing. The fixture asserts that as found
+  rather than fixing it: whether sections 1–7 should intersect passes per
+  comparison instead of refusing is an aggregation-policy change, which is Scott's
+  call.
 
 ### Changed — affects comparability of numbers
 
@@ -501,6 +566,15 @@ change can be compared.
 - README described a static decision guide in `decompose.py` that the rewrite
   replaced with a computed verdict, and said `capture-env.sh`'s dispatch-direction
   wording "is being corrected" after it had been.
+- **Two suites sharing one fixture tree failed each other rather than the code.**
+  `tests/run-matrix-stubs.sh` and `gates/p1.sh` both built their fixtures at a
+  fixed path and `rm -rf`'d it on entry, so a `gates/p0.sh` run (which invokes the
+  stub suite) concurrent with a direct run of the same suite deleted its stubs
+  mid-flight: 35 assertions red, none of them about `run-matrix.sh`. Both scratch
+  paths are now PID-suffixed, with `GBB_TEST_TMP` / `GBB_P1_WORK` still available to
+  pin them. Serial CI never hit it; a test suite whose failures can be caused by
+  another test suite is a suite that costs credibility the first time it is
+  believed.
 
 ### Corrected
 

@@ -199,10 +199,12 @@ support opposite conclusions.
   in which the effect is known by construction: a null, an effect in one regime
   only, an effect at one stride only, a leading-dimension penalty, a dead arm, a
   mislabelled arm, an arm that never ran, an arm that ran only half its sizes, a
-  lucky duplicate sample, a flattered pass, two passes that disagree, all nine
+  lucky duplicate sample, a flattered pass, two passes that disagree, three passes
+  where two agree and the third lost its arms to a crash, all nine
   routines with the effect on the three in the N2 gap, a reference library
   that is absent either entirely or for one routine, two reference libraries
-  competing to be the named one, a host whose DYNAMIC_ARCH probe never ran, and a
+  competing to be the named one, a host whose DYNAMIC_ARCH probe never ran, a host
+  with no DYNAMIC build to probe in the first place, and a
   host whose topology fields are `lscpu` defaults rather than measurements.
   `gates/p1.sh` runs `decompose.py` over each and asserts the report says the
   planted thing. The instrument earns nothing on its own — it earns its place by
@@ -303,6 +305,29 @@ support opposite conclusions.
   licence had failed, the download was missing or the link had broken. Absent and
   null being different claims is a property the *artifact* has to have, not just the
   input files, so section 7 now prints the reason beside every explained absence.
+  The same gap exists one level down: section 7's listing is pooled across passes,
+  so an arm that failed on exactly one pass had its reason recorded and printed
+  nowhere, which is why section 8 now lists each pass's own losses.
+- **One arm lost on one pass can turn the pooled headline into a false
+  `INCONCLUSIVE`.** Sections 1–7 pool by median across `run_id`s and refuse any
+  cell whose two sides have unequal N, which is right — a median over three passes
+  compared against a median over two is a comparison between different experiments.
+  But it means a single crashed arm on one of three passes makes *every* pooled
+  cell non-comparable, and the report then says `INCONCLUSIVE` while section 8
+  shows two passes agreeing on a 22% effect. Pooled `INCONCLUSIVE` is not parity,
+  and the verdict now carries a caveat saying so and pointing at the per-pass
+  verdicts. Whether sections 1–7 should instead intersect the passes available per
+  comparison is an aggregation-policy question, not a bug fix, and is Scott's call:
+  intersecting recovers the headline but changes what the pooled number means.
+- **An exit bit that fires routinely costs you the bit.** Bit 8 says the
+  provenance is incomplete, which is a claim worth reading — but only if it fires
+  when the evidence *should* have existed and does not. A missing DYNAMIC_ARCH
+  probe on a host where the DYNAMIC build failed, or `sve_kernels: unknown` on an
+  arm that has no archive because it never built, are both structurally
+  inapplicable rather than incomplete, and raising them would have set bit 8 on
+  routine data until nobody read the exit code. Both cases now go to section 7's
+  explained-absence machinery as notes. The severity of a bit is worth less than
+  its signal-to-noise.
 - **The alarming dispatch outcome is narrower than the above.** Generic `ARMV8`
   selected on a host that *has* SVE would mean the SVE detection itself failed;
   `NO_SVE` set at build time would mean the SVE kernels were never compiled in.

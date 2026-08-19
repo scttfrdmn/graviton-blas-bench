@@ -28,7 +28,9 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-WORK="${GBB_P1_WORK:-${TMPDIR:-/tmp}/gbb-p1}"
+# PID-suffixed for the same reason as tests/run-matrix-stubs.sh: two concurrent
+# runs sharing one fixture tree fail each other, not the code.
+WORK="${GBB_P1_WORK:-${TMPDIR:-/tmp}/gbb-p1.$$}"
 KEEP="${GBB_P1_KEEP:-0}"
 PY="${PYTHON:-python3}"
 

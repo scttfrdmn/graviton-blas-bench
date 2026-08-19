@@ -13,7 +13,12 @@
 set -uo pipefail
 
 REPO="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
-T="${GBB_TEST_TMP:-/tmp/gbb-test}"
+# PID-suffixed by default: `gates/p0.sh` runs this suite, so a p0 run concurrent
+# with a direct run shared one fixture tree and each `rm -rf`'d the other's stubs
+# mid-flight -- 35 assertions failed for reasons that had nothing to do with the
+# code under test. Artifacts are deliberately left behind for post-mortem; pass
+# GBB_TEST_TMP to pin the path.
+T="${GBB_TEST_TMP:-/tmp/gbb-test.$$}"
 rm -rf "$T/work"; mkdir -p "$T/work/bin" "$T/work/scripts" "$T/work/libs" "$T/work/results"
 W="$T/work"
 
