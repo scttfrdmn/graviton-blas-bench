@@ -133,7 +133,7 @@ change can be compared.
 - `tools/synth.py` and `gates/p1.sh`: the analysis is now calibrated against
   datasets whose right answer is known by construction, because campaign data
   cannot serve that purpose — the right answer there is the thing being looked
-  for. 36 scenarios plant a null, a broad effect, an effect confined to the small
+  for. 42 scenarios plant a null, a broad effect, an effect confined to the small
   regime, an effect confined to `incx=4`, a leading-dimension penalty, a dead arm,
   an arm returning wrong answers, a mislabelled arm, an arm censused `aliased`, an
   arm that produced only some of its sizes, an arm with no provenance, generic
@@ -167,6 +167,62 @@ change can be compared.
   to be guarded by nothing at all — see the aggregation entry under Fixed — and
   the exit-bit table now covers bit 1 as well as 2, 4, 8 and 16.
 
+- **The fixtures now cover the routine set the conclusion rests on, and the
+  routine-localised shape the campaign predicts.** Every scenario had been running
+  the default three routines, so `dtrsm`, `dtrmm` and `dsymm` appeared in no
+  fixture — and those are the operations in the 90-kernel `NEOVERSEV2`/`N2` gap
+  this campaign exists to price. The gate certified the analysis on `dgemm` and
+  `dgemv` and said nothing about the routines the answer would be quoted from.
+  `full-routine-set` plants all nine routines `bench.c` emits with the effect on
+  the N2-gap three only. It found the verdict defect below.
+
+- **Section 1, the deficit-by-routine table, is now asserted.** It was computed,
+  printed and quoted by the write-up while nothing in the gate checked a single
+  number in it — an analysis that got section 2 right and section 1's
+  reference-relative deficit wrong passed green. Four new check kinds assert the
+  deficit magnitude and sign, that exactly one arm per condition is marked
+  `SHIPPED` and that it is the `openblas/DYNAMIC/unforced` one the wheels run, and
+  both ways the table can have no reference to measure against. Mutation-checked:
+  `is_shipped()` returning `False` for every arm, returning `True` for every arm,
+  the deficit sign left un-negated, and the instance-level NO-DATA row not
+  appended each turn a scenario red. Two scenarios were added for the absent
+  branches — `reference-library-absent` (no non-OpenBLAS library on the host at
+  all, which is the ordinary case if ArmPL is not on the AMI) and
+  `reference-arm-partial` (a reference library that ran but has no kernel for one
+  routine). The second also pins a coverage consequence: an arm censused
+  `measured` that produced no records for a routine is `MISSING-UNEXPLAINED` and
+  exit bit 4, not a quietly narrower table.
+
+- **The fixtures now contain every arm shape the producers can write.** An audit
+  of `build-libs.sh`'s `arm_record` call sites and `run-matrix.sh`'s census against
+  the fixture set found four shapes no scenario could produce, so four branches of
+  `decompose.py` would have run for the first time on campaign data:
+  `openblas/DYNAMIC_OMP` (`thread_backend:openmp`), the `DYNAMIC_OMP_BOUND` arm the
+  runner synthesises after the manifest loop to *measure* the pinning delta rather
+  than assume it, a BLIS arm, and a control target `built:true` with
+  `runnable:false`. `manifest-shapes` plants all four. It also puts two candidate
+  reference libraries on one host for the first time, which turns section 1's
+  "named reference arm" from a description into a claim that can fail: the new
+  `deficit_reference` check asserts one reference per cell, the same one for every
+  arm in it, since rows measured against different references are not one table.
+  Mutation-checked: choosing the reference per arm instead of per cell turns
+  `manifest-shapes` red and no other scenario.
+  `reference-library-absent` now makes its reference arms absent the way the
+  producers do — `armpl/native` and `blis` in the manifest as `built:false` with an
+  empty `blas_sha` and a stated reason — rather than by being left out of the arm
+  list, and asserts that an unbuilt arm with a reason is an explained absence and
+  not exit bit 4. That is the ordinary state of at least one campaign host, so a
+  dataset that set bit 4 there would set it on every real run.
+- Two scenarios for provenance shapes that had no fixture: `probe-unavailable`
+  (`capture-env.sh` could not run the DYNAMIC_ARCH probe, so
+  `openblas_dynamic_selection` is null and `openblas_coretype_forcing` falls back
+  to `not_probed`) and `topology-defaulted` (`lscpu` produced nothing, so
+  `sockets`, `numa_nodes` and `threads_per_core` are defaults). The second also
+  pins the exact warning text `capture-env.sh` emits, because `decompose.py`
+  matches it by substring and a reword would not error — it would silently stop
+  suppressing the cross-socket note and stop flagging the defaulted SMT field.
+  Mutation-checked by rewording the constant.
+
 - **`role` is a filter in `decompose.py`, not just a field in the record.**
   Records carrying a role other than the requested one (default `campaign`) are
   excluded before anything else looks at them, counted in
@@ -187,6 +243,29 @@ change can be compared.
   escalates `no` accepted `unknown` — "the archive could not be inspected" — as
   equivalent to "SVE kernels are present". It now records a provenance gap, raises
   `sve_kernels_unknown` and sets exit bit 8.
+- **A DYNAMIC_ARCH probe that did not run is a provenance gap too, on the same
+  axis and for the same reason.** `openblas_dynamic_probe_status` of
+  `not_attempted` / `build_failed` / `run_failed` all mean the standing-order-8
+  generic-`ARMV8` check was never performed on the campaign's central hardware
+  axis, and that was a `note` — and notes set no exit bit. It now raises
+  `dynamic_probe_unavailable` and sets exit bit 8. Deliberately *not* an
+  escalation: absent evidence about what DYNAMIC_ARCH selected is not evidence
+  that it selected wrongly, and a fixture that let the escalate branch fire here
+  would make the escalation unreadable on the host where it matters.
+  `run-matrix.sh` exports `GBB_OPENBLAS_DYNAMIC_DIR` before `capture-env.sh`
+  runs, so `ok` is the normal case and this does not fire on healthy data.
+  `Host.provenance_gaps` now carries `(anomaly_kind, message)` pairs — it held
+  bare strings and section 5 stamped every one of them `sve_kernels_unknown`,
+  which was true of the only producer at the time and would have mislabelled the
+  second one.
+- **An explained absence now explains itself in the report, not only in the
+  census file.** Standing order 11 says every gap carries a reason; section 7 read
+  that reason, used it to classify the gap, and then dropped it for every gap that
+  was not a hole. A reader saw `build_failed=12` and had to go back to
+  `census-*.ndjson` to learn that `ARMPL_DIR` was unset. Section 7 now lists each
+  explained absence with its reason, and `coverage.explained` carries the same in
+  the JSON. The two `excluded` statuses are deliberately not listed: their reason
+  is this file's own exclusion, already stated as a hard anomaly in section 5.
 
 ### Changed — affects comparability of numbers
 
@@ -301,6 +380,30 @@ change can be compared.
   rather than the verdict, deliberately: substituting `max` across runs raises
   `run_spread` by exactly the amount it raises the delta, so the parity band widens
   in step and every verdict-level assertion in the file survives the mutant.
+- **The campaign verdict reported a routine-localised effect as a global null.**
+  `compute_verdict` counts comparable cells, and the routine set does not
+  contribute them evenly: padded and unpadded `dgemm` is 20 cells, `sgemm`,
+  `dsyrk`, `dtrsm`, `dtrmm` and `dsymm` 12 each, `dgemv` 8. So an effect confined
+  to TRSM/TRMM/SYMM — the shape the 94-vs-5 kernel gap predicts, and the whole
+  reason the campaign exists — is 36 of 104 comparable cells, the parity cells
+  then hold 65%, they clear the 60% majority, and the headline read
+  `NULL … publish the negative result` over a coherent +22% on every cell of the
+  three routines under study. Whether such an effect reaches the majority is
+  decided by how many cells the *unaffected* routines contribute, which is a
+  property of `bench.c`'s size ladder rather than of the hardware. The NULL branch
+  now requires that no coherent subset carries a direction of its own —
+  `coherent_subsets()`, over routine, regime and instance, both directions, at
+  least `--subset-min-cells` (3) comparable cells and a `--verdict-majority` share
+  within the subset — and the verdict is `MIXED` with the subsets named plus a
+  `CONSEQUENCE: the difference is routine-localised …` line, which is the sentence
+  the write-up needs for "worth doing, and where". This makes NULL *harder* to
+  reach, so it is guarded in both directions: `null` and `noise-only` assert that
+  the subset set is exactly empty, and a mutant that drops the within-subset
+  majority test turns both red. A guard that could manufacture a localised effect
+  out of a genuine null would be worse than the false negative it fixes — a null
+  result is a publishable outcome here. Found by the `full-routine-set` fixture on
+  its first run; nothing in the campaign's own hypothesis was used to derive the
+  rule.
 - **Exit code 1 was the one exit code no gate could assert on.** `decompose.py`
   returned before writing its report when nothing loaded, and `gates/p1.sh` cannot
   tell a scenario that wrote no report from one whose analysis crashed. It now

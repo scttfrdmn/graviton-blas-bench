@@ -118,6 +118,11 @@ DEFAULT_WIN_FRACTION = 0.60
 # Fraction of comparable cells that must agree for a campaign-level verdict.
 DEFAULT_VERDICT_MAJORITY = 0.60
 
+# Comparable cells a single axis value (one routine, one regime, one instance)
+# must hold before it is allowed to block the NULL branch. 3 for the same reason
+# as DEFAULT_MIN_SIZES: two cells agreeing is not a localised effect.
+DEFAULT_SUBSET_MIN_CELLS = 3
+
 # If more than this fraction of the cells in the target cross are not comparable
 # (missing arm, thin, unequal N, inadmissible host), the campaign verdict is
 # INCONCLUSIVE rather than directional: with a third of the design absent the
@@ -411,6 +416,9 @@ class Host:
     # relies on could not be performed. Not an escalation, because absent evidence
     # is not evidence of absence -- but not a note either, because it must set the
     # provenance bit rather than scroll past in a list nobody greps.
+    # (anomaly_kind, message) pairs. It held bare strings and section 5 stamped
+    # every one of them `sve_kernels_unknown`, which was true of the only producer
+    # at the time and would have mislabelled the second one.
     provenance_gaps: list = field(default_factory=list)
     cpus_affinity: int | None = None
     forcing: str = "not_probed"
@@ -482,9 +490,24 @@ def build_hosts(inp: Inputs) -> dict:
         status = e.get("openblas_dynamic_probe_status")
         sel = e.get("openblas_dynamic_selection")
         if status != "ok":
-            h.notes.append(
-                f"{who}: openblas_dynamic_probe_status={status!r}; the standing-order-8 "
-                f"generic-ARMV8 check was NOT performed on this host."
+            # A provenance gap, not a note, and for the same reason
+            # `sve_kernels:unknown` is one: this is the OTHER way the standing-order-8
+            # check can fail to happen, and the two were being treated differently
+            # for no reason anyone could state. `not_attempted`, `build_failed` and
+            # `run_failed` all mean the generic-ARMV8 check did not run, on the
+            # campaign's central hardware axis, and a list of notes nobody greps is
+            # the wrong place for that. run-matrix.sh exports
+            # GBB_OPENBLAS_DYNAMIC_DIR before capture-env.sh runs, so `ok` is the
+            # normal case on a host whose DYNAMIC build succeeded -- this does not
+            # fire on healthy data.
+            h.provenance_gaps.append(
+                (
+                    "dynamic_probe_unavailable",
+                    f"{who}: openblas_dynamic_probe_status={status!r}; the standing-order-8 "
+                    f"generic-ARMV8 check was NOT performed on this host. Absent evidence about "
+                    f"what DYNAMIC_ARCH selected is not evidence that it selected correctly, and "
+                    f"standing order 5 says a number without provenance is not admissible.",
+                )
             )
         else:
             lib = e.get("openblas_dynamic_lib_resolved")
@@ -608,10 +631,13 @@ def build_hosts(inp: Inputs) -> dict:
             # provenance hole, and standing order 5 says a number without
             # provenance is not admissible.
             h.provenance_gaps.append(
-                f"{inst}: whether the {m.get('library')}/{m.get('target')} build contains SVE "
-                f"kernel symbols is UNKNOWN -- build-libs.sh could not read the archive. On a "
-                f"host that reports SVE this leaves standing order 8's quiet trigger unchecked; "
-                f"re-run build-libs.sh with nm available before trusting any SVE-coretype arm."
+                (
+                    "sve_kernels_unknown",
+                    f"{inst}: whether the {m.get('library')}/{m.get('target')} build contains SVE "
+                    f"kernel symbols is UNKNOWN -- build-libs.sh could not read the archive. On a "
+                    f"host that reports SVE this leaves standing order 8's quiet trigger unchecked; "
+                    f"re-run build-libs.sh with nm available before trusting any SVE-coretype arm.",
+                )
             )
             continue
         h.escalate.append(
@@ -1501,8 +1527,8 @@ def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, args, out):
             add("!!", "escalate", r)
         for r in h.invalid:
             add("!!", "host_invalid", r)
-        for r in h.provenance_gaps:
-            add("!!", "sve_kernels_unknown", r)
+        for kind, r in h.provenance_gaps:
+            add("!!", kind, r)
         for r in h.notes:
             add(".", "host_note", r)
 
@@ -1743,6 +1769,13 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
     tally = defaultdict(int)
     per_arm = defaultdict(lambda: defaultdict(int))
     missing_cells = []
+    # Standing order 11 says every gap carries a reason. The reason was being read,
+    # used to classify the gap, and then dropped for every gap that was NOT a hole:
+    # a reader of the report saw `build_failed=12` and had to go back to
+    # census-*.ndjson to learn that ARMPL_DIR was unset. "Absent and null are
+    # different claims" is a claim about the artifact, not about the input files.
+    explained = defaultdict(int)
+    explained_why = {}
     for inst, conds in sorted(conds_by_inst.items(), key=lambda kv: str(kv[0])):
         arms = sorted(arms_by_inst[inst] | expected_arms, key=arm_label)
         cellset = defaultdict(list)
@@ -1784,6 +1817,15 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
                             "reason": why,
                         }
                     )
+                elif status not in ("measured", "excluded", "partial-excluded"):
+                    # The two excluded statuses are deliberately not listed here:
+                    # their reason is this file's own exclusion, already stated as a
+                    # hard anomaly in section 5, and explain() would answer with the
+                    # census's view of an arm that ran fine.
+                    _st, why = explain(inst, arm, thr)
+                    key = (inst, arm_label(arm), status)
+                    explained[key] += 1
+                    explained_why.setdefault(key, why)
 
     for inst, arm in sorted(per_arm, key=lambda k: (str(k[0]), arm_label(k[1]))):
         d = per_arm[(inst, arm)]
@@ -1817,6 +1859,14 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
         if len(partial) > args.max_listed:
             out(f"    ... and {len(partial) - args.max_listed} more")
 
+    if explained:
+        out(f"\n  explained absences ({len(explained)}); the reason each gap carries:")
+        for (inst, arm, status), n in sorted(explained.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
+            out(
+                f"    {inst!s:14s} {arm:30s} {status:14s} {n:<4} cells — "
+                f"{explained_why[(inst, arm, status)] or 'no reason recorded'}"
+            )
+
     inadmissible = sorted(i for i, h in hosts.items() if not h.admissible)
     if inadmissible:
         out(f"\n  hosts whose cells cannot support a verdict: {', '.join(map(str, inadmissible))}")
@@ -1829,6 +1879,16 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
         "excluded": tally.get("excluded", 0),
         "measured": tally.get("measured", 0),
         "cells": missing_cells,
+        "explained": [
+            {
+                "instance": inst,
+                "arm": arm,
+                "status": status,
+                "cells": n,
+                "reason": explained_why[(inst, arm, status)],
+            }
+            for (inst, arm, status), n in sorted(explained.items(), key=lambda kv: (str(kv[0][0]), kv[0][1]))
+        ],
         "by_arm": [
             {"instance": inst, "arm": arm_label(arm), **dict(per_arm[(inst, arm)])} for (inst, arm) in per_arm
         ],
@@ -1975,6 +2035,79 @@ def report_replicates(inp, hosts, explain, args, out):
 # ---- verdict ---------------------------------------------------------------
 
 
+def coherent_subsets(cross, args):
+    """Axis values whose own comparable cells carry a direction by majority.
+
+    This exists to guard the NULL branch, and the reason is arithmetic. The
+    campaign verdict counts cells; the routine set does not contribute cells
+    evenly. `dgemm` alone contributes 20 cells (padded and unpadded), `sgemm`,
+    `dsyrk`, `dtrsm`, `dtrmm` and `dsymm` 12 each, `dgemv` 8. So an effect
+    confined to TRSM/TRMM/SYMM -- which is 90 of the 94-vs-5 kernel gap this
+    campaign exists to measure -- is 36 of 104 comparable cells, or 35%. The
+    parity cells then hold 65%, clear the 60% majority, and the headline reads
+    "NULL ... publish the negative result" over a coherent +22% on every cell of
+    the three routines under study.
+
+    Whether such an effect reaches the global majority is decided by how many
+    cells the *unaffected* routines contribute, which is a property of bench.c's
+    size ladder, not of the hardware. That makes the unguarded NULL branch a
+    false negative on exactly the shape the campaign predicts.
+
+    A subset must clear more than the global rule does to qualify: every cell in
+    it already passed `band_for()`, at least DEFAULT_SUBSET_MIN_CELLS cells are
+    comparable, and one direction holds `--verdict-majority` of them. Both
+    directions are tested, so a routine where the V1 set is *worse* blocks NULL
+    on the same terms -- this widens what counts as "not a null", it does not
+    lean on the campaign's hypothesis.
+
+    Found by C11: before this, gates/p1.sh certified the analysis on `dgemm` and
+    `dgemv` only, and the routine-localised fixture read out as a global null.
+    """
+    buckets = defaultdict(lambda: defaultdict(int))
+    deltas = defaultdict(list)
+    for c in cross:
+        if not c["host_admissible"]:
+            continue
+        v = c["verdict"]
+        if v == "parity":
+            bucket = "parity"
+        elif v.endswith("V1-set-ahead"):
+            bucket = "v1"
+        elif v.endswith("V2-set-ahead"):
+            bucket = "v2"
+        else:
+            continue
+        for axis, value in (
+            ("routine", c["routine"]),
+            ("regime", c["regime"]),
+            ("instance", c["instance"]),
+        ):
+            buckets[(axis, value)][bucket] += 1
+            if c["median_delta"] is not None:
+                deltas[(axis, value, bucket)].append(c["median_delta"])
+
+    found = []
+    for (axis, value), t in sorted(buckets.items(), key=lambda kv: skey(kv[0])):
+        n = t["v1"] + t["v2"] + t["parity"]
+        if n < args.subset_min_cells:
+            continue
+        for direction, side in (("V1", "v1"), ("V2", "v2")):
+            if t[side] / n < args.verdict_majority:
+                continue
+            d = deltas[(axis, value, side)]
+            found.append(
+                {
+                    "axis": axis,
+                    "value": value,
+                    "direction": direction,
+                    "wins": t[side],
+                    "comparable": n,
+                    "median_delta": statistics.median(d) if d else None,
+                }
+            )
+    return found
+
+
 def compute_verdict(cross, hosts, args):
     """One line, computed. The previous version's decision guide was
     unconditional literal text, so `grep -q parity` and `grep -q "publish the
@@ -2010,6 +2143,7 @@ def compute_verdict(cross, hosts, args):
     comparable = tally["v1_wins"] + tally["v2_wins"] + tally["parity"]
     med = statistics.median(deltas) if deltas else None
     band_pct = 100 * args.min_effect
+    subsets = coherent_subsets(cross, args)
 
     if total == 0:
         code = "NO-DATA"
@@ -2036,11 +2170,27 @@ def compute_verdict(cross, hosts, args):
             f"VERDICT: V2-SET-AHEAD — median {100 * med:+.1f}% over {tally['v2_wins']}/{comparable} "
             f"comparable cells, against the V1 set; the NEON choice was right, publish the negative result"
         )
-    elif tally["parity"] / comparable >= args.verdict_majority:
+    elif tally["parity"] / comparable >= args.verdict_majority and not subsets:
         code = "NULL"
         line = (
             f"VERDICT: NULL — {args.v1_set}-set and {args.v2_set}-set at parity in "
             f"{tally['parity']}/{comparable} comparable cells; publish the negative result"
+        )
+    elif tally["parity"] / comparable >= args.verdict_majority:
+        # A parity majority with a coherent minority is not a null. See
+        # coherent_subsets(): the majority here is an artefact of how many cells
+        # the unaffected routines contribute, so reporting NULL would publish a
+        # negative result over a real, located effect.
+        code = "MIXED"
+        where = "; ".join(
+            f"{s['axis']} {s['value']}: {s['direction']} set ahead in {s['wins']}/{s['comparable']}"
+            + (f" (median {100 * s['median_delta']:+.1f}%)" if s["median_delta"] is not None else "")
+            for s in subsets[: args.max_listed]
+        )
+        line = (
+            f"VERDICT: MIXED — {tally['parity']}/{comparable} comparable cells are at parity, but the "
+            f"difference is located, not absent: {where}. Not a null: the effect is confined to a "
+            f"minority of cells, and cell counts follow bench.c's size ladder, not the hardware"
         )
     else:
         code = "MIXED"
@@ -2063,6 +2213,7 @@ def compute_verdict(cross, hosts, args):
         "median_delta": med,
         "min_effect": args.min_effect,
         "unverified_cells": unverified,
+        "coherent_subsets": subsets,
         "by_instance_regime": [
             {"instance": i, "regime": r, **dict(per_ir[(i, r)])} for (i, r) in sorted(per_ir, key=skey)
         ],
@@ -2110,6 +2261,18 @@ def report_verdict(verdict, lda, regimes, coverage, anomalies, replicates, exit_
         out(
             f"  CONSEQUENCE: leading-dimension penalty is real in {len(hurts)} of {len(lda)} pairs "
             f"(median {100 * med:+.1f}%) — packing kernels are the target."
+        )
+    by_routine = [s for s in verdict["coherent_subsets"] if s["axis"] == "routine"]
+    if by_routine and verdict["code"] != "NO-DATA":
+        # Named because this is the sentence the write-up quotes: "worth doing,
+        # and here" needs the routines, not a campaign-wide fraction.
+        out(
+            "  CONSEQUENCE: the difference is routine-localised — "
+            + ", ".join(
+                f"{s['value']} ({s['direction']} set ahead in {s['wins']}/{s['comparable']} cells)"
+                for s in by_routine[: args.max_listed]
+            )
+            + ' — so the answer to "where" is these kernels, not the library as a whole.'
         )
     small_led = [
         r
@@ -2160,6 +2323,13 @@ def parse_args(argv=None):
         default=DEFAULT_VERDICT_MAJORITY,
         help=f"fraction of comparable cells needed for a campaign verdict "
         f"(default {DEFAULT_VERDICT_MAJORITY})",
+    )
+    ap.add_argument(
+        "--subset-min-cells",
+        type=int,
+        default=DEFAULT_SUBSET_MIN_CELLS,
+        help=f"comparable cells one routine/regime/instance must hold before a direction of its own "
+        f"blocks the NULL verdict (default {DEFAULT_SUBSET_MIN_CELLS})",
     )
     ap.add_argument(
         "--max-nodata-fraction",
@@ -2282,7 +2452,14 @@ def main(argv=None):
     if any(a["kind"] == "arch_selected_mismatch" for a in anomalies):
         exit_code |= 2
     if any(
-        a["kind"] in ("no_provenance", "blas_sha_conflict", "env_unparseable", "sve_kernels_unknown")
+        a["kind"]
+        in (
+            "no_provenance",
+            "blas_sha_conflict",
+            "env_unparseable",
+            "sve_kernels_unknown",
+            "dynamic_probe_unavailable",
+        )
         for a in anomalies
     ):
         exit_code |= 8

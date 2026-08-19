@@ -199,7 +199,11 @@ support opposite conclusions.
   in which the effect is known by construction: a null, an effect in one regime
   only, an effect at one stride only, a leading-dimension penalty, a dead arm, a
   mislabelled arm, an arm that never ran, an arm that ran only half its sizes, a
-  lucky duplicate sample, a flattered pass, two passes that disagree.
+  lucky duplicate sample, a flattered pass, two passes that disagree, all nine
+  routines with the effect on the three in the N2 gap, a reference library
+  that is absent either entirely or for one routine, two reference libraries
+  competing to be the named one, a host whose DYNAMIC_ARCH probe never ran, and a
+  host whose topology fields are `lscpu` defaults rather than measurements.
   `gates/p1.sh` runs `decompose.py` over each and asserts the report says the
   planted thing. The instrument earns nothing on its own — it earns its place by
   having already found defects that would each have survived into published
@@ -212,7 +216,22 @@ support opposite conclusions.
   broken it must also go red. That is how two rules were found to be guarded by
   nothing — the minimum-within-a-run and median-across-runs aggregation, both of
   which exist so that the luckiest sample is not the one that survives, and neither
-  of which any fixture could reach.
+  of which any fixture could reach. It is also how the routine set was found to be
+  a coverage gap in the instrument rather than in the campaign: every fixture ran
+  three routines, so the analysis was certified on `dgemm` and `dgemv` and said
+  nothing about `dtrsm`, `dtrmm` and `dsymm` — the operations the conclusion will
+  rest on. Planting the effect there is what exposed the majority-of-cells hazard
+  below.
+- **The fixtures are audited against the producers, not only against the
+  analysis.** A fixture that cannot emit a shape the scripts can write leaves that
+  branch of the analysis to run for the first time on data that costs money. So
+  `build-libs.sh`'s `arm_record` call sites and `run-matrix.sh`'s census statuses
+  are read off the scripts and checked against the scenario set; four shapes had no
+  fixture, including the OpenMP arm, the arm that measures the pinning delta, and a
+  control target built but not runnable on its host. The same audit is why the
+  exact wording of `capture-env.sh`'s no-topology warning is now pinned in a
+  fixture: `decompose.py` matches it by substring, so a reword would not error — it
+  would quietly stop flagging a defaulted field as a default.
 
 ## Hazards, learned the hard way
 
@@ -263,6 +282,27 @@ support opposite conclusions.
   is where the next blind spot of this kind will be, so aggregation rules are
   tested on numbers, and `within_spread`/`run_spread` are printed beside every
   verdict rather than folded into it.
+- **A majority-of-cells verdict is decided partly by the size ladder.** The
+  campaign verdict counts comparable cells, and the routine set does not
+  contribute them evenly — padded and unpadded `dgemm` is 20 cells, most level-3
+  routines 12, `dgemv` 8. So an effect confined to TRSM/TRMM/SYMM, which is the
+  shape the 94-vs-5 kernel gap predicts, is about a third of the cells, and the
+  parity cells clear the 60% majority on their own: the headline read
+  `NULL … publish the negative result` over a coherent +22% on every cell of the
+  three routines the campaign was built to price. The number of cells a routine
+  contributes is a property of `bench.c`'s ladder, not of the hardware, so the
+  NULL branch now requires that no coherent subset — by routine, regime or
+  instance, in either direction — carries a direction of its own. The guard is
+  asserted in both directions, because a rule that could manufacture a localised
+  effect out of a genuine null would be worse than the false negative it fixes.
+- **A reason recorded is not a reason reported.** Standing order 11 says every gap
+  in the results carries a reason, and every gap did — in `census-*.ndjson`. The
+  analysis read those reasons, used them to classify each absence, and then printed
+  only the ones it had classified as holes. So a reader of the report saw
+  `build_failed=12` against ArmPL and could not tell from the report whether the
+  licence had failed, the download was missing or the link had broken. Absent and
+  null being different claims is a property the *artifact* has to have, not just the
+  input files, so section 7 now prints the reason beside every explained absence.
 - **The alarming dispatch outcome is narrower than the above.** Generic `ARMV8`
   selected on a host that *has* SVE would mean the SVE detection itself failed;
   `NO_SVE` set at build time would mean the SVE kernels were never compiled in.

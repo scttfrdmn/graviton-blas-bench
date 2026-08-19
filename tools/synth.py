@@ -110,6 +110,18 @@ PEAK1 = {
 }
 MEMORY_BOUND = frozenset({"dgemv", "daxpy", "ddot"})
 
+# capture-env.sh's warning when lscpu is absent or produced nothing, copied
+# verbatim from scripts/capture-env.sh. decompose.py matches it by substring
+# (`LSCPU_DEFAULTED`), so the two strings are a contract between a shell script
+# and a Python file with nothing to enforce it -- which makes this constant, and
+# the `topology-defaulted` scenario that uses it, the only thing that would catch
+# a reword. A reworded warning does not error: it silently stops suppressing the
+# NUMA note and stops flagging the defaulted SMT field.
+LSCPU_DEFAULTED_WARNING = (
+    "lscpu produced no topology (not installed, or not Linux): sockets, numa_nodes and "
+    "threads_per_core are defaulted to 1 and are NOT measurements on this host."
+)
+
 
 def base_gflops(routine, m, threads):
     """A smooth surface: ramps with size, scales sublinearly with threads.
@@ -172,6 +184,12 @@ class Arm:
     # remove the whole arm: this is the "arm ran and produced only some sizes"
     # case that decompose.py counts as `partial`, and it was inexpressible.
     omit_sizes: tuple = ()
+    # Routines this arm produced no record for at all. The reference arm's version
+    # of omit_sizes, and the only way to reach section 1's per-arm "NO DATA --
+    # reference arm absent" branch: a reference library that ran but has no kernel
+    # for one routine is the ordinary case (ArmPL and netlib do not cover the same
+    # set), and until this existed that branch was unreachable from any fixture.
+    omit_routines: tuple = ()
     # A second record for the SAME (condition, arm, run_id), faster than the real
     # one. bench.c writes one record per condition per run, but a re-run appended
     # into the same file, or a retried arm, produces exactly this -- and the
@@ -335,7 +353,15 @@ def arm_sha(sc: Scenario, host: HostSpec, arm: Arm):
     if arm.library == "openblas" and host.blas_sha_override:
         return host.blas_sha_override
     if arm.library == "armpl":
-        return "armpl-24.10"
+        # build-libs.sh reads the version out of the install directory, so an arm
+        # it could not find has an EMPTY sha, not a plausible one: `arm_record armpl
+        # native "" false true "ARMPL_DIR unset or not a directory"`.
+        return "armpl-24.10" if arm.manifest_built else ""
+    if arm.library == "blis":
+        # The same sha the toolchain record carries for BLIS. A fixture in which
+        # the manifest and the toolchain record disagree about one library's tree
+        # would be planting a blas_sha finding nobody asked for.
+        return "b" * 40
     return sc.blas_sha_overrides.get((arm.library, arm.target), sc.blas_sha)
 
 
@@ -367,7 +393,7 @@ def bench_records(sc: Scenario, host: HostSpec):
                 boost *= mult
         for threads in host.threads:
             for routine, m, n, k, pad, incx in conds:
-                if m in arm.omit_sizes:
+                if m in arm.omit_sizes or routine in arm.omit_routines:
                     continue
                 base = (
                     base_gflops(routine, m, threads)
@@ -857,9 +883,14 @@ def _arms(v1_gain=None, v2_gain=None, shipped_gain=None, routines=None, v1_incx=
 
     `routines` restricts where the gain applies. Left unset the gain is broad,
     which is what a campaign-level verdict needs -- the verdict is a majority over
-    all comparable cells, so an effect confined to two of five routines yields
-    MIXED however large it is. That is correct behaviour, and it is why
-    `v1-ahead-broad` and `v1-ahead-small` are separate scenarios rather than one."""
+    all comparable cells, so an effect confined to a few routines yields MIXED
+    however large it is, and `v1-ahead-broad` and `v1-ahead-small` are separate
+    scenarios rather than one for that reason.
+
+    That MIXED is not free, and this docstring asserted it before it was true: a
+    minority effect used to land on the NULL branch whenever the unaffected
+    routines held 60% of the cells, which `full-routine-set` demonstrated. It is
+    `coherent_subsets()` in decompose.py that makes the sentence above correct."""
     v1_gain = v1_gain or {}
     v2_gain = v2_gain or {}
     shipped_gain = shipped_gain if shipped_gain is not None else v2_gain
@@ -893,6 +924,26 @@ def sc_null():
             {"kind": "exit_bits_clear", "bits": [2, 4, 8, 16]},
             {"kind": "stdout_contains", "text": "publish the negative result"},
             {"kind": "cross_verdicts_all", "expect": "parity", "min_rows": 12},
+            # The subset guard that keeps `full-routine-set` off the NULL branch
+            # must find nothing here. A null result is a publishable outcome of
+            # this campaign, so a guard that can invent a localised effect out of
+            # a genuine null is worse than the false negative it was added to fix.
+            {"kind": "coherent_subsets", "expect": []},
+            # Section 1 as well as section 2. The kernel sets being at parity with
+            # each other says nothing about where OpenBLAS stands against ArmPL,
+            # and section 1 is the table the write-up quotes: the planted 12%
+            # deficit has to appear as a 12% deficit, on the arm the wheels ship.
+            {
+                "kind": "deficit_where",
+                "shipped_only": True,
+                "routine": "dgemm",
+                "op": ">=",
+                "value": 0.08,
+                "min_rows": 4,
+            },
+            {"kind": "deficit_where", "shipped_only": True, "routine": "dgemm", "op": "<=", "value": 0.17},
+            {"kind": "deficit_shipped", "min_rows": 12},
+            {"kind": "stdout_contains", "text": "SHIPPED"},
             {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 0},
             {"kind": "json_number", "path": "coverage.partial", "op": "==", "value": 0},
             {"kind": "anomaly_kind_absent", "kind_name": "escalate"},
@@ -963,6 +1014,28 @@ def sc_v1_ahead_small():
             # honest headline for this shape: "worth fixing, in the small regime".
             {"kind": "verdict_code", "one_of": ["MIXED"]},
             {"kind": "stdout_contains", "text": "CONSEQUENCE: deficit concentrated in the small regime"},
+            # The same concentration in section 1, on the arm that ships: 25%
+            # behind ArmPL in the small regime, level with it in the large. The
+            # CONSEQUENCE line above is derived from the regime profile, so it can
+            # be right while the table it points at is wrong.
+            {
+                "kind": "deficit_where",
+                "shipped_only": True,
+                "routine": "dgemm",
+                "regime": "small",
+                "op": ">=",
+                "value": 0.15,
+                "min_rows": 2,
+            },
+            {
+                "kind": "deficit_where",
+                "shipped_only": True,
+                "routine": "dgemm",
+                "regime": "large",
+                "op": "<=",
+                "value": 0.05,
+                "min_rows": 2,
+            },
             {"kind": "exit_bits_clear", "bits": [2, 4, 8, 16]},
         ],
     )
@@ -1007,6 +1080,11 @@ def sc_noise_only():
             # number while being judged sub-threshold in the verdict.
             {"kind": "cross_delta_where", "routine": "dgemm", "op": ">=", "value": 0.015},
             {"kind": "cross_delta_where", "routine": "dgemm", "op": "<=", "value": 0.05},
+            # A sub-threshold difference is present on every routine here. If the
+            # subset guard fired on that it would convert the audit's original
+            # false positive into a "localised" one, which is the same error with a
+            # better vocabulary.
+            {"kind": "coherent_subsets", "expect": []},
         ],
     )
 
@@ -1950,6 +2028,406 @@ def sc_all_arms_failed():
     )
 
 
+# bench.c's own routine list, in its own order (src/bench.c:682 plus the dgemv and
+# level-1 sweeps below it). Every scenario above this point runs the three-routine
+# default, which is enough to carry a verdict and is NOT what a host produces: a
+# real sweep writes all six level-3 routines, dgemm again at a padded leading
+# dimension, dgemv, and daxpy/ddot at two strides. The routines that only ever
+# appeared in the default set are dgemm, dtrsm and dgemv -- so sgemm, dtrmm, dsyrk
+# and dsymm reached no fixture at all, and DTRMM and DSYMM are inside the very
+# 90-operation N2 gap this campaign exists to price.
+BENCH_ROUTINES = ("dgemm", "sgemm", "dtrsm", "dtrmm", "dsyrk", "dsymm", "dgemv")
+# The operations KERNEL.NEOVERSEN2 does not cover. If the N2 kernel-selection gap
+# is what the deficit is, this is the shape the data takes: a large effect on these
+# and nothing on GEMM.
+N2_GAP_ROUTINES = ("dtrsm", "dtrmm", "dsymm")
+
+
+def sc_full_routine_set():
+    """The routine set a real host actually produces, with the effect where the
+    campaign's hypothesis puts it.
+
+    Two claims, and the first is the reason this scenario is not optional. Until
+    it existed the gate certified decompose.py on dgemm, dtrsm and dgemv and said
+    nothing about sgemm, dtrmm, dsyrk or dsymm -- and dtrmm and dsymm are in the
+    90-operation N2 gap the entire campaign exists to price. A routine the analysis
+    mishandles would have passed P1 green and produced a confident wrong answer in
+    P2 about the cheapest fix in the repo.
+
+    The second claim is about localisation. The effect is planted on the N2-gap
+    routines only, so a global verdict would be the wrong answer: MIXED is correct
+    and is what the campaign would then report -- "worth closing, for TRSM/TRMM/
+    SYMM" -- and the per-routine rows have to be right for that sentence to mean
+    anything."""
+    return Scenario(
+        name="full-routine-set",
+        description=(
+            "All nine routines bench.c emits, with the V1 kernel set 22% ahead on "
+            "dtrsm/dtrmm/dsymm -- the N2 gap -- and at parity on dgemm/sgemm/dsyrk. "
+            "The verdict is routine-specific, and the analysis has to say which "
+            "routines rather than announce a global win."
+        ),
+        hosts=[_host()],
+        routines=BENCH_ROUTINES,
+        arms=_arms(v1_gain=flat(1.22), routines=N2_GAP_ROUTINES),
+        expect=[
+            # 1. every routine survives to both reports. A KeyError or a silent drop
+            # in either section would show up here and nowhere else.
+            {
+                "kind": "routines_covered",
+                "section": "deficit_by_routine",
+                "routines": [*BENCH_ROUTINES, "daxpy", "ddot"],
+            },
+            {
+                "kind": "routines_covered",
+                "section": "target_cross",
+                "routines": [*BENCH_ROUTINES, "daxpy", "ddot"],
+            },
+            # 2. the effect is where it was planted, and only there.
+            {"kind": "cross_verdicts_where", "routine": "dtrsm", "expect": "V1-set-ahead", "min_rows": 4},
+            {"kind": "cross_verdicts_where", "routine": "dtrmm", "expect": "V1-set-ahead", "min_rows": 4},
+            {"kind": "cross_verdicts_where", "routine": "dsymm", "expect": "V1-set-ahead", "min_rows": 4},
+            {"kind": "cross_verdicts_where", "routine": "dgemm", "expect": "parity", "min_rows": 4},
+            {"kind": "cross_verdicts_where", "routine": "sgemm", "expect": "parity", "min_rows": 4},
+            {"kind": "cross_verdicts_where", "routine": "dsyrk", "expect": "parity", "min_rows": 4},
+            # 3. and the campaign-level answer is the honest one: neither a global
+            # win nor a null. 36 of 104 comparable cells carry the effect, so the
+            # parity cells hold a 65% majority and the unguarded verdict said
+            # "NULL ... publish the negative result" over a coherent +22% on every
+            # cell of the three routines the campaign was built to price. That the
+            # majority tips at all is a property of bench.c's ladder -- dgemm
+            # contributes 20 cells, dgemv 8 -- not of the hardware, which is why
+            # the guard is on the parity branch and not a threshold change.
+            {"kind": "verdict_code", "one_of": ["MIXED"]},
+            {
+                "kind": "coherent_subsets",
+                "expect": ["routine:dtrsm:V1", "routine:dtrmm:V1", "routine:dsymm:V1"],
+            },
+            {"kind": "stdout_contains", "text": "CONSEQUENCE: the difference is routine-localised"},
+            {"kind": "stdout_absent", "text": "publish the negative result"},
+            # 4. three of the four affected routines have no correctness check in
+            # bench.c, so this verdict rests on verified=null records and must say
+            # so. A TRSM win that nothing verified is the exact failure mode the
+            # tri-state `verified` was introduced for.
+            {"kind": "stdout_contains", "text": "VERDICT-CAVEAT:"},
+            {"kind": "stdout_contains", "text": "verified=null"},
+            {"kind": "exit_bits_clear", "bits": [2, 4, 8, 16]},
+        ],
+    )
+
+
+def sc_reference_library_absent():
+    """A host where no reference library ran at all -- ArmPL not installed, or its
+    licence check failed. Section 1 has nothing to be a deficit against.
+
+    This is the ordinary case for at least one host in the campaign: ArmPL is not
+    on every AMI, and standing order 3 forbids filling the gap from the published
+    comparisons. So the row must say NO DATA and say why, and section 2 -- which
+    compares the kernel sets against each other and needs no reference -- must be
+    unaffected. A section 1 that silently emitted an empty table would let a
+    reader conclude "no deficit".
+
+    The reference arms are absent the way the producers make them absent, not by
+    being left out of the arm list. build-libs.sh emits an `armpl/native` manifest
+    record unconditionally -- `built:false`, an EMPTY blas_sha, and "ARMPL_DIR unset
+    or not a directory" as the reason -- and a `blis` record the same way when the
+    build fails; run-matrix.sh then censuses both `build_failed`. So this host's
+    manifest names two reference arms that produced nothing, which is the shape that
+    has to be readable as an explained absence rather than a coverage hole."""
+    arms = [a for a in _arms(v1_gain=flat(1.22)) if a.library == "openblas"]
+    arms += [
+        Arm(
+            "armpl",
+            "native",
+            "unforced",
+            thread_backend="openmp",
+            measured=False,
+            manifest_built=False,
+            manifest_reason="ARMPL_DIR unset or not a directory",
+            census_status="build_failed",
+            census_reason="ARMPL_DIR unset or not a directory",
+        ),
+        Arm(
+            "blis",
+            "auto",
+            "unforced",
+            measured=False,
+            manifest_built=False,
+            manifest_reason="build failed, see /opt/gbb/blis.buildlog",
+            census_status="build_failed",
+            census_reason="build failed, see /opt/gbb/blis.buildlog",
+        ),
+    ]
+    return Scenario(
+        name="reference-library-absent",
+        description=(
+            "No non-OpenBLAS library produced a record on this host: both reference arms "
+            "are in the manifest as built:false with an empty blas_sha. Section 1 must "
+            "report NO DATA with a reason and compute nothing; section 2 must still "
+            "answer the kernel-set question."
+        ),
+        hosts=[_host()],
+        arms=arms,
+        expect=[
+            {"kind": "deficit_nodata", "scope": "instance", "min_rows": 1},
+            {"kind": "stdout_contains", "text": "NO DATA — reference library absent"},
+            {"kind": "deficit_absent"},
+            # Section 2 is untouched: the planted kernel-set effect is still found.
+            {"kind": "verdict_code", "one_of": ["V1-SET-AHEAD"]},
+            {"kind": "cross_delta_where", "routine": "dgemm", "op": ">=", "value": 0.15},
+            # An unbuilt arm with a stated reason is an explained absence. This is
+            # the ordinary state of at least one campaign host, so a dataset that
+            # sets bit 4 here would set it on every real run and make the bit
+            # meaningless.
+            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 0},
+            {"kind": "exit_bits_clear", "bits": [4]},
+            {"kind": "stdout_contains", "text": "ARMPL_DIR unset or not a directory"},
+        ],
+    )
+
+
+def sc_reference_arm_partial():
+    """ArmPL ran, but produced no dtrsm. The per-condition twin of the scenario
+    above, and a different claim: the reference library is present, so the instance
+    is not skipped, but one routine has no reference to be measured against.
+
+    Real: reference libraries do not cover the same routine set, and a licence or
+    a missing kernel takes out one routine rather than the library. The row has to
+    name the arm it could not compare and stay out of the payload -- a deficit
+    computed against a reference that did not run for that routine would be a
+    number nobody measured."""
+    arms = _arms(v1_gain=flat(1.22))
+    for a in arms:
+        if a.library == "armpl":
+            a.omit_routines = ("dtrsm",)
+    return Scenario(
+        name="reference-arm-partial",
+        description=(
+            "The reference library ran but has no dtrsm. Section 1 must print NO DATA "
+            "for dtrsm naming the absent reference arm, keep it out of the payload, and "
+            "report the other routines normally."
+        ),
+        hosts=[_host()],
+        arms=arms,
+        expect=[
+            {"kind": "deficit_nodata", "min_rows": 4},
+            {"kind": "deficit_absent", "routine": "dtrsm"},
+            # ...and the routines that do have a reference are unaffected.
+            {
+                "kind": "deficit_where",
+                "routine": "dgemm",
+                "shipped_only": True,
+                "op": "<=",
+                "value": 0.05,
+                "min_rows": 4,
+            },
+            {"kind": "deficit_shipped", "min_rows": 8},
+            # One reference candidate on this host, so every row that does have a
+            # deficit must name it. This is the coverage half of the choice
+            # `manifest-shapes` exercises with two candidates: losing dtrsm must not
+            # promote some other arm into the reference slot for the other routines.
+            {"kind": "deficit_reference", "arm": "armpl/native/unforced", "min_rows": 8},
+            # dtrsm still has a kernel-set verdict: section 2 does not need ArmPL,
+            # and losing the reference must not lose the comparison that matters.
+            {"kind": "cross_verdicts_where", "routine": "dtrsm", "expect": "V1-set-ahead", "min_rows": 2},
+            # And the hole is reported as a hole. The census says this arm ran, so
+            # nothing in results/ accounts for the six absent dtrsm cells: by
+            # standing order 11 that is MISSING-UNEXPLAINED and bit 4, not a
+            # silently narrower table. Asserted with the count, because "some hole
+            # somewhere" would also be satisfied by a coverage model that had lost
+            # track of which arm was missing.
+            {"kind": "exit_bits_set", "bits": [4]},
+            {"kind": "exit_bits_clear", "bits": [2, 8, 16]},
+            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 6},
+        ],
+    )
+
+
+def sc_manifest_shapes():
+    """Every arm shape `build-libs.sh` and `run-matrix.sh` can emit that no fixture
+    contained.
+
+    The manifest is where the expected-arm census comes from, so a shape those two
+    scripts can write and no fixture can produce is a branch of `decompose.py` that
+    first runs on real data. Four were missing, all from call sites that exist
+    today: the OpenMP-threaded OpenBLAS (`DYNAMIC_OMP`, `thread_backend:openmp`),
+    the `DYNAMIC_OMP_BOUND` arm the runner synthesises after the manifest loop to
+    measure the pinning delta rather than assume it (census-only, no manifest
+    record), a BLIS arm, and a control target built but not runnable.
+
+    `built:true` + `runnable:false` is the only way that pair occurs: build-libs.sh
+    builds a control target anyway and records that the host cannot run it, and
+    run-matrix.sh then censuses it `unrunnable` per thread count. Both halves are
+    here, because that is what the producers write -- the manifest reason alone is
+    a shape only a sweep truncated before the arm shipped its census would give.
+    NEOVERSEN2 is the faithful choice on this host: `requires()` puts it behind
+    sve2, and this host reports sve without sve2.
+
+    BLIS also gives section 1 two reference candidates for the first time, so the
+    `max(present_refs, key=(conditions, label))` choice at decompose.py:1102 is
+    exercised rather than defaulted. Both candidates cover every condition here, so
+    the tie falls to the label -- which is why what gets asserted is that ONE
+    reference is named and it is the same one for every arm in a cell, not which of
+    the two it is. Coverage deciding the choice is `reference-arm-partial`."""
+    arms = _arms(v1_gain=flat(1.22))
+    unrunnable = "target requires sve2 which this host does not report (sve=true sve2=false)"
+    arms += [
+        Arm("openblas", "DYNAMIC_OMP", "unforced", thread_backend="openmp"),
+        Arm("openblas", "DYNAMIC_OMP_BOUND", "unforced", thread_backend="openmp", in_manifest=False),
+        Arm("blis", "auto", "unforced"),
+        Arm(
+            "openblas",
+            "NEOVERSEN2",
+            "unforced",
+            measured=False,
+            census_status="unrunnable",
+            census_reason=unrunnable,
+            manifest_runnable=False,
+            manifest_reason=unrunnable,
+        ),
+    ]
+    return Scenario(
+        name="manifest-shapes",
+        description=(
+            "Every arm shape the producers can write: the OpenMP OpenBLAS and its bound "
+            "twin, a BLIS arm, and a control target built but not runnable here. Two "
+            "reference candidates, so section 1 must name one and name it consistently."
+        ),
+        hosts=[_host()],
+        arms=arms,
+        expect=[
+            # built:true + runnable:false + census unrunnable is a stated reason,
+            # so it is an explained absence and not a hole.
+            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "coverage.by_status.unrunnable", "op": ">", "value": 0},
+            {"kind": "exit_bits_clear", "bits": [4]},
+            # And the reason reaches the artifact, not just the census file. Both
+            # producers write this string for this arm and the census is consulted
+            # first, so what is asserted here is that an explained absence explains
+            # itself to a reader of the report.
+            {"kind": "stdout_contains", "text": "sve2 which this host does not report"},
+            # Two candidate reference arms: exactly one is named per cell, and every
+            # OpenBLAS arm in that cell is measured against the same one. Rows
+            # compared against different references do not belong in one table.
+            {
+                "kind": "deficit_reference",
+                "routine": "dgemm",
+                "one_of": ["armpl/native/unforced", "blis/auto/unforced"],
+                "min_rows": 8,
+            },
+            {
+                "kind": "deficit_reference",
+                "routine": "dgemv",
+                "one_of": ["armpl/native/unforced", "blis/auto/unforced"],
+                "min_rows": 4,
+            },
+            {"kind": "deficit_shipped", "min_rows": 12},
+            # The two OpenMP arms are their own arms, not variants of a target
+            # already present, so both must reach the report rather than merge.
+            {"kind": "stdout_contains", "text": "openblas/DYNAMIC_OMP/unforced"},
+            {"kind": "stdout_contains", "text": "openblas/DYNAMIC_OMP_BOUND/unforced"},
+            # Four extra arms, none of them V1 or V2, must not disturb the cross.
+            {"kind": "cross_verdicts_where", "routine": "dgemm", "expect": "V1-set-ahead", "min_rows": 4},
+            {"kind": "verdict_code", "one_of": ["V1-SET-AHEAD"]},
+            {"kind": "exit_bits_clear", "bits": [2, 8]},
+        ],
+    )
+
+
+def sc_probe_unavailable():
+    """`capture-env.sh` could not run the DYNAMIC_ARCH probe, so nobody knows what
+    the shipped library selects on this host.
+
+    Standing order 8's loud trigger is generic `ARMV8` on an SVE host. This is the
+    case where that check did not happen: `openblas_dynamic_probe_status` is one of
+    `not_attempted`/`build_failed`/`run_failed`, `openblas_dynamic_selection` is
+    null, and `openblas_coretype_forcing` falls back to `not_probed` because
+    capture-env.sh only probes forcing once the corename probe works. The faithful
+    pairing is both fields together, which is why one scenario covers both.
+
+    It was a note, and notes set no exit bit. That is the same failing-open that
+    `sve_kernels:unknown` was fixed for, on the same axis, so it is now the same
+    thing: a provenance gap and exit bit 8. Not an escalation -- absent evidence is
+    not evidence of absence -- and `escalate` must stay empty here."""
+    return Scenario(
+        name="probe-unavailable",
+        description=(
+            "The DYNAMIC_ARCH probe failed to run, so the standing-order-8 generic-ARMV8 "
+            "check was never performed and coretype forcing was never proven. A "
+            "provenance gap on the campaign's central axis, not a note and not an alarm."
+        ),
+        hosts=[
+            _host(
+                dynamic_probe_status="run_failed",
+                dynamic_selection=None,
+                forcing="not_probed",
+                warnings=(
+                    "DYNAMIC_ARCH probe failed: could not build/link the corename probe against "
+                    "/opt/gbb/openblas-DYNAMIC/lib. openblas_dynamic_selection is null -- "
+                    "detection broke, it did not report a clean result.",
+                ),
+            )
+        ],
+        arms=_arms(v1_gain=flat(1.22)),
+        expect=[
+            {"kind": "anomaly_kind_present", "kind_name": "dynamic_probe_unavailable"},
+            {"kind": "exit_bits_set", "bits": [8]},
+            {"kind": "exit_bits_clear", "bits": [2, 4, 16]},
+            # Absent evidence is not evidence of absence: this is not standing
+            # order 8 firing, and a fixture that let it fire here would make the
+            # escalation unreadable on the host where it matters.
+            {"kind": "anomaly_kind_absent", "kind_name": "escalate"},
+            {"kind": "stdout_contains", "text": "the coretype axis is unproven here"},
+            # And the numbers are still analysed. A provenance gap says "do not
+            # publish this yet", not "throw the sweep away".
+            {"kind": "cross_verdicts_where", "routine": "dgemm", "expect": "V1-set-ahead", "min_rows": 4},
+        ],
+    )
+
+
+def sc_topology_defaulted():
+    """`lscpu` produced no topology, so `sockets`, `numa_nodes` and
+    `threads_per_core` in the record are defaults rather than measurements.
+
+    Two hosts, because the warning has two distinct consequences. On the first,
+    `threads_per_core=1` must not be read as "SMT is off" -- that is the same
+    fail-open shape as a null `verified` being treated as a pass, and Graviton
+    having no SMT is a fact about Graviton, not evidence about this box. On the
+    second, `numa_nodes=2` must NOT produce the cross-socket note, because a 2 that
+    came from a default is not a measurement either. The warning lives in
+    `warnings[]`, matched by substring, and CLAUDE.md's contract with
+    capture-env.sh says do not reword it -- so this fixture is also the regression
+    test for that string."""
+    return Scenario(
+        name="topology-defaulted",
+        description=(
+            "lscpu produced nothing, so the topology fields are defaults. SMT-off must "
+            "read as unverified rather than as measured, and a defaulted numa_nodes must "
+            "not produce a cross-socket note."
+        ),
+        hosts=[
+            _host(warnings=(LSCPU_DEFAULTED_WARNING,)),
+            _host(
+                instance_type="c7g.16xlarge",
+                instance_id="i-0000000000000002",
+                run_id="synth-c7g16-pass1",
+                numa_nodes=2,
+                warnings=(LSCPU_DEFAULTED_WARNING,),
+            ),
+        ],
+        arms=_arms(),
+        expect=[
+            {"kind": "stdout_contains", "text": "is a DEFAULT (lscpu produced no topology)"},
+            {"kind": "stdout_contains", "text": "SMT being off is unverified here"},
+            {"kind": "stdout_absent", "text": "multithreaded arms cross a socket"},
+            # A defaulted topology is not a reason to distrust the timings, so
+            # nothing here is invalid, poisoned or missing.
+            {"kind": "exit_bits_clear", "bits": [2, 4, 8, 16]},
+            {"kind": "verdict_code", "one_of": ["NULL"]},
+        ],
+    )
+
+
 SCENARIOS = {
     f.__name__[3:].replace("_", "-"): f
     for f in (
@@ -1989,6 +2467,12 @@ SCENARIOS = {
         sc_lucky_sample,
         sc_lucky_pass,
         sc_all_arms_failed,
+        sc_full_routine_set,
+        sc_reference_library_absent,
+        sc_reference_arm_partial,
+        sc_manifest_shapes,
+        sc_probe_unavailable,
+        sc_topology_defaulted,
     )
 }
 
@@ -2028,6 +2512,21 @@ def cross_rows(report, **filters):
     for key, val in filters.items():
         rows = [r for r in rows if r.get(key) == val]
     return rows
+
+
+def deficit_rows(report, **filters):
+    """Section 1's per-arm rows. The instance-level `no_data` rows share the list
+    and carry none of these keys, so they are dropped by the `arm` guard rather
+    than by the filters -- an expectation about deficits must not silently match a
+    row that has none."""
+    rows = [r for r in (report.get("deficit_by_routine") or []) if r.get("arm")]
+    for key, val in filters.items():
+        rows = [r for r in rows if r.get(key) == val]
+    return rows
+
+
+def _pick(exp, keys):
+    return {k: exp[k] for k in keys if k in exp}
 
 
 def comparable(rows):
@@ -2100,6 +2599,34 @@ def check_one(exp, report, stdout, exit_code, root):
         if not isinstance(got, (int, float)) or isinstance(got, bool):
             return False, f"{exp['path']} is {got!r}, not a number"
         return OPS[exp["op"]](got, exp["value"]), f"{exp['path']}={got} {exp['op']} {exp['value']}"
+
+    if kind == "routines_covered":
+        # Every routine the fixture emitted must reach the named report section.
+        # Cheap, and the only assertion that fails when the analysis drops a
+        # routine wholesale rather than getting its number wrong.
+        rows = report.get(exp["section"]) or []
+        got = {r.get("routine") for r in rows if r.get("routine")}
+        missing = [r for r in exp["routines"] if r not in got]
+        return not missing, (
+            f"{exp['section']} covers {len(got)} routines"
+            + (f"; MISSING {missing}" if missing else f" including all {len(exp['routines'])} expected")
+        )
+
+    if kind == "coherent_subsets":
+        # verdict.coherent_subsets is what blocks the NULL branch, so this is
+        # asserted as a set and by default exactly. A length or membership check
+        # would pass on a guard that over-fires -- a regime or an instance bucket
+        # qualifying as well would widen "not a null" on a shape the scenario
+        # never planted, and the fixtures where the guard must stay silent
+        # (`null`, `noise-only`) are the only place that shows up.
+        subs = dig(report, "verdict.coherent_subsets") or []
+        got = sorted({f"{s['axis']}:{s['value']}:{s['direction']}" for s in subs})
+        want = sorted(exp["expect"])
+        hit = got == want if exp.get("exact", True) else all(w in got for w in want)
+        return (
+            hit,
+            f"coherent subsets {got}, want {'exactly' if exp.get('exact', True) else 'at least'} {want}",
+        )
 
     if kind == "json_len":
         # For the report's list-valued fields -- `inputs.files.<family>` is the
@@ -2187,6 +2714,128 @@ def check_one(exp, report, stdout, exit_code, root):
         return not bad, (
             f"{f}: {len(rows) - len(bad)}/{len(rows)} deltas satisfy {exp['op']} {exp['value']}"
             + ("; failing: " + ", ".join(f"{r['median_delta']:+.3f}" for r in bad[:5]) if bad else "")
+        )
+
+    if kind == "deficit_where":
+        # Section 1 is the table the write-up quotes: "OpenBLAS is N% behind ArmPL
+        # on this routine". Until C4 nothing asserted a single number in it, so an
+        # analysis that got section 2's kernel-set cross right and section 1's
+        # reference-relative deficit wrong passed the gate green.
+        rows = deficit_rows(report, **_pick(exp, ("instance", "routine", "regime", "incx", "lda_pad")))
+        if "arm_contains" in exp:
+            rows = [r for r in rows if exp["arm_contains"] in str(r.get("arm"))]
+        if exp.get("shipped_only"):
+            rows = [r for r in rows if r.get("shipped_arm")]
+        rows = [r for r in rows if r.get("median_deficit") is not None]
+        if len(rows) < exp.get("min_rows", 1):
+            return False, f"{len(rows)} section-1 rows with a deficit, want >= {exp.get('min_rows', 1)}"
+        bad = [r for r in rows if not OPS[exp["op"]](r["median_deficit"], exp["value"])]
+        return not bad, (
+            f"{len(rows) - len(bad)}/{len(rows)} section-1 deficits satisfy {exp['op']} {exp['value']}"
+            + (
+                "; failing: "
+                + ", ".join(f"{r['arm']}/{r['routine']}={r['median_deficit']:+.3f}" for r in bad[:5])
+                if bad
+                else ""
+            )
+        )
+
+    if kind == "deficit_shipped":
+        # is_shipped() decides which row of section 1 is the one anybody runs, and
+        # a mutant returning False for every arm left the gate green: the table
+        # still printed, every number in it was still right, and the sentence
+        # "this is what the wheels do" had quietly lost its subject. Asserted as a
+        # partition -- exactly one shipped arm per condition, and it is the
+        # DYNAMIC/unforced one -- because always-True passes a bare "some row is
+        # marked" check just as well as always-False fails it.
+        rows = [r for r in (report.get("deficit_by_routine") or []) if r.get("arm")]
+        if not rows:
+            return False, "section 1 has no per-arm rows"
+        groups = collections.defaultdict(list)
+        for r in rows:
+            groups[(r["instance"], r["threads"], r["routine"], r["regime"], r["lda_pad"], r["incx"])].append(
+                r
+            )
+        wrong = []
+        for key, rs in sorted(groups.items(), key=str):
+            marked = [r for r in rs if r.get("shipped_arm")]
+            if len(marked) != 1:
+                wrong.append(f"{key}: {len(marked)} arms marked SHIPPED of {len(rs)}")
+            elif marked[0]["arm"] != exp.get("arm", "openblas/DYNAMIC/unforced"):
+                wrong.append(f"{key}: SHIPPED is {marked[0]['arm']!r}")
+        if len(groups) < exp.get("min_rows", 1):
+            return False, f"{len(groups)} condition groups in section 1, want >= {exp.get('min_rows', 1)}"
+        return not wrong, (
+            f"{len(groups) - len(wrong)}/{len(groups)} condition groups mark exactly one SHIPPED arm "
+            f"({exp.get('arm', 'openblas/DYNAMIC/unforced')})"
+            + ("; wrong: " + "; ".join(wrong[:3]) if wrong else "")
+        )
+
+    if kind == "deficit_reference":
+        # Section 1's header promises "each named OpenBLAS arm vs a NAMED reference
+        # arm", and with two candidate reference libraries on a host that promise
+        # acquires a failure mode: a per-row choice. Rows measured against
+        # different references are not one table, and nothing about the printed
+        # deficits would look wrong. So the invariant asserted is per-cell
+        # uniqueness first, membership second -- which of two equally-covering
+        # candidates wins is a tie-break, not a finding, and pinning it would make
+        # the fixture assert the alphabet.
+        rows = deficit_rows(report, **_pick(exp, ("instance", "routine", "regime", "incx", "lda_pad")))
+        if len(rows) < exp.get("min_rows", 1):
+            return False, f"{len(rows)} section-1 rows, want >= {exp.get('min_rows', 1)}"
+        groups = collections.defaultdict(set)
+        for r in rows:
+            key = (r["instance"], r["threads"], r["routine"], r["regime"], r["lda_pad"], r["incx"])
+            groups[key].add(r.get("reference_arm"))
+        wrong = []
+        for key, refs in sorted(groups.items(), key=str):
+            if len(refs) != 1:
+                wrong.append(f"{key}: {len(refs)} different reference arms {sorted(map(str, refs))}")
+                continue
+            ref = next(iter(refs))
+            if "arm" in exp and ref != exp["arm"]:
+                wrong.append(f"{key}: reference is {ref!r}, want {exp['arm']!r}")
+            elif "one_of" in exp and ref not in exp["one_of"]:
+                wrong.append(f"{key}: reference is {ref!r}, not in {exp['one_of']}")
+            elif not ref:
+                wrong.append(f"{key}: reference_arm is {ref!r}")
+        want = exp.get("arm") or exp.get("one_of") or "a named non-OpenBLAS arm"
+        return not wrong, (
+            f"{len(groups) - len(wrong)}/{len(groups)} section-1 cells name one reference arm ({want})"
+            + ("; wrong: " + "; ".join(wrong[:3]) if wrong else "")
+        )
+
+    if kind == "deficit_absent":
+        # The other half of a NO-DATA claim: nothing was quietly computed anyway.
+        # A branch that prints "NO DATA" and still appends a row would satisfy
+        # deficit_nodata on its own.
+        rows = deficit_rows(report, **_pick(exp, ("instance", "routine", "regime", "incx", "lda_pad")))
+        return not rows, (
+            f"{_pick(exp, ('instance', 'routine', 'regime', 'incx', 'lda_pad'))}: "
+            f"{len(rows)} section-1 deficit rows, want none"
+            + ("; found: " + ", ".join(f"{r['arm']}/{r['routine']}" for r in rows[:3]) if rows else "")
+        )
+
+    if kind == "deficit_nodata":
+        # The two ways section 1 can have nothing to compare against, which are
+        # different claims: no reference library on the host at all (one row for
+        # the whole instance) versus a reference library that ran but has no
+        # kernel for this condition (one row per OpenBLAS arm). Standing order 11:
+        # absent and null are different, and so are these two absences.
+        rows = report.get("deficit_by_routine") or []
+        nd = [r for r in rows if r.get("no_data")]
+        if exp.get("scope") == "instance":
+            hit = len(nd) >= exp.get("min_rows", 1)
+            return (
+                hit,
+                f"{len(nd)} instance-level NO-DATA rows in section 1, want >= {exp.get('min_rows', 1)}",
+            )
+        # The per-arm branch prints but does not append, by design: a row with no
+        # number must not enter the payload the report averages. So it is asserted
+        # on stdout, and the count matters -- one line per OpenBLAS arm.
+        n = stdout.count("NO DATA — reference arm absent")
+        return n >= exp.get("min_rows", 1), (
+            f"{n} 'NO DATA — reference arm absent' lines in section 1, want >= {exp.get('min_rows', 1)}"
         )
 
     if kind == "regime_gap_cross":
