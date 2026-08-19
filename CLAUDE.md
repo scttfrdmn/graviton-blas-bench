@@ -20,7 +20,7 @@ until it finds something.
   explicitly** — the profile defaults to `us-west-2`, but the campaign is pinned
   to `us-east-1`/`us-east-2`, the only regions carrying all five families.
 
-## The eleven standing orders
+## The fourteen standing orders
 
 1. **Measured peak, never theoretical.** The primary denominator is the best
    GFLOP/s any arm achieved on that host. `peak_fma` is a cross-check only; if
@@ -64,9 +64,24 @@ until it finds something.
    The original runner set `OMP_PROC_BIND`/`OMP_PLACES` while OpenBLAS was built
    `USE_OPENMP=0`, so the only arm that obeyed them was the reference arm —
    a confound the exact size of the effect under study.
-10. **Session-end status comment** on the active umbrella issue: what ran, what
-   the gate said, what is blocked, what is needed from Scott.
-11. **Long jobs run in the background.** `build-libs.sh` is ~40 minutes and the
+10. **An arm is labelled with what the library reported, never with what was
+    requested.** `OPENBLAS_CORETYPE` is a request: `force_coretype()` silently
+    ignores a name it does not know, and a non-`DYNAMIC_ARCH` build ignores the
+    variable entirely. Verify with `gbb-coreprobe` before the arm runs and record
+    `openblas_get_corename()`'s answer. If the request was not honoured, do not
+    run the arm — a mislabelled arm is not a failed run, it is a plausible wrong
+    answer, which is worse. Same rule for `TARGET=`, the MIDR, and the thread
+    count: record the observed value, not the intended one.
+11. **A gap in the results carries a reason.** Every arm the runner declines to
+    run writes a census record saying why. Absent and null are different claims,
+    and the analysis must be able to tell them apart: "V1 and V2 are at parity"
+    and "the V1 arm never ran" support opposite conclusions.
+12. **Ship results as they are produced.** Per-arm to S3, not at end of sweep.
+    Instances terminate on completion and a spot reclaim comes sooner; results
+    that exist only on the instance are instance-hours spent for nothing.
+13. **Session-end status comment** on the active umbrella issue: what ran, what
+    the gate said, what is blocked, what is needed from Scott.
+14. **Long jobs run in the background.** `build-libs.sh` is ~40 minutes and the
     sweeps are longer. Launch them backgrounded and pick them up on completion;
     never block on `sleep` or a fixed timeout.
 
@@ -85,9 +100,9 @@ under `gates/` that exits 0/1 and prints its evidence.
 | gate | requires |
 |---|---|
 | `gates/p0.sh` | CI green on a clean clone; `make roofline` builds; `bash -n` clean |
-| `gates/p1.sh` | expected-arm census present and read from `build-manifest.ndjson`; every planted effect recovered; the planted **null** reported as a null, not a weak hit, and distinguishable from a missing arm |
-| `gates/p2.sh` | complete NDJSON set from one host; `decompose.py` clean bar genuine findings; `numactl -H` recorded |
-| `gates/p3.sh` | five hosts collected; every `env-*.json` present; no unresolved section-5 anomalies |
+| `gates/p1.sh` | expected-arm census present and read from `manifest-*.ndjson` + `census-*.ndjson`; every planted effect recovered; the planted **null** reported as a null, not a weak hit, and distinguishable from a missing arm |
+| `gates/p2.sh` | complete NDJSON set from one host; `decompose.py` clean bar genuine findings; `topology-*.txt` recorded; every arm in `census-*.ndjson` either `measured` or carrying a stated reason — zero `MISSING-UNEXPLAINED` |
+| `gates/p3.sh` | five hosts collected; every `env-*.json` present; `blas_sha` identical across hosts; no unresolved section-5 anomalies |
 | `gates/p4.sh` | report answers "is the N2 gap worth closing", supported by section 2, stated as a null if that is what the data says |
 
 ## Working conventions

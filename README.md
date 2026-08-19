@@ -27,22 +27,48 @@ on a *different* OpenBLAS kernel set:
 | `c9g`   | 5  | Neoverse V3 | SVE2, VL=128 | `NEOVERSEV2`→`N2`   | 5  |
 
 Run naively this confounds silicon with kernel set. So the harness **crosses
-them**: every OpenBLAS `TARGET=` is built on every host, including targets the
-host is not. Running the SVE-rich `NEOVERSEV1` kernel set *on* Graviton4 and
-Graviton5 is the measurement that separates "V2/V3 is bad at SVE" from "the N2
-kernel set is worse than the V1 one." That single comparison decides whether the
-90-operation N2 gap is worth closing — and closing it requires no new kernel
-code, only kernel selection.
+them**: the SVE-rich `NEOVERSEV1` kernel set is run *on* Graviton4 and Graviton5.
+That is the measurement separating "V2/V3 is bad at SVE" from "the N2 kernel set
+is worse than the V1 one," and it decides whether the 90-operation N2 gap is
+worth closing — closing it requires no new kernel code, only kernel selection.
 
-`ARMV8` (generic NEON) and `DYNAMIC_ARCH` are built as controls. `DYNAMIC_ARCH`
-is what distro packages and NumPy wheels actually ship, so what it selects at
-runtime on each host is a finding in its own right, not bookkeeping.
+**The cross is a runtime sweep, not a set of builds.** This is worth being
+precise about, because the obvious way to do it is wrong. `TARGET=` is not only a
+kernel-table selection: `Makefile.arm64` also uses it to set the compiler flags
+applied to the *common* code, so comparing a `TARGET=NEOVERSEV1` build against a
+`TARGET=NEOVERSEV2` build moves the kernel table **and** the codegen of every
+shared source file at once, with no way to attribute the difference afterwards.
+
+OpenBLAS's own `force_coretype()` makes every target in its switch reachable by
+name at runtime via `OPENBLAS_CORETYPE`, so one `DYNAMIC_ARCH` binary can be
+swept over `{ARMV8, ARMV8SVE, NEOVERSEN1, NEOVERSEV1, NEOVERSEV2, NEOVERSEN2}`
+with one set of common-code flags and only the kernel table varying. Two static
+`TARGET=` builds are kept per host — the host's native target and the cross
+target — purely as controls on the mechanism: that `DYNAMIC_ARCH` dispatch costs
+nothing measurable, and that a forced coretype lands where a real `TARGET=` build
+does.
+
+`OPENBLAS_CORETYPE` is a **request**. `force_coretype()` ignores a name it does
+not know, and a non-`DYNAMIC_ARCH` build ignores the variable entirely, so
+`src/coreprobe.c` verifies every coretype against `openblas_get_corename()`
+before its arm runs. An arm whose request was not honoured is not run at all,
+because labelling its records `coretype=NEOVERSEV1` would be claiming a number
+we did not measure.
+
+`DYNAMIC_ARCH` unforced is its own arm: it is what distro packages and NumPy
+wheels actually ship, so what it selects on each host is a finding rather than
+bookkeeping.
 
 `ARMV8SVE` is **not** a control. `KERNEL.ARMV8SVE` is the file
 `KERNEL.NEOVERSEN2` conspicuously does not include, so the `ARMV8SVE` arm is
 the closest thing in-tree to "what Graviton 4 would get if the N2
-kernel-selection gap were closed." It is a first-class experimental arm and runs
-on every host.
+kernel-selection gap were closed." It is a first-class experimental arm.
+
+Two further arms exist to measure confounds rather than leave them in the
+comparison. `DYNAMIC_OMP` is the same OpenBLAS built `USE_OPENMP=1`, so the
+threading backend can be attributed; `DYNAMIC_OMP_BOUND` is that binary with
+`OMP_PROC_BIND=close`, which measures what thread pinning is worth. See
+§Measurement discipline for why those are arms and not fixes.
 
 ## Quickstart
 
@@ -50,10 +76,27 @@ Per host:
 
 ```bash
 export GBB_PREFIX=$HOME/graviton-blas-bench-libs
-export ARMPL_DIR=/opt/arm/armpl_24.10_gcc          # optional but wanted
-bash scripts/build-libs.sh                          # ~40 min, builds 6 OpenBLAS variants
-bash scripts/run-matrix.sh                          # writes results/*.ndjson
+export ARMPL_DIR=/opt/arm/armpl_24.10_gcc     # optional but wanted
+export GBB_S3_URI=s3://your-bucket/gbb        # strongly advised, see below
+export GBB_AWS_REGION=us-east-1
+bash scripts/build-libs.sh                     # ~40 min
+bash scripts/run-matrix.sh                     # writes results/*.ndjson
 ```
+
+`GBB_S3_URI` is not optional in practice. Instances are terminated on completion
+and a spot reclaim can come sooner, so results are shipped after every arm rather
+than at the end of the sweep. Without it a multi-hour run exists only on a host
+that is about to be destroyed.
+
+`build-libs.sh` requires `OPENBLAS_REF` to be an immutable commit SHA — it
+defaults to the audited `cc3fc1e`. The five hosts are built on different days,
+and a branch name would let them silently get different libraries while the
+cross-host comparison treats them as one. `GBB_ALLOW_MUTABLE_REF=1` overrides it.
+
+`run-matrix.sh` refuses to start if `capture-env.sh` exits non-zero: 3 means this
+host's timings would not be comparable, 4 means stop and escalate per standing
+order 8. `GBB_FORCE_INVALID_HOST=1` and `GBB_ESCALATION_ACK="<note>"` override
+them respectively, and the override is recorded in the census.
 
 Then, with results from all hosts collected into one directory:
 
@@ -66,11 +109,29 @@ python3 analysis/decompose.py results/
 ```
 src/bench.c            routine sweep, Fortran BLAS ABI, NDJSON per measurement
 src/roofline.c         measured peak FMA + triad bandwidth (the denominators)
-scripts/build-libs.sh  builds the OpenBLAS target cross, ArmPL link, BLIS
-scripts/capture-env.sh MIDR, HWCAP, NUMA, governor, OpenBLAS runtime selection
-scripts/run-matrix.sh  orchestrates library x target x threads on one host
-analysis/decompose.py  the five reports plus an anomaly section
+src/coreprobe.c        what OpenBLAS actually selected, per OPENBLAS_CORETYPE
+scripts/build-libs.sh  DYNAMIC_ARCH + control builds, ArmPL link, BLIS
+scripts/capture-env.sh MIDR per core, HWCAP, NUMA, cgroups, governor, dispatch
+scripts/run-matrix.sh  orchestrates arm x coretype x threads on one host
+analysis/decompose.py  the reports, the coverage census, and an anomaly section
+tests/                 stub-based regression suite for the runner's decisions
+gates/                 one script per phase gate; each exits 0/1 with evidence
 ```
+
+Each run writes, per host:
+
+```
+results/env-<run_id>.json        provenance; capture-env.sh's exit code gates the run
+results/manifest-<run_id>.ndjson what was built, and why anything was not
+results/census-<run_id>.ndjson   one record per attempted arm, with an outcome
+results/topology-<run_id>.txt    numactl -H and lscpu, verbatim
+results/roofline-<run_id>.ndjson measured peak FMA and triad bandwidth
+results/bench-<run_id>.ndjson    the measurements
+```
+
+The census is load-bearing, not bookkeeping: without it the analysis cannot
+distinguish "V1 and V2 are at parity" from "the V1 arm never ran," and those two
+support opposite conclusions.
 
 ## Measurement discipline
 
@@ -79,10 +140,48 @@ analysis/decompose.py  the five reports plus an anomaly section
 - **Minimum, with p50 and p90 recorded.** Min is the statistic; the others are
   kept so the analysis can flag arms where min is unrepresentative. On a
   no-turbo, no-SMT host a wide min/p50 spread means a noisy neighbour.
+- **Calls are batched, and the batch is calibrated in two stages.** Bracketing
+  every call with `now()` cost ~31 ns per pair — 27.9% of the sample at n=8 — and
+  a constant additive term compresses ratios, biasing the campaign toward "no
+  effect found" in the one regime where the missing `GEMM_SMALL_*` path should
+  show. Sizing the batch from a single timed call does not work either: clock
+  *resolution* and clock *overhead* are different quantities, and a coarse
+  clocksource (1 µs is common under virtualisation, which `hpc7g` is) reads a
+  58 ns call as zero. `timer_res_ns` is recorded in every record so a reader can
+  check rather than trust this.
 - **Reps scale with problem size** so every measurement runs at least 0.3 s.
-- **Correctness is verified**, not assumed. A 4×4 corner of every DGEMM result
-  is recomputed by hand and compared. A failed check poisons the record rather
-  than reporting a fast wrong answer. `decompose.py` surfaces these loudly.
+- **Pinning is external and uniform.** Every arm is bound with `numactl`
+  (falling back to `taskset`) to the same CPU set and memory policy, chosen from
+  the real per-node CPU lists in `numactl -H` rather than an assumption that node
+  N owns a contiguous range. `OMP_PROC_BIND` is explicitly **disabled** during
+  the sweep. That is not an omission: it used to be set to `close` on every arm,
+  and only OpenMP arms obey it — so ArmPL, the reference, was pinned and shipping
+  pthread OpenBLAS was not, a systematic advantage to the reference of roughly the
+  size of the deficit under investigation. What pinning is worth is measured by
+  the `DYNAMIC_OMP_BOUND` arm instead of being left in the comparison as a bias.
+  It is deliberately **not** equalised by rebuilding OpenBLAS with
+  `USE_OPENMP=1`: that changes the threading backend and therefore what is under
+  test, and pthreads is what the wheels ship.
+- **One memory policy for the denominator and the measurement.** `bench.c`
+  first-touches its matrices serially and `roofline.c` in parallel, so on a
+  multi-node host the two used to land their pages on different nodes — making
+  the standing-order-1 cross-check compare different machines. A single explicit
+  `--membind`/`--interleave` policy for both removes that.
+- **Every arm the runner declines to run is recorded with a reason.** Build
+  failure, ISA the host lacks, a coretype the library ignored: each writes a
+  census record. An unexplained gap in the results is then a detectable defect
+  rather than an invisible one.
+- **Correctness is verified where it is verified, and `null` where it is not.**
+  A 4×4 corner of every DGEMM result is recomputed by hand and compared at
+  `8 * k * DBL_EPSILON` — validated against a real optimised multithreaded BLAS at
+  every k from 8 to 8192 with zero false positives. A failed check poisons the
+  record rather than reporting a fast wrong answer. `verified` is **tri-state**:
+  `true`, `false`, or `null` where no check for that routine exists. Seven of the
+  eight drivers used to hardcode `verified=1` — including `dtrsm`, `dtrmm` and
+  `dsymm`, precisely the operations in the 90-kernel N2 gap under study — so a
+  fast-and-wrong generic TRSM would have produced a clean win. The analysis fails
+  closed on this: only `true` counts as verified, and any verdict resting on
+  `null` records is marked unverified.
 - **Measured peak, not theoretical.** The primary denominator is the best
   GFLOP/s any arm achieved on that host — an empirical ceiling no compiler
   decision can inflate. `peak_fma` from the microbenchmark is a cross-check: if
