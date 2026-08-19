@@ -57,6 +57,36 @@ jobs:
       - name: bench.c compiles and links against a real BLAS
         run: make openblas OPENBLAS_DIR=/usr VARIANT=ci-system
 
+      - name: coreprobe compiles and links against a real BLAS
+        run: make coreprobe OPENBLAS_DIR=/usr VARIANT=ci-system
+
+      - name: OPENBLAS_CORETYPE forcing actually works
+        # The whole hardware x kernel-set cross now rides on force_coretype()
+        # being honoured on a DYNAMIC_ARCH build, and on us being able to detect
+        # when it is not. Debian's libopenblas is DYNAMIC_ARCH on arm64, so this
+        # is the real mechanism, not a mock. If this step ever fails, the
+        # experiment design in build-libs.sh is invalid and not merely broken.
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: |
+          set -u
+          UNFORCED=$(./bin/gbb-coreprobe-ci-system | cut -d'|' -f1)
+          echo "unforced selection: $UNFORCED"
+          test -n "$UNFORCED" || { echo "::error::coreprobe reported nothing"; exit 1; }
+          FORCED=$(OPENBLAS_CORETYPE=ARMV8 ./bin/gbb-coreprobe-ci-system | cut -d'|' -f1)
+          echo "forced ARMV8:      $FORCED"
+          if [ "$FORCED" != "armv8" ]; then
+            echo "::error::OPENBLAS_CORETYPE=ARMV8 gave '$FORCED', not 'armv8'."
+            echo "The coretype axis cannot be trusted on this build; run-matrix.sh"
+            echo "is expected to detect exactly this and refuse to label the arm."
+            exit 1
+          fi
+          # And the negative case: a name force_coretype() does not know must be
+          # ignored, not silently accepted. run-matrix.sh depends on being able
+          # to see that happen.
+          BOGUS=$(OPENBLAS_CORETYPE=NOTATARGET ./bin/gbb-coreprobe-ci-system | cut -d'|' -f1)
+          echo "forced NOTATARGET: $BOGUS  (must not equal 'notatarget')"
+          test "$BOGUS" != "notatarget"
+
       - name: harness build flags are unchanged
         # Standing order 6: the harness must not be the thing that differs
         # between arms.
@@ -77,6 +107,11 @@ jobs:
       - uses: ludeeus/action-shellcheck@master
         with:
           severity: warning
+      - name: run-matrix decision logic (stub suite)
+        # The runner decides whether to spend instance-hours and what to call
+        # each arm. A defect there yields a plausible wrong answer rather than a
+        # failed run, so it is tested on every push, against stubs, on any arch.
+        run: bash tests/run-matrix-stubs.sh
 
   python:
     name: python

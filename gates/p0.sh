@@ -24,9 +24,9 @@ printf 'root: %s\n' "$ROOT"
 head_ "1. required files"
 for f in LICENSE README.md CHANGELOG.md CLAUDE.md .gitignore Makefile \
          CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md \
-         src/bench.c src/roofline.c \
+         src/bench.c src/roofline.c src/coreprobe.c \
          scripts/build-libs.sh scripts/capture-env.sh scripts/run-matrix.sh \
-         analysis/decompose.py \
+         analysis/decompose.py tests/run-matrix-stubs.sh \
          .github/workflows/ci.yml scripts/bootstrap-github.sh; do
   if [ -f "$f" ]; then ok "$f"; else bad "$f missing"; fi
 done
@@ -75,6 +75,25 @@ if ${CC:-cc} -O2 -Wall -Wextra -std=c11 -c src/bench.c -o /tmp/gbb-p0-bench.o \
 else
   bad "bench.c does not compile -- see /tmp/gbb-p0-bench.log"
   sed -n '1,20p' /tmp/gbb-p0-bench.log
+fi
+
+if ${CC:-cc} -O2 -Wall -Wextra -std=c11 -c src/coreprobe.c -o /tmp/gbb-p0-coreprobe.o \
+     >/tmp/gbb-p0-coreprobe.log 2>&1; then
+  ok "coreprobe.c compiles (-c, no BLAS needed)"
+else
+  bad "coreprobe.c does not compile -- see /tmp/gbb-p0-coreprobe.log"
+  sed -n '1,20p' /tmp/gbb-p0-coreprobe.log
+fi
+
+# ---- 5b. the runner's decision logic --------------------------------------
+# Stub-based, so it runs anywhere. This is the part of the harness that decides
+# whether to spend instance-hours and what to call each arm; a defect here does
+# not produce a failed run, it produces a plausible wrong answer.
+if bash tests/run-matrix-stubs.sh >/tmp/gbb-p0-stubs.log 2>&1; then
+  ok "run-matrix stub suite ($(grep -o 'pass=[0-9]*' /tmp/gbb-p0-stubs.log | tail -1) assertions)"
+else
+  bad "run-matrix stub suite -- see /tmp/gbb-p0-stubs.log"
+  grep -A2 'FAIL' /tmp/gbb-p0-stubs.log | head -30
 fi
 
 # ---- 6. build flags are the ones we promised -----------------------------
