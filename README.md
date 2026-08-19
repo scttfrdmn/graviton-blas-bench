@@ -227,8 +227,8 @@ support opposite conclusions.
   `NEOVERSEV2`→`NEOVERSEN2` and gets 5. Being present in the dispatch table is a
   **downgrade** for Neoverse V2/V3, and a NumPy wheel that does *not* recognise
   the chip may be faster than one that does. `capture-env.sh` and `decompose.py`
-  still surface an unrecognised part; their wording follows the old prediction
-  and is being corrected with it.
+  surface an unrecognised part as a finding to read against the `ARMV8SVE` arm,
+  not as an alarm.
 - **The alarming dispatch outcome is narrower than the above.** Generic `ARMV8`
   selected on a host that *has* SVE would mean the SVE detection itself failed;
   `NO_SVE` set at build time would mean the SVE kernels were never compiled in.
@@ -238,13 +238,15 @@ support opposite conclusions.
 
 ## Practical notes
 
-- **`us-east-1` and `us-east-2` are the only regions carrying all five
-  families.** Pin the whole campaign to one of them.
-- **In `us-east-1`, `hpc7g.16xlarge` is offered in `us-east-1a` only**, so the
-  whole campaign is pinned to that AZ if the hosts are to be comparable in
-  placement as well as in region. The four metal types are offered in `1a`–`1d`,
-  and `c7g.metal`/`c6g.metal`/`c8g.metal-48xl` additionally in `1f`. From
-  `describe-instance-type-offerings`, 2026-08-19.
+- **`us-east-1a` is the only availability zone where all five families can be
+  placed**, and there is no fallback region. `hpc7g.16xlarge` is offered in
+  exactly three regions — `us-east-1`, `eu-west-1`, `ap-northeast-1` — in one AZ
+  each, and neither of the other two offers `c9g.metal-48xl` at all; `us-east-2`
+  has no `hpc7g` either. Within `us-east-1`, `hpc7g` is `1a` only, the four metal
+  types are in `1a`–`1d`, and `c6g.metal`/`c7g.metal`/`c8g.metal-48xl`
+  additionally in `1f`. So the campaign is pinned to `us-east-1a` by
+  availability, not by preference. From `describe-instance-type-offerings`,
+  2026-08-19.
 - **`hpc7g` has no metal size and no spot.** It is the one arm where tenancy
   cannot be eliminated; run it repeatedly and lean on the p50/p90 spread. It is
   also on-demand only, while all four metal types support spot — so it is the one
@@ -260,16 +262,40 @@ support opposite conclusions.
 
 ## What the output supports
 
-`decompose.py` ends with a decision guide keyed to its own sections:
+`decompose.py` prints eight numbered sections and then a `DECISION` block. The
+sections are: 0 hosts and admissibility, 1 deficit by routine, 2 the target
+cross, 3 the leading-dimension penalty, 4 the regime profile, 5 anomalies,
+6 thread scaling, 7 the coverage census.
 
-- V1-set beats V2-set on `c8g`/`c9g` → closing the N2 gap is justified and needs
-  no new kernel code.
-- Parity, or V2-set winning → the NEON choice was correct; publish the negative
-  result and drop the SVE angle.
-- Large leading-dimension penalty → packing kernels are the target, which is
-  the one place an SVE2 argument (TBL2/TBX, FCVTLT/FCVTNT) actually holds up.
-- Deficit concentrated in the small regime → the missing `GEMM_SMALL_*` path on
-  the N2 target, the cheapest possible fix.
-- Generic `ARMV8` selected on a host that has SVE, or `NO_SVE` in the build →
-  report that first. An unrecognised part landing on `ARMV8SVE` is a different
-  thing: read it against the `ARMV8SVE` arm, not as an alarm.
+The `DECISION` block is **computed, not a guide to be read against**. It emits
+exactly one machine-greppable `VERDICT:` line, so `gates/p4.sh` can assert on it
+rather than on a human's reading:
+
+| `VERDICT:` | means |
+|---|---|
+| `V1-SET-AHEAD` | the V1 kernel set wins on `c8g`/`c9g` → closing the N2 gap is justified and needs no new kernel code, only kernel selection |
+| `V2-SET-AHEAD` | the N2 mapping was the right call → publish the negative result and drop the SVE angle |
+| `NULL` | the two sets are at parity within `--min-effect` → also a negative result, and a reportable one |
+| `MIXED` | neither set wins a majority of cells → the answer is routine- or regime-specific, not global |
+| `INCONCLUSIVE` | too few cells are comparable to support any of the above |
+| `NO-DATA` | the cross never ran; nothing in this dataset answers the question |
+
+`NULL` and `NO-DATA` are deliberately distinct verdicts. "The kernel sets are
+equivalent" and "we never measured them against each other" are the two claims
+easiest to confuse and they support opposite conclusions.
+
+Anything that should qualify the verdict is printed beneath it as a
+`VERDICT-CAVEAT:` line — contributing cells that rest on `verified=null`
+records, unexplained holes in section 7, hard anomalies in section 5 — and any
+consequence the data actually shows is printed as a `CONSEQUENCE:` line, for
+instance a real leading-dimension penalty pointing at the packing kernels, or a
+deficit concentrated in the small regime pointing at the absent `GEMM_SMALL_*`
+path on the N2 target. Consequences are conditional on the finding: the guide
+this replaced stated all of them unconditionally, which is exactly why no gate
+could assert on any of them.
+
+Two outcomes bypass the verdict entirely and are reported first, via exit
+bit 2: generic `ARMV8` selected on a host that *has* SVE, or `NO_SVE` in the
+build. Either means the measurement apparatus, not the kernel set, is what the
+run discovered. An unrecognised part landing on `ARMV8SVE` is **not** in that
+class — read it against the `ARMV8SVE` arm.

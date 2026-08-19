@@ -41,8 +41,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/bin"
 PREFIX="${GBB_PREFIX:-$HOME/graviton-blas-bench-libs}"
-RESULTS="${GBB_RESULTS:-$ROOT/results}"
-RUN_ID="${GBB_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$(hostname -s)}"
+RESULTS_ROOT="${GBB_RESULTS:-$ROOT/results}"
+RUN_ID_BASE="${GBB_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$(hostname -s)}"
 BUILD_MANIFEST="$PREFIX/build-manifest.ndjson"
 
 # S3 shipping. An instance is terminated on completion and a spot reclaim can
@@ -52,17 +52,7 @@ BUILD_MANIFEST="$PREFIX/build-manifest.ndjson"
 S3_URI="${GBB_S3_URI:-}"
 AWS_REGION_ARG="${GBB_AWS_REGION:-us-east-1}"
 
-mkdir -p "$RESULTS"
-export GBB_RUN_ID="$RUN_ID"
 GBB_HOST="$(hostname -s)"; export GBB_HOST
-
-OUT="$RESULTS/bench-$RUN_ID.ndjson"
-ROOFOUT="$RESULTS/roofline-$RUN_ID.ndjson"
-CENSUS="$RESULTS/census-$RUN_ID.ndjson"
-ENVFILE="$RESULTS/env-$RUN_ID.json"
-MANIFEST="$RESULTS/manifest-$RUN_ID.ndjson"
-TOPOFILE="$RESULTS/topology-$RUN_ID.txt"
-STDERRLOG="$RESULTS/stderr-$RUN_ID.log"
 
 log() { printf '[gbb] %s\n' "$*" >&2; }
 # No ship() here: the EXIT trap already runs it on every path out, including
@@ -75,6 +65,100 @@ jstr() {
   printf '%s' "${v//$'\n'/ }"
 }
 
+# ---- role: campaign data, or an instrument check ---------------------------
+# The local Grace/GB10 boxes (castor, pollux) are instrument checks -- they
+# exercise the harness on real SVE2 silicon and are useful for that, and they
+# are not campaign data. Mixing the two would put a heterogeneous 20-core
+# desktop part into a table of five EC2 Neoverse hosts, which is not a mistake
+# any amount of care in the analysis can undo afterwards.
+#
+# So the separation is structural rather than procedural: the role is decided
+# here, from evidence this script cannot be talked out of, and it determines the
+# output directory, the run_id prefix, the S3 prefix and a `role` field stamped
+# into every record by bench.c and roofline.c. Campaign role requires BOTH:
+#
+#   1. IMDS reports an instance type in the campaign set, and
+#   2. cpu0's MIDR part is one of the Graviton parts.
+#
+# Either condition failing means instrument. A laptop fails both. castor fails
+# (2) -- Cortex-X925/A725, parts 0xd85/0xd87 -- so even a forged instance type
+# cannot promote it. A genuinely new Graviton part also fails (2), which is
+# correct and deliberate: standing order 8 makes an unrecognised MIDR a
+# stop-and-escalate, so adding one is a human edit here and in capture-env.sh.
+CAMPAIGN_TYPES="${GBB_CAMPAIGN_TYPES:-c6g.metal c7g.metal hpc7g.16xlarge c8g.metal-48xl c9g.metal-48xl}"
+GRAVITON_PARTS="0xd0c 0xd40 0xd49 0xd4f 0xd83 0xd84"
+
+imds_instance_type() {
+  # GBB_TEST_IMDS_TYPE exists so the stub suite can reach this code without an
+  # EC2 network. It cannot manufacture campaign data on its own: condition (2)
+  # still has to hold, and on any machine a test runs on it does not.
+  if [ -n "${GBB_TEST_IMDS_TYPE:-}" ]; then printf '%s' "$GBB_TEST_IMDS_TYPE"; return 0; fi
+  command -v curl >/dev/null 2>&1 || return 1
+  local tok
+  tok="$(curl -sf -m 1 -X PUT http://169.254.169.254/latest/api/token \
+          -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null)" || return 1
+  [ -n "$tok" ] || return 1
+  curl -sf -m 1 -H "X-aws-ec2-metadata-token: $tok" \
+    http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null
+}
+
+IMDS_TYPE="$(imds_instance_type || true)"
+MIDR_RAW="$(cat /sys/devices/system/cpu/cpu0/regs/identification/midr_el1 2>/dev/null || true)"
+MIDR_PART=""
+[ -n "$MIDR_RAW" ] && MIDR_PART="$(printf '0x%x' $(( ( $((MIDR_RAW)) >> 4 ) & 0xFFF )))"
+
+ROLE=instrument
+ROLE_REASON=""
+if [ -z "$IMDS_TYPE" ]; then
+  ROLE_REASON="no EC2 instance metadata: this host is not an EC2 instance"
+elif ! printf '%s' " $CAMPAIGN_TYPES " | grep -qF " $IMDS_TYPE "; then
+  ROLE_REASON="instance type '$IMDS_TYPE' is not one of the campaign families ($CAMPAIGN_TYPES)"
+elif [ -z "$MIDR_PART" ]; then
+  ROLE_REASON="cpu0 MIDR unreadable, so the silicon cannot be confirmed"
+elif ! printf '%s' " $GRAVITON_PARTS " | grep -qF " $MIDR_PART "; then
+  ROLE_REASON="cpu0 MIDR part $MIDR_PART is not a known Graviton part ($GRAVITON_PARTS)"
+else
+  ROLE=campaign
+fi
+
+# GBB_ROLE is an assertion checked against the evidence, never a selector. An
+# operator who believes this is a campaign host and is wrong should be stopped,
+# not obeyed.
+if [ -n "${GBB_ROLE:-}" ] && [ "$GBB_ROLE" != "$ROLE" ]; then
+  die "GBB_ROLE='$GBB_ROLE' but the evidence says '$ROLE': $ROLE_REASON
+     GBB_ROLE is an assertion, not an override. If this really is a campaign
+     host, fix the detection (CAMPAIGN_TYPES / GRAVITON_PARTS in this script)
+     rather than the label -- a mislabelled host is a plausible wrong answer."
+fi
+export GBB_ROLE="$ROLE"
+
+if [ "$ROLE" = campaign ]; then
+  RESULTS="$RESULTS_ROOT"
+  RUN_ID="$RUN_ID_BASE"
+else
+  RESULTS="$RESULTS_ROOT/instrument"
+  case "$RUN_ID_BASE" in instr-*) RUN_ID="$RUN_ID_BASE" ;; *) RUN_ID="instr-$RUN_ID_BASE" ;; esac
+fi
+
+mkdir -p "$RESULTS"
+export GBB_RUN_ID="$RUN_ID"
+
+OUT="$RESULTS/bench-$RUN_ID.ndjson"
+ROOFOUT="$RESULTS/roofline-$RUN_ID.ndjson"
+CENSUS="$RESULTS/census-$RUN_ID.ndjson"
+ENVFILE="$RESULTS/env-$RUN_ID.json"
+MANIFEST="$RESULTS/manifest-$RUN_ID.ndjson"
+TOPOFILE="$RESULTS/topology-$RUN_ID.txt"
+STDERRLOG="$RESULTS/stderr-$RUN_ID.log"
+
+if [ "$ROLE" = campaign ]; then
+  log "role=campaign (instance $IMDS_TYPE, MIDR part $MIDR_PART) -> $RESULTS"
+else
+  log "role=INSTRUMENT -- $ROLE_REASON"
+  log "     results go to $RESULTS with run_id '$RUN_ID' and role=instrument in"
+  log "     every record. This is a harness check, not campaign data."
+fi
+
 # ---- durability -----------------------------------------------------------
 # ship() is idempotent and cheap, and runs on every exit path including a
 # trapped signal. Uploading the whole file each time rather than appending is
@@ -82,7 +166,9 @@ jstr() {
 # reclaim would be worse than a slightly stale complete file.
 ship() {
   [ -n "$S3_URI" ] || return 0
-  local dest="${S3_URI%/}/$GBB_HOST/$RUN_ID"
+  # The role is part of the S3 prefix as well as the local path: a bucket that
+  # collects both must not interleave them under one prefix either.
+  local dest="${S3_URI%/}/$ROLE/$GBB_HOST/$RUN_ID"
   local f
   for f in "$ENVFILE" "$MANIFEST" "$CENSUS" "$TOPOFILE" "$ROOFOUT" "$OUT" "$STDERRLOG"; do
     [ -s "$f" ] || continue
@@ -96,15 +182,16 @@ trap ship EXIT
 
 if [ -n "$S3_URI" ]; then
   command -v aws >/dev/null 2>&1 || die "GBB_S3_URI is set but the aws CLI is not installed."
-  log "shipping results to ${S3_URI%/}/$GBB_HOST/$RUN_ID (region $AWS_REGION_ARG)"
+  log "shipping results to ${S3_URI%/}/$ROLE/$GBB_HOST/$RUN_ID (region $AWS_REGION_ARG)"
 else
   log "GBB_S3_URI unset -- results stay on this instance only. If it is terminated"
   log "before you collect them, the instance-hours are spent for nothing."
 fi
 
 census() {
-  printf '{"record":"arm_outcome","run_id":"%s","host":"%s","instance":"%s",' \
-    "$(jstr "$RUN_ID")" "$(jstr "$GBB_HOST")" "$(jstr "${INSTANCE:-unknown}")" >> "$CENSUS"
+  printf '{"record":"arm_outcome","run_id":"%s","role":"%s","host":"%s","instance":"%s",' \
+    "$(jstr "$RUN_ID")" "$(jstr "$ROLE")" "$(jstr "$GBB_HOST")" \
+    "$(jstr "${INSTANCE:-unknown}")" >> "$CENSUS"
   printf '"library":"%s","target":"%s","coretype":"%s","coretype_effective":"%s",' \
     "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")" "$(jstr "$4")" >> "$CENSUS"
   printf '"threads":%s,"status":"%s","exit_code":%s,"records":%s,' \
@@ -116,7 +203,15 @@ census() {
 
 # ---- provenance first, always ---------------------------------------------
 [ -r "$BUILD_MANIFEST" ] || die "no build manifest at $BUILD_MANIFEST -- run build-libs.sh first."
-cp "$BUILD_MANIFEST" "$MANIFEST"
+# Stamped, not copied. build-libs.sh runs before anything knows which host this
+# is, so its records carry no instance -- and the analysis concatenates every
+# host's manifest into one stream, at which point "this build has no SVE
+# kernels" is unattributable to a host and therefore not actionable. The
+# instance stamped here is the interlock's IMDS answer, the same value
+# capture-env.sh is cross-checked against below. Inserting after the opening
+# brace keeps each line valid JSON without needing a JSON tool on the host.
+sed "s/^{/{\"instance\":\"${IMDS_TYPE:-unknown}\",\"role\":\"$ROLE\",/" \
+  "$BUILD_MANIFEST" > "$MANIFEST"
 
 export GBB_OPENBLAS_DYNAMIC_DIR="$PREFIX/openblas-DYNAMIC"
 bash "$ROOT/scripts/capture-env.sh" > "$ENVFILE"
@@ -144,8 +239,9 @@ case "$ENV_RC" in
   4)
     if [ -n "${GBB_ESCALATION_ACK:-}" ]; then
       log "WARNING: capture-env exited 4 (escalate) and GBB_ESCALATION_ACK is set."
-      printf '{"record":"escalation_ack","run_id":"%s","host":"%s","note":"%s"}\n' \
-        "$(jstr "$RUN_ID")" "$(jstr "$GBB_HOST")" "$(jstr "$GBB_ESCALATION_ACK")" >> "$CENSUS"
+      printf '{"record":"escalation_ack","run_id":"%s","role":"%s","host":"%s","note":"%s"}\n' \
+        "$(jstr "$RUN_ID")" "$(jstr "$ROLE")" "$(jstr "$GBB_HOST")" \
+        "$(jstr "$GBB_ESCALATION_ACK")" >> "$CENSUS"
     else
       die "capture-env.sh exited 4: standing order 8 says stop and escalate before
      running anything. An unrecognised MIDR, or generic ARMV8 selected on a host
@@ -169,6 +265,20 @@ print("" if v is None else "true" if v is True else "false" if v is False else v
 PY
 }
 INSTANCE="$(envq instance_type)"; [ -n "$INSTANCE" ] || INSTANCE=unknown
+# Two independent IMDS reads must agree. The role interlock above read the
+# instance type itself rather than waiting for capture-env.sh, precisely so that
+# it could not be steered by anything downstream -- which means there are now two
+# sources for the same fact, and a disagreement is either a bug here or a host
+# that changed identity mid-run. On a campaign host that invalidates the record.
+if [ -n "$IMDS_TYPE" ] && [ "$INSTANCE" != "$IMDS_TYPE" ]; then
+  if [ "$ROLE" = campaign ]; then
+    die "instance type disagrees between the two IMDS reads: the role interlock saw
+     '$IMDS_TYPE', capture-env.sh recorded '$INSTANCE'. One of them is wrong and
+     every record on this host would carry the wrong host identity."
+  fi
+  log "WARNING: instance type '$INSTANCE' from capture-env != '$IMDS_TYPE' from the"
+  log "         role interlock. Instrument run, so this is noted and not fatal."
+fi
 CORES="$(envq cores_total)"
 CPUS_AFFINITY="$(envq cpus_affinity)"
 FORCING="$(envq openblas_coretype_forcing)"
@@ -297,11 +407,52 @@ CORETYPES="${GBB_CORETYPES:-$CORETYPES}"
 PROBE="$BIN/gbb-coreprobe-DYNAMIC"
 DYN_BACKEND=pthreads
 
-# Verify each coretype is honoured, and record what came back. `unforced` is
-# first and is its own arm: it is what a NumPy wheel gets on this host, which is
-# a finding in its own right rather than bookkeeping.
+UNFORCED_EFF=""
+if [ -x "$PROBE" ]; then
+  UNFORCED_EFF="$("$PROBE" 2>/dev/null | cut -d'|' -f1)"
+  log "unforced DYNAMIC_ARCH selects: '${UNFORCED_EFF:-unknown}'"
+fi
+
+# arch_selected must be measured on the library it describes. Every non-DYNAMIC
+# arm used to be labelled with the DYNAMIC binary's unforced selection, which is
+# provenance taken from a different library -- wrong for a static TARGET= build
+# (not DYNAMIC_ARCH at all, so it reports its fixed target) and meaningless for
+# ArmPL and BLIS, which export no such symbol. build-libs.sh now builds one probe
+# per OpenBLAS variant; anything else is `n/a` or `unprobed`, never a guess.
+probe_variant() {
+  # Two statements, not one. In `local v="$1" pr="...$v"` the reference to $v is
+  # expanded while v is a declared-but-unset local, which under `set -u` aborts
+  # the function -- and inside $( ) that failure is invisible: the caller just
+  # gets an empty string and labels the arm "unknown".
+  local v="$1"
+  local pr="$BIN/gbb-coreprobe-$v" out
+  [ -x "$pr" ] || { printf 'unprobed'; return 0; }
+  out="$("$pr" 2>/dev/null | cut -d'|' -f1)"
+  printf '%s' "${out:-unprobed}"
+}
+
+# Verify each coretype is honoured, and record what came back. `unforced` is its
+# own arm: it is what a NumPy wheel gets on this host, which is a finding in its
+# own right rather than bookkeeping. It is deliberately NOT deduplicated against
+# the forced arms even when it selects the same kernel set -- comparing it with
+# the forced arm that lands in the same place is how "does forcing cost
+# anything" gets answered.
 declare -A CT_EFFECTIVE
+declare -A EFF_CLAIMED
 VERIFIED_CORETYPES=""
+
+# alias_ok <requested-uppercase> <reported-lowercase>
+# The name aliases OpenBLAS's arm64 kernel tables are known to contain in the
+# audited tree. Declared rather than inferred: "the reported name differs from
+# the request" cannot by itself tell an alias from an ignored request, and the
+# difference decides whether an arm is a measurement or a duplicate.
+alias_ok() {
+  case "$1:$2" in
+    NEOVERSEV2:neoversen2) return 0 ;;                      # KERNEL.NEOVERSEV2 includes KERNEL.NEOVERSEN2
+    NEOVERSEV3:neoversev2|NEOVERSEV3:neoversen2) return 0 ;; # 0.3.32 maps V3 onto V2, and V2 onto N2
+    *) return 1 ;;
+  esac
+}
 if [ "$FORCING" = unavailable ]; then
   log "WARNING: capture-env reports OPENBLAS_CORETYPE forcing is UNAVAILABLE on this"
   log "         build. The entire coretype axis is unmeasurable here -- running it"
@@ -332,22 +483,59 @@ for CT in $CORETYPES; do
   CT_EFFECTIVE[$CT]="$EFF"
   # Compare case-insensitively: force_coretype() takes upper case and
   # openblas_get_corename() returns lower.
-  if [ "$(printf '%s' "$EFF" | tr '[:upper:]' '[:lower:]')" \
-     != "$(printf '%s' "$CT" | tr '[:upper:]' '[:lower:]')" ]; then
+  LC_EFF="$(printf '%s' "$EFF" | tr '[:upper:]' '[:lower:]')"
+  LC_CT="$(printf '%s' "$CT" | tr '[:upper:]' '[:lower:]')"
+
+  # Three outcomes, not two.
+  #
+  # A request that reports back a DIFFERENT name is not automatically a failure:
+  # on SVE2 silicon it is the campaign's central assumption coming true.
+  # KERNEL.NEOVERSEV2 is a one-line include of KERNEL.NEOVERSEN2 and 0.3.32 maps
+  # NEOVERSEV3 onto NEOVERSEV2, so a NEOVERSEV2 request reporting `neoversen2` is
+  # the expected result and is the finding. An earlier version of this loop wrote
+  # that arm off as `unrunnable`, which made the check meant to *detect* the
+  # aliasing the thing that suppressed it.
+  #
+  # But a request that lands somewhere unexpected is a different thing: it means
+  # force_coretype() ignored the name, and the arm is then an unlabelled
+  # duplicate of the unforced arm rather than a measurement of what was asked
+  # for. So the aliases are declared here, and only a declared one is permitted.
+  # Anything else is still refused -- an undeclared surprise is exactly the case
+  # where guessing would be wrong.
+  if alias_ok "$CT" "$LC_EFF"; then
+    :
+  elif [ "$LC_EFF" != "$LC_CT" ]; then
     log "  coretype $CT: library reports '$EFF' -- request NOT honoured, not run"
     census openblas DYNAMIC "$CT" "$EFF" 0 unrunnable 0 0 "$DYN_BACKEND" "" \
-      "requested coretype $CT but openblas_get_corename() reports $EFF; the label would be false"
+      "requested coretype $CT but openblas_get_corename() reports $EFF, which is not a declared alias of it; force_coretype() ignored the request and the arm would be an unlabelled duplicate of the unforced arm"
     continue
   fi
-  log "  coretype $CT: verified as '$EFF'"
+
+  # A second request landing on a kernel set already being measured is skipped.
+  # Running the identical kernel table twice buys nothing and would read as two
+  # independent arms. The order of CORETYPES is therefore load-bearing:
+  # NEOVERSEV2 precedes NEOVERSEN2 so the surviving arm carries the label the
+  # analysis compares on. The unforced arm is not in this map on purpose -- it is
+  # kept even when it lands on the same set, because comparing it against the
+  # forced arm that agrees with it is how "does forcing cost anything" is
+  # answered.
+  if [ -n "${EFF_CLAIMED[$LC_EFF]:-}" ]; then
+    log "  coretype $CT: library reports '$EFF', already measured as ${EFF_CLAIMED[$LC_EFF]} -- alias, not run twice"
+    census openblas DYNAMIC "$CT" "$EFF" 0 alias_duplicate 0 0 "$DYN_BACKEND" "" \
+      "requested $CT; openblas_get_corename() reports '$EFF', which the ${EFF_CLAIMED[$LC_EFF]} arm is already measuring. The two requests select the same kernel set -- that is the finding, and measuring it twice would read as two independent arms."
+    continue
+  fi
+  EFF_CLAIMED[$LC_EFF]="$CT"
+
+  if [ "$LC_EFF" != "$LC_CT" ]; then
+    log "  coretype $CT: library reports '$EFF' -- ALIAS. Running it; the record says both."
+    census openblas DYNAMIC "$CT" "$EFF" 0 aliased 0 0 "$DYN_BACKEND" "" \
+      "requested $CT, openblas_get_corename() reports '$EFF'. Running it: the arm is a valid measurement of '$EFF' and every record carries both the request and the reported name."
+  else
+    log "  coretype $CT: verified as '$EFF'"
+  fi
   VERIFIED_CORETYPES="$VERIFIED_CORETYPES $CT"
 done
-
-UNFORCED_EFF=""
-if [ -x "$PROBE" ]; then
-  UNFORCED_EFF="$("$PROBE" 2>/dev/null | cut -d'|' -f1)"
-  log "unforced DYNAMIC_ARCH selects: '${UNFORCED_EFF:-unknown}'"
-fi
 
 # ---- roofline, once per thread count --------------------------------------
 # Under the same external binding as the bench arms. Standing order 1 makes the
@@ -480,8 +668,12 @@ while IFS=$'\t' read -r LIB TGT EXE BACKEND SHA BUILT RUNNABLE REASON; do
       for CT in $VERIFIED_CORETYPES; do
         run_arm "$LIB" "$TGT" "$EXE" "$BACKEND" "$SHA" "$CT" "${CT_EFFECTIVE[$CT]}" "$T"
       done
+    elif [ "$LIB" = openblas ]; then
+      run_arm "$LIB" "$TGT" "$EXE" "$BACKEND" "$SHA" "" "$(probe_variant "$TGT")" "$T"
     else
-      run_arm "$LIB" "$TGT" "$EXE" "$BACKEND" "$SHA" "" "${UNFORCED_EFF:-n/a}" "$T"
+      # ArmPL and BLIS have no OpenBLAS coretype. `n/a` says the question does
+      # not apply here; `unknown` would say we tried to answer it and failed.
+      run_arm "$LIB" "$TGT" "$EXE" "$BACKEND" "$SHA" "" "n/a" "$T"
     fi
   done
 done < <(manifest_arms)
@@ -493,6 +685,7 @@ done < <(manifest_arms)
 # to ArmPL and not to OpenBLAS, so it is measured here as its own arm and
 # subtracted in the analysis rather than left in the comparison.
 OMP_EXE=gbb-openblas-DYNAMIC_OMP
+OMP_EFF="$(probe_variant DYNAMIC_OMP)"
 if [ -x "$BIN/$OMP_EXE" ]; then
   for T in $THREADS; do
     before=$(wc -l < "$OUT")
@@ -507,18 +700,18 @@ else: print("unknown")' "$MANIFEST")" \
         GBB_CORETYPE=unforced GBB_THREAD_BACKEND=openmp \
         GBB_PIN_POLICY="${PIN_CMD[$T]};omp_bind=close,omp_places=cores" \
         GBB_BUILD="$GBB_BUILD" GBB_THREADS="$T" \
-        GBB_ARCH_SELECTED="${UNFORCED_EFF:-unknown}" \
+        GBB_ARCH_SELECTED="$OMP_EFF" \
         OPENBLAS_NUM_THREADS="$T" OMP_NUM_THREADS="$T" \
         OMP_PROC_BIND=close OMP_PLACES=cores \
         ${PIN_CMD[$T]} "$BIN/$OMP_EXE" all >> "$OUT" 2>>"$STDERRLOG"
     rc=$?
     after=$(wc -l < "$OUT")
     if [ $rc -ne 0 ]; then
-      census openblas DYNAMIC_OMP_BOUND unforced "${UNFORCED_EFF:-unknown}" "$T" \
+      census openblas DYNAMIC_OMP_BOUND unforced "$OMP_EFF" "$T" \
         runtime_failed "$rc" "$((after - before))" openmp \
         "${PIN_CMD[$T]};omp_bind=close" "harness exited $rc"
     else
-      census openblas DYNAMIC_OMP_BOUND unforced "${UNFORCED_EFF:-unknown}" "$T" \
+      census openblas DYNAMIC_OMP_BOUND unforced "$OMP_EFF" "$T" \
         measured 0 "$((after - before))" openmp "${PIN_CMD[$T]};omp_bind=close" ""
     fi
     ship

@@ -166,14 +166,39 @@ jstr() {
   printf '%s' "${v//$'\n'/ }"
 }
 
+# Did this build actually get SVE kernels compiled into it? Standing order 8
+# names `NO_SVE` in the build as one of its two escalate-now conditions, and it
+# is the more insidious of the two: NO_SVE=1, or an assembler too old to accept
+# SVE, produces a library with no SVE kernels at all, on which every arm still
+# builds, still runs, and still reports plausible numbers -- while the entire SVE
+# axis of this campaign silently measures nothing. So it is read off the
+# installed artifact rather than inferred from the variables we passed, and the
+# static archive is used because it is installed unstripped by every variant.
+#   yes / no / unknown -- `unknown` means we could not look, not that it is fine.
+sve_kernels() {
+  local dest="$1" lib
+  command -v nm >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  for lib in "$dest/lib/libopenblas.a" "$dest/lib64/libopenblas.a"; do
+    [ -f "$lib" ] || continue
+    if nm --defined-only "$lib" 2>/dev/null | grep -qE '(ARMV8SVE|_sve|sve_)'; then
+      printf 'yes'
+    else
+      printf 'no'
+    fi
+    return 0
+  done
+  printf 'unknown'
+}
+
 # arm_record <library> <target> <blas_sha> <built> <runnable> <reason>
-#            <thread_backend> <exe> <prefix>
+#            <thread_backend> <exe> <prefix> <sve_kernels>
 arm_record() {
   printf '{"record":"arm","library":"%s","target":"%s","coretype":null,"blas_sha":"%s",' \
     "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")"
   printf '"built":%s,"runnable":%s,"reason":"%s","thread_backend":"%s",' \
     "$4" "$5" "$(jstr "$6")" "$(jstr "$7")"
-  printf '"exe":"%s","prefix":"%s"}\n' "$(jstr "$8")" "$(jstr "$9")"
+  printf '"exe":"%s","prefix":"%s","sve_kernels":"%s"}\n' \
+    "$(jstr "$8")" "$(jstr "$9")" "$(jstr "${10:-unknown}")"
 }
 
 # ---- OpenBLAS -------------------------------------------------------------
@@ -221,7 +246,8 @@ if [ "$OK_DYN" = true ]; then
     >>"$PREFIX/openblas-DYNAMIC.buildlog" 2>&1 || OK_DYN=false
 fi
 arm_record openblas DYNAMIC "$OB_SHA" "$OK_DYN" true "" pthreads \
-  gbb-openblas-DYNAMIC "$PREFIX/openblas-DYNAMIC" >> "$MANIFEST"
+  gbb-openblas-DYNAMIC "$PREFIX/openblas-DYNAMIC" \
+  "$(sve_kernels "$PREFIX/openblas-DYNAMIC")" >> "$MANIFEST"
 
 # --- the threading-backend arm ---
 # Same sources, same TARGET dispatch, different threading runtime. Kept as its
@@ -234,9 +260,16 @@ OK_OMP=$BUILD_OK
 if [ "$OK_OMP" = true ]; then
   make -C "$ROOT" openblas-omp OPENBLAS_DIR="$PREFIX/openblas-DYNAMIC_OMP" VARIANT=DYNAMIC_OMP \
     >>"$PREFIX/openblas-DYNAMIC_OMP.buildlog" 2>&1 || OK_OMP=false
+  # A probe per variant, not one probe for all of them. This is also DYNAMIC_ARCH,
+  # so what it selects is a real per-library fact, and the runner used to label
+  # every non-DYNAMIC arm with the DYNAMIC binary's selection -- provenance
+  # measured on a different library.
+  make -C "$ROOT" coreprobe OPENBLAS_DIR="$PREFIX/openblas-DYNAMIC_OMP" VARIANT=DYNAMIC_OMP \
+    >>"$PREFIX/openblas-DYNAMIC_OMP.buildlog" 2>&1 || true
 fi
 arm_record openblas DYNAMIC_OMP "$OB_SHA" "$OK_OMP" true "" openmp \
-  gbb-openblas-DYNAMIC_OMP "$PREFIX/openblas-DYNAMIC_OMP" >> "$MANIFEST"
+  gbb-openblas-DYNAMIC_OMP "$PREFIX/openblas-DYNAMIC_OMP" \
+  "$(sve_kernels "$PREFIX/openblas-DYNAMIC_OMP")" >> "$MANIFEST"
 
 # --- static controls ---
 for T in $CONTROL_TARGETS; do
@@ -251,11 +284,19 @@ for T in $CONTROL_TARGETS; do
   if [ "$OK" = true ]; then
     make -C "$ROOT" openblas OPENBLAS_DIR="$PREFIX/openblas-$T" VARIANT="$T" \
       >>"$PREFIX/openblas-$T.buildlog" 2>&1 || { OK=false; REASON="harness link failed"; }
+    # A static TARGET= build is not DYNAMIC_ARCH, so openblas_get_corename()
+    # reports its fixed target. That is worth recording: it is how the control
+    # confirms a forced coretype lands where a real TARGET= build does. Failure
+    # to build the probe is not fatal -- the arm is still measurable, it just
+    # carries an unprobed selection.
+    make -C "$ROOT" coreprobe OPENBLAS_DIR="$PREFIX/openblas-$T" VARIANT="$T" \
+      >>"$PREFIX/openblas-$T.buildlog" 2>&1 || true
   else
     REASON="${REASON:-build failed, see $PREFIX/openblas-$T.buildlog}"
   fi
   arm_record openblas "$T" "$OB_SHA" "$OK" "$RUNNABLE" "$REASON" pthreads \
-    "gbb-openblas-$T" "$PREFIX/openblas-$T" >> "$MANIFEST"
+    "gbb-openblas-$T" "$PREFIX/openblas-$T" \
+    "$(sve_kernels "$PREFIX/openblas-$T")" >> "$MANIFEST"
 done
 
 # ---- ArmPL ----------------------------------------------------------------
@@ -270,11 +311,11 @@ if [ -n "${ARMPL_DIR:-}" ] && [ -d "$ARMPL_DIR" ]; then
     OK=false; REASON="harness link against $ARMPL_DIR failed, see $PREFIX/armpl.buildlog"
   fi
   arm_record armpl native "armpl-$(basename "$ARMPL_DIR")" "$OK" true "$REASON" openmp \
-    gbb-armpl "$ARMPL_DIR" >> "$MANIFEST"
+    gbb-armpl "$ARMPL_DIR" n/a >> "$MANIFEST"
 else
   log "ARMPL_DIR unset or missing -- skipping ArmPL arm"
   arm_record armpl native "" false true "ARMPL_DIR unset or not a directory" openmp \
-    gbb-armpl "" >> "$MANIFEST"
+    gbb-armpl "" n/a >> "$MANIFEST"
 fi
 
 # ---- BLIS -----------------------------------------------------------------
@@ -310,17 +351,17 @@ else
 fi
 cd "$ROOT"
 arm_record blis "$BLIS_CONF" "$BLIS_SHA" "$OK" true "$BLIS_REASON" pthreads \
-  gbb-blis "$PREFIX/blis" >> "$MANIFEST"
+  gbb-blis "$PREFIX/blis" n/a >> "$MANIFEST"
 
 # ---- reference netlib (correctness control) -------------------------------
 # Not a performance arm. It is here so that "fast" and "correct" can be
 # separated when a verification fails.
 if make -C "$ROOT" reference >"$PREFIX/reference.buildlog" 2>&1; then
   arm_record reference native "" true true "correctness control only, not timed" \
-    pthreads gbb-reference "" >> "$MANIFEST"
+    pthreads gbb-reference "" n/a >> "$MANIFEST"
 else
   arm_record reference native "" false true "netlib libblas not available on this host" \
-    pthreads gbb-reference "" >> "$MANIFEST"
+    pthreads gbb-reference "" n/a >> "$MANIFEST"
 fi
 
 # ---- roofline -------------------------------------------------------------

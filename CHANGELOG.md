@@ -55,6 +55,36 @@ change can be compared.
 - `make openblas-omp`: links the `USE_OPENMP=1` OpenBLAS with `-lgomp` and
   *without* `-fopenmp`, so the harness compilation stays byte-identical across
   arms as standing order 6 requires.
+- **A `role` field in every record, decided from evidence rather than from a
+  flag.** Instrument checks on non-Graviton hardware and campaign data must not
+  be mixable by accident. `run-matrix.sh` now derives the role from two things it
+  cannot fake — an IMDS instance type in the campaign set *and* a Graviton MIDR
+  part — and instrument runs get their own directory, an `instr-` run_id prefix
+  and a role-prefixed S3 path. `GBB_ROLE` is an assertion that aborts on
+  mismatch, not an override, and the binaries default to `role=unknown` so a
+  hand-run binary is never mistaken for campaign data.
+- **`sve_kernels` per OpenBLAS build, read off the installed archive.** Standing
+  order 8 names `NO_SVE` in the build as an escalate-now condition and nothing
+  checked it. It is the quieter of the two triggers: `NO_SVE=1`, or an assembler
+  too old to accept SVE, yields a library on which every arm still builds, still
+  runs, and still reports plausible numbers while the entire SVE axis of the
+  campaign measures nothing. `build-libs.sh` now looks for SVE kernel symbols in
+  the installed `libopenblas.a` and records `yes`/`no`/`unknown` (`n/a` for
+  ArmPL, BLIS and netlib), and `decompose.py` escalates `no` on a host that
+  reports SVE, which makes the host inadmissible and sets exit bit 2.
+- `analysis/decompose.py` rewritten. An adversarial review reproduced the
+  previous version printing "V1 kernels win" on data where V2 won 4 of 5 sizes
+  and the mean, printing `parity` for two arms that had produced 0.00 GFLOP/s,
+  deciding rows at a hardcoded 2% while its header announced 5%, and returning 0
+  on every input including one with no comparisons at all. Every threshold that
+  decides anything is now a named constant with a stated reason and a flag, the
+  `DECISION` block emits one computed machine-greppable `VERDICT:` line so the
+  P4 gate can assert on it, and `NULL` (measured parity) and `NO-DATA` (the
+  cross never ran) are distinct verdicts because they support opposite
+  conclusions. `--json` emits schema `gbb-decompose/1`.
+- `tests/run-matrix-stubs.sh` is now 61 assertions, up from 33: the role
+  interlock, a forged IMDS type failing to promote a non-Graviton host, the
+  declared-alias path, per-variant `arch_selected`, and the manifest stamping.
 
 ### Changed — affects comparability of numbers
 
@@ -154,9 +184,48 @@ change can be compared.
   but *virtualized* sizes; the campaign runs `c8g.metal-48xl`/`c9g.metal-48xl`,
   and the one place the name appears operationally is a launch instruction.
 - The build manifest was written to `$GBB_PREFIX`, outside `results/`, so the
-  analysis could not reach it. It is now copied to
-  `results/manifest-<run_id>.ndjson`, which is what the P1 expected-arm census
-  reads.
+  analysis could not reach it. It is now stamped into
+  `results/manifest-<run_id>.ndjson` — stamped, not copied: `build-libs.sh` runs
+  before anything knows which host it is on, and the analysis concatenates every
+  host's manifest into one stream, where a per-build fact like `sve_kernels` is
+  unattributable to a host and therefore unactionable. `instance` and `role` are
+  inserted on the way in.
+- **The coretype check suppressed the finding it existed to detect.** Any
+  `OPENBLAS_CORETYPE` request whose reported corename differed from the request
+  was written off as `unrunnable` — but `KERNEL.NEOVERSEV2` is a one-line include
+  of `KERNEL.NEOVERSEN2`, so on Graviton 4/5 the expected and correct outcome is
+  that `NEOVERSEV2` reports `neoversen2`. The check would therefore have deleted
+  the V2-set arm on the two hosts the experiment is about. The known aliases are
+  now *declared* rather than inferred, because "the reported name differs from
+  the request" cannot by itself distinguish a documented alias from a request the
+  library ignored, and the difference decides whether an arm is a measurement or
+  an unlabelled duplicate of the unforced arm. A declared alias runs and is
+  recorded as `aliased`; an undeclared mismatch is still refused; a second
+  request resolving to a corename already claimed is `alias_duplicate`.
+- **Every non-`DYNAMIC` arm was labelled with the `DYNAMIC` binary's kernel
+  selection** — `openblas/NEOVERSEV1` recorded `arch_selected=neoversen2`, and so
+  did ArmPL. That is provenance measured on a different library, which standing
+  order 10 makes worse than no provenance at all. `build-libs.sh` now builds a
+  coreprobe per OpenBLAS variant and each arm is labelled by the probe linked
+  against its own library; ArmPL and BLIS record `n/a`, which says the question
+  does not apply, where `unknown` would say we tried to answer it and failed.
+- `probe_variant()` in `run-matrix.sh` declared `local v="$1" pr=".../$v"` in one
+  statement, so `$v` expanded while `v` was a declared-but-unset local. Under
+  `set -u` that aborts the function, and inside a command substitution the abort
+  is invisible: the caller got `""` and labelled the arm `unknown`.
+- `us-east-2` was documented as a fallback region carrying all five families. It
+  has no `hpc7g` at all. `hpc7g.16xlarge` exists in exactly three regions —
+  `us-east-1`, `eu-west-1`, `ap-northeast-1` — one AZ each, and neither of the
+  other two offers `c9g.metal-48xl`, so `us-east-1a` is the only availability
+  zone where all five families can be placed and there is no fallback.
+- A comment in `bench.c` claimed the size-regime boundaries were "re-derived per
+  host from measured cache sizes by scripts/run-matrix.sh". They are compile-time
+  constants, identical on every host, and nothing overrides them — which is
+  correct, since per-host size ladders would mean the cross-host comparison was
+  comparing different problem sets.
+- README described a static decision guide in `decompose.py` that the rewrite
+  replaced with a computed verdict, and said `capture-env.sh`'s dispatch-direction
+  wording "is being corrected" after it had been.
 
 ### Corrected
 

@@ -18,7 +18,12 @@ until it finds something.
 - Binaries and env vars use the `gbb` / `GBB_` initialism.
 - AWS: `AWS_PROFILE=aws` (account `942542972736`). **Always pass `--region`
   explicitly** — the profile defaults to `us-west-2`, but the campaign is pinned
-  to `us-east-1`/`us-east-2`, the only regions carrying all five families.
+  to **`us-east-1`, and within it to `us-east-1a`**. That is not a preference and
+  there is no fallback: `hpc7g.16xlarge` exists in only three regions
+  (`us-east-1`, `eu-west-1`, `ap-northeast-1`), one AZ each, and neither of the
+  other two offers `c9g.metal-48xl` at all. `us-east-1a` is the only AZ on Earth
+  where all five families can be placed together. Verified by
+  `describe-instance-type-offerings`, 2026-08-19.
 
 ## The fourteen standing orders
 

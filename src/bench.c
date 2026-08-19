@@ -305,8 +305,16 @@ static const char *g_host, *g_instance, *g_library, *g_target, *g_build,
  *   g_thread_backend pthreads vs openmp. Not cosmetic: it decides whether the
  *                    arm obeys OMP_PROC_BIND at all, which was the confound.
  *   g_pin_policy     the exact external binding applied to this arm.
+ *   g_role           "campaign" or "instrument". Local instrument checks
+ *                    (castor/pollux) must not be mixable with campaign data by
+ *                    accident, so the runner derives the role from evidence it
+ *                    cannot fake and stamps it here. The default is "unknown",
+ *                    not "campaign": a record produced by running this binary by
+ *                    hand is not campaign data, and the analysis excludes
+ *                    anything that does not say campaign.
  */
-static const char *g_blas_sha, *g_coretype, *g_thread_backend, *g_pin_policy;
+static const char *g_blas_sha, *g_coretype, *g_thread_backend, *g_pin_policy,
+                  *g_role;
 static int g_threads;
 static long g_batch = 1;   /* set by TIMED_LOOP */
 
@@ -343,7 +351,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"library\":\"%s\",\"target\":\"%s\",\"build\":\"%s\","
            "\"blas_sha\":\"%s\",\"coretype\":\"%s\","
            "\"thread_backend\":\"%s\",\"pin_policy\":\"%s\","
-           "\"arch_selected\":\"%s\",\"threads\":%d,"
+           "\"arch_selected\":\"%s\",\"role\":\"%s\",\"threads\":%d,"
            "\"routine\":\"%s\",\"m\":%d,\"n\":%d,\"k\":%d,\"lda_pad\":%d,"
            "\"reps\":%d,\"batch\":%ld,\"calls\":%ld,"
            "\"timer_overhead_ns\":%.3f,\"timer_res_ns\":%.3f,"
@@ -351,7 +359,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"gflops\":%.6f,\"gflops_p50\":%.6f,\"verified\":%s,\"note\":\"%s\"}\n",
            g_run_id, g_host, g_instance, g_library, g_target, g_build,
            g_blas_sha, g_coretype, g_thread_backend, g_pin_policy,
-           g_arch_selected, g_threads,
+           g_arch_selected, g_role, g_threads,
            routine, m, n, k, lda_pad,
            reps, g_batch, (long)reps * g_batch,
            g_timer_overhead * 1e9, g_timer_res * 1e9,
@@ -542,8 +550,16 @@ static void run_level1(const Case *c, const char *which, int incx) {
 
 /* ---- size regimes ------------------------------------------------------ */
 /* Three regimes chosen so the analysis can separate kernel quality from
-   memory behaviour. Boundaries are re-derived per host from measured cache
-   sizes by scripts/run-matrix.sh; these are the fallback defaults. */
+   memory behaviour. These boundaries are compile-time constants and are the
+   same on every host: nothing re-derives them from measured cache sizes, and
+   no environment variable overrides them. That is deliberate -- per-host size
+   ladders would mean the cross-host comparison that is the whole deliverable
+   was comparing different problem sets. The consequence is that "small" is a
+   fixed number of elements, not a fixed fraction of L1, so a given regime label
+   sits at a different cache level on Gv2 than on Gv5. The measured L1d/L2/L3 of
+   each host is recorded in results/env-<run_id>.json by capture-env.sh, which is
+   what a reader needs to see where these boundaries actually fell on that host.
+   Changing these requires asking Scott (CLAUDE.md, "Ask before"). */
 static const int SIZES_SMALL[]  = { 8, 16, 24, 32, 48, 64, 96, 128, 192, 256 };
 static const int SIZES_MEDIUM[] = { 384, 512, 768, 1024, 1536 };
 static const int SIZES_LARGE[]  = { 2048, 3072, 4096, 6144, 8192 };
@@ -578,6 +594,7 @@ int main(int argc, char **argv) {
     g_coretype       = env_or("GBB_CORETYPE", "unforced");
     g_thread_backend = env_or("GBB_THREAD_BACKEND", "unknown");
     g_pin_policy     = env_or("GBB_PIN_POLICY", "none");
+    g_role           = env_or("GBB_ROLE", "unknown");
     g_threads       = atoi(env_or("GBB_THREADS", "1"));
 
     calibrate_timer();

@@ -24,6 +24,13 @@ select = [
     "C4",   # comprehensions
     "SIM",  # simplify
     "RUF",
+    # ARG catches an argument that is accepted and never used. This is here
+    # because of a specific bug: decompose.py parsed --min-effect, printed it in
+    # the header as the parity threshold, passed it to report_anomalies, and
+    # never read it -- while the rows were decided by a hardcoded 1.02. The
+    # header said 5% and the verdicts were made at 2%. A dead threshold
+    # parameter must fail CI, not survive review.
+    "ARG",
 ]
 
 [tool.ruff.format]

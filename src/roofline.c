@@ -141,6 +141,13 @@ int main(void) {
     const char *host     = env_or("GBB_HOST","unknown");
     const char *instance = env_or("GBB_INSTANCE","unknown");
     const char *build    = env_or("GBB_BUILD","unknown");
+    /* Campaign data and instrument checks must not be mixable by accident. The
+       runner decides the role from evidence it cannot fake -- a host with no
+       IMDS instance type is never "campaign" -- and stamps it into every record
+       here. The default is "unknown", not "campaign": a record produced by
+       running this binary by hand is not campaign data, and the analysis
+       excludes anything that does not say campaign. */
+    const char *role     = env_or("GBB_ROLE","unknown");
     int threads = atoi(env_or("GBB_THREADS","1"));
 
     long iters = 4000000;
@@ -151,9 +158,10 @@ int main(void) {
     sanity_check("peak_fma_f32", f32_1*1e-9, 1);
 
     printf("{\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\",\"build\":\"%s\","
+           "\"role\":\"%s\","
            "\"threads\":1,\"metric\":\"peak_fma\",\"accumulators\":%d,"
            "\"gflops_f64\":%.4f,\"gflops_f32\":%.4f}\n",
-           run_id, host, instance, build, ACC, f64_1*1e-9, f32_1*1e-9);
+           run_id, host, instance, build, role, ACC, f64_1*1e-9, f32_1*1e-9);
 
     /* All-core peak. Graviton has no SMT and no turbo, so this should be
        threads x the single-core figure. A shortfall is itself a finding
@@ -168,9 +176,10 @@ int main(void) {
         double all = 2.0*(double)ACC*(double)iters*threads / t;
         sanity_check("peak_fma_f64_allcore", all*1e-9, threads);
         printf("{\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\",\"build\":\"%s\","
+               "\"role\":\"%s\","
                "\"threads\":%d,\"metric\":\"peak_fma_allcore\",\"accumulators\":%d,"
                "\"gflops_f64\":%.4f,\"scaling_efficiency\":%.4f}\n",
-               run_id, host, instance, build, threads, ACC,
+               run_id, host, instance, build, role, threads, ACC,
                all*1e-9, all / (f64_1 * threads));
     }
 #endif
@@ -180,9 +189,10 @@ int main(void) {
     size_t n = (size_t)64*1024*1024;
     double bw = triad(n, 5);
     printf("{\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\",\"build\":\"%s\","
+           "\"role\":\"%s\","
            "\"threads\":%d,\"metric\":\"bandwidth\",\"array_bytes\":%zu,"
            "\"triad_gbs\":%.4f}\n",
-           run_id, host, instance, build, threads, n*sizeof(double), bw*1e-9);
+           run_id, host, instance, build, role, threads, n*sizeof(double), bw*1e-9);
 
     if (g_sink == 1234.5678) fputs("", stderr);   /* keep results live */
     return 0;
