@@ -28,6 +28,7 @@ for f in LICENSE README.md CHANGELOG.md CLAUDE.md .gitignore Makefile \
          scripts/build-libs.sh scripts/capture-env.sh scripts/run-matrix.sh \
          analysis/decompose.py tests/run-matrix-stubs.sh \
          tests/arch-selected-assert.sh \
+         tools/synth.py gates/p1.sh \
          .github/workflows/ci.yml scripts/bootstrap-github.sh; do
   if [ -f "$f" ]; then ok "$f"; else bad "$f missing"; fi
 done
@@ -122,8 +123,20 @@ else
   cat /tmp/gbb-p0-flags.log
 fi
 
-# ---- 7. no results or binaries committed ---------------------------------
-head_ "7. no artifacts committed"
+# ---- 7. CI actually runs the gates and the test suites -------------------
+# P0's requirement is "CI green on a clean clone", which is worth exactly as much
+# as the set of things CI runs. A gate or a suite that exists in the tree but is
+# not wired into CI rots silently, and the whole value of the P1 calibration is
+# that it fails at push time rather than on a dataset that cost instance-hours.
+head_ "7. CI runs every gate and suite in the tree"
+CI=.github/workflows/ci.yml
+for want in gates/p0.sh gates/p1.sh gates/check-build-flags.sh \
+            tests/run-matrix-stubs.sh tests/arch-selected-assert.sh; do
+  if grep -q "$want" "$CI"; then ok "CI runs $want"; else bad "$CI never runs $want"; fi
+done
+
+# ---- 8. no results or binaries committed ---------------------------------
+head_ "8. no artifacts committed"
 if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
   if git ls-files | grep -Eq '^(bin/|results/)|\.ndjson$|\.o$'; then
     bad "build output or results are tracked by git"

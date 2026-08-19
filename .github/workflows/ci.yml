@@ -112,6 +112,10 @@ jobs:
         # each arm. A defect there yields a plausible wrong answer rather than a
         # failed run, so it is tested on every push, against stubs, on any arch.
         run: bash tests/run-matrix-stubs.sh
+      - name: arch_selected is asserted, not reported
+        # Standing order 8 rides on capture-env.sh refusing to proceed rather
+        # than noting the problem in a file nobody reads.
+        run: bash tests/arch-selected-assert.sh
 
   python:
     name: python
@@ -142,3 +146,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libopenblas-dev
       - run: bash gates/p0.sh
+
+  gate-p1:
+    name: gate p1
+    needs: [python]
+    # No BLAS, no Graviton, no spend: the whole point of P1 is that the analysis
+    # can be calibrated against data whose answer is known, on any machine. It
+    # runs here on every push because the alternative is that synth.py drifts
+    # away from bench.c between now and P2 and the drift is discovered by a
+    # dataset that cost real instance-hours.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: bash gates/p1.sh
