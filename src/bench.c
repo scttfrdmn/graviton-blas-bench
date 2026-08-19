@@ -26,7 +26,7 @@
 #include <math.h>
 #include <time.h>
 #include <stdint.h>
-#include <unistd.h>
+#include <float.h>
 
 #define MIN_SECONDS   0.30
 #define MIN_REPS      3
@@ -84,11 +84,57 @@ static double rng_next(void) {
 static void fill_d(double *p, size_t n) { for (size_t i = 0; i < n; i++) p[i] = rng_next(); }
 static void fill_s(float  *p, size_t n) { for (size_t i = 0; i < n; i++) p[i] = (float)rng_next(); }
 
-/* Diagonally dominant triangular operand so TRSM is well-conditioned. */
+/* Diagonally dominant triangular operand so TRSM is well-conditioned.
+ *
+ * MEASUREMENT HAZARD (load-bearing -- do not "simplify" the 1/n scaling out):
+ *   TRSM and TRMM are DESTRUCTIVE and operate in place on B, and TIMED_LOOP
+ *   repeats the same call up to MAX_REPS times without restoring the operand.
+ *   So whatever gain the triangular operator has is applied ONCE PER REP,
+ *   geometrically.
+ *
+ *   The original fill used a diagonal of (double)n, giving a per-rep gain of
+ *   about n. dtrmm then multiplied B by ~n every rep and dtrsm divided by ~n:
+ *   at n=256 the operand overflowed to +Inf by around rep 128, and dtrsm
+ *   underflowed to exactly 0.0 over the same span. A large share of every
+ *   dtrsm/dtrmm sample was therefore timed on Inf or on exact zeros -- values
+ *   some kernels special-case -- and because those two drivers hardcode
+ *   verified=1, nothing flagged it. That silently corrupted the SMALL and
+ *   low-MEDIUM regimes, which is exactly where the campaign expects to find
+ *   the missing GEMM_SMALL_* / generic-TRSM deficit.
+ *
+ *   Fix: unit diagonal, and off-diagonals scaled by 1/n. Off-diagonal
+ *   magnitude is then <= 0.005/n, so the worst-case row sum is <= 0.005
+ *   against a diagonal of 1.0 -- MORE diagonally dominant than before, at
+ *   every n, while the operator gain is ~1.005 instead of ~n. Over 200 reps
+ *   that is a bounded factor of about 2.8 rather than n^200.
+ *
+ *   alpha stays 1.0 deliberately: scaling by alpha would also fix the growth,
+ *   but many libraries have an alpha==1 fast path, and taking a different code
+ *   path than production callers would make the measurement unrepresentative.
+ *
+ *   Flop count and memory access pattern are unchanged by operand values, so
+ *   this costs nothing in what the benchmark measures.
+ */
 static void fill_tri_d(double *p, int n, int ld) {
+    const double off = 0.01 / (double)n;
     for (int j = 0; j < n; j++)
         for (int i = 0; i < n; i++)
-            p[(size_t)j*ld + i] = (i == j) ? (double)n : 0.01 * rng_next();
+            p[(size_t)j*ld + i] = (i == j) ? 1.0 : off * rng_next();
+}
+
+/* Strided finiteness probe for in-place operands.
+ *
+ * The detector for the hazard documented above: if a destructive routine ever
+ * drives its operand out of range again, the record must say so rather than
+ * reporting a fast number computed on Inf. Blow-up is global, not local, so a
+ * strided sample is sufficient and stays cheap on the 8192-square cases.
+ */
+static int operand_finite(const double *p, size_t n) {
+    size_t stride = n / 1024;
+    if (stride < 1) stride = 1;
+    for (size_t i = 0; i < n; i += stride)
+        if (!isfinite(p[i])) return 0;
+    return isfinite(p[0]) && isfinite(p[n - 1]);
 }
 
 static void *xalloc(size_t bytes) {
@@ -130,7 +176,22 @@ static int verify_gemm_corner(const double *A, int lda, const double *B, int ldb
                               const double *C, int ldc, int m, int n, int k,
                               double alpha, double beta, const double *C0) {
     int mm = m < 4 ? m : 4, nn = n < 4 ? n : 4;
-    double tol = 1e-9 * k;
+    /* Was 1e-9 * k, which is about 4.5e6 times looser than the error a correct
+     * FP64 dot product can actually accumulate. At k=1024 that admitted a
+     * relative error of 1e-6: a kernel wrong in the 7th significant digit --
+     * one that had silently dropped to FP32 accumulation, or was skipping a
+     * tail block -- passed cleanly. That is precisely the "fast because it is
+     * wrong" failure this check exists to catch (standing order 4).
+     *
+     * The forward error bound for a k-length dot product is k*eps; the factor
+     * of 8 is headroom for the different summation orders that blocked and
+     * SIMD-reduced kernels legitimately produce. Tightening, not relaxing, so
+     * it needs no sign-off -- but it MUST be validated against real OpenBLAS,
+     * ArmPL and BLIS builds before P2, because a false positive poisons records
+     * just as badly as a false negative. If it does fire spuriously, raise the
+     * factor with the measured evidence attached, never to make records pass.
+     */
+    double tol = 8.0 * (double)k * DBL_EPSILON;
     for (int j = 0; j < nn; j++) {
         for (int i = 0; i < mm; i++) {
             double acc = 0.0;
@@ -146,6 +207,23 @@ static int verify_gemm_corner(const double *A, int lda, const double *B, int ldb
 }
 
 /* ---- record emission --------------------------------------------------- */
+
+/* Verification state is tri-state on the wire, not boolean.
+ *
+ * Only dgemm has a correctness check. Every other driver used to pass a
+ * hardcoded 1, so seven routines -- including dtrsm, dtrmm and dsymm, which
+ * are exactly the operations in the 90-kernel N2 gap this campaign exists to
+ * study -- asserted "verified" on the strength of nothing. The routines most
+ * likely to be mis-dispatched were the ones self-reporting as correct.
+ *
+ * "not checked" and "checked and passed" are different claims, and standing
+ * order 3 does not let us print the second when we mean the first. UNCHECKED
+ * emits JSON null so the analysis can fail closed on it.
+ */
+#define VERIFIED_UNCHECKED (-1)
+#define VERIFIED_FAIL       (0)
+#define VERIFIED_PASS       (1)
+
 static const char *g_host, *g_instance, *g_library, *g_target, *g_build,
                   *g_run_id, *g_arch_selected;
 static int g_threads;
@@ -157,6 +235,28 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
     double tmin = samples[0];
     double p50  = samples[reps/2];
     double p90  = samples[(int)(0.9*(reps-1))];
+
+    /* A zero t_min makes flops/tmin print as the bare token `inf`, which is not
+     * valid JSON -- Python's json module rejects it (it accepts `Infinity`, not
+     * `inf`). decompose.py would then drop the whole record with a one-line
+     * stderr warning and under-count silently in its header. t_min can legally
+     * be zero whenever a single call is shorter than the clock granularity:
+     * CLOCK_MONOTONIC resolves to 1 ns on Linux arm64 but 1000 ns on macOS, and
+     * coarse clocksources do occur under virtualisation.
+     *
+     * Emit a valid record that says the timer was outrun, rather than an
+     * invalid one that disappears. gflops of 0 is unambiguous here because a
+     * real measurement can never be 0. */
+    int timer_outrun = !(tmin > 0.0) || !(p50 > 0.0);
+    double gf     = timer_outrun ? 0.0 : flops / tmin * 1e-9;
+    double gf_p50 = timer_outrun ? 0.0 : flops / p50  * 1e-9;
+    if (timer_outrun) {
+        note = "timer_resolution_outrun";
+        verified = VERIFIED_FAIL;
+    }
+
+    const char *vstr = verified > 0 ? "true" : verified == 0 ? "false" : "null";
+
     printf("{\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\","
            "\"library\":\"%s\",\"target\":\"%s\",\"build\":\"%s\","
            "\"arch_selected\":\"%s\",\"threads\":%d,"
@@ -166,8 +266,8 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            g_run_id, g_host, g_instance, g_library, g_target, g_build,
            g_arch_selected, g_threads,
            routine, m, n, k, lda_pad, reps, tmin, p50, p90,
-           flops / tmin * 1e-9, flops / p50 * 1e-9,
-           verified ? "true" : "false", note ? note : "");
+           gf, gf_p50,
+           vstr, note ? note : "");
     fflush(stdout);
 }
 
@@ -179,7 +279,9 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
         int reps = (int)(MIN_SECONDS / (one > 1e-9 ? one : 1e-9));          \
         if (reps < MIN_REPS) reps = MIN_REPS;                               \
         if (reps > MAX_REPS) reps = MAX_REPS;                               \
-        samples = realloc(samples, (size_t)reps * sizeof(double));          \
+        double *_s = realloc(samples, (size_t)reps * sizeof(double));       \
+        if (!_s) { fprintf(stderr, "gbb: sample realloc failed\n"); exit(2); } \
+        samples = _s;                                                       \
         for (int r = 0; r < reps; r++) {                                    \
             double a = now(); CALL; samples[r] = now() - a;                 \
         }                                                                   \
@@ -220,7 +322,7 @@ static void run_sgemm(const Case *c) {
     TIMED_LOOP(sgemm_("N","N",&m,&n,&k,&alpha,A,&lda,B,&ldb,&beta,C,&ldc));
     /* sgemm correctness is checked in the dgemm arm; fp32 corner tolerance
        would need its own analysis and is not worth poisoning records over */
-    emit("sgemm", m,n,k,c->lda_pad, samples, nreps, case_flops("sgemm",m,n,k), 1, "corner_check_skipped");
+    emit("sgemm", m,n,k,c->lda_pad, samples, nreps, case_flops("sgemm",m,n,k), VERIFIED_UNCHECKED, "corner_check_absent_fp32");
     free(samples); free(A); free(B); free(C);
 }
 
@@ -233,7 +335,13 @@ static void run_dtrsm(const Case *c) {
     fill_tri_d(A, m, lda); fill_d(B,(size_t)ldb*n);
     double *samples = NULL; int nreps = 0;
     TIMED_LOOP(dtrsm_("L","L","N","N",&m,&n,&alpha,A,&lda,B,&ldb));
-    emit("dtrsm", m,n,0,c->lda_pad, samples, nreps, case_flops("dtrsm",m,n,0), 1, "");
+    /* dtrsm is destructive and TIMED_LOOP never restores B, so every rep feeds
+       on the previous rep's output. fill_tri_d bounds the per-rep gain, but the
+       bound is an argument, not a measurement -- check it. */
+    int fin = operand_finite(B, (size_t)ldb*n);
+    emit("dtrsm", m,n,0,c->lda_pad, samples, nreps, case_flops("dtrsm",m,n,0),
+         fin ? VERIFIED_UNCHECKED : VERIFIED_FAIL,
+         fin ? "corner_check_absent" : "operand_left_finite_range");
     free(samples); free(A); free(B);
 }
 
@@ -246,7 +354,11 @@ static void run_dtrmm(const Case *c) {
     fill_tri_d(A, m, lda); fill_d(B,(size_t)ldb*n);
     double *samples = NULL; int nreps = 0;
     TIMED_LOOP(dtrmm_("L","L","N","N",&m,&n,&alpha,A,&lda,B,&ldb));
-    emit("dtrmm", m,n,0,c->lda_pad, samples, nreps, case_flops("dtrmm",m,n,0), 1, "");
+    /* destructive and unrestored, exactly as dtrsm above */
+    int fin = operand_finite(B, (size_t)ldb*n);
+    emit("dtrmm", m,n,0,c->lda_pad, samples, nreps, case_flops("dtrmm",m,n,0),
+         fin ? VERIFIED_UNCHECKED : VERIFIED_FAIL,
+         fin ? "corner_check_absent" : "operand_left_finite_range");
     free(samples); free(A); free(B);
 }
 
@@ -259,7 +371,7 @@ static void run_dsyrk(const Case *c) {
     fill_d(A,(size_t)lda*k); fill_d(C,(size_t)ldc*n);
     double *samples = NULL; int nreps = 0;
     TIMED_LOOP(dsyrk_("L","N",&n,&k,&alpha,A,&lda,&beta,C,&ldc));
-    emit("dsyrk", n,n,k,c->lda_pad, samples, nreps, case_flops("dsyrk",0,n,k), 1, "");
+    emit("dsyrk", n,n,k,c->lda_pad, samples, nreps, case_flops("dsyrk",0,n,k), VERIFIED_UNCHECKED, "corner_check_absent");
     free(samples); free(A); free(C);
 }
 
@@ -273,7 +385,7 @@ static void run_dsymm(const Case *c) {
     fill_d(A,(size_t)lda*m); fill_d(B,(size_t)ldb*n); fill_d(C,(size_t)ldc*n);
     double *samples = NULL; int nreps = 0;
     TIMED_LOOP(dsymm_("L","L",&m,&n,&alpha,A,&lda,B,&ldb,&beta,C,&ldc));
-    emit("dsymm", m,n,0,c->lda_pad, samples, nreps, case_flops("dsymm",m,n,0), 1, "");
+    emit("dsymm", m,n,0,c->lda_pad, samples, nreps, case_flops("dsymm",m,n,0), VERIFIED_UNCHECKED, "corner_check_absent");
     free(samples); free(A); free(B); free(C);
 }
 
@@ -287,7 +399,7 @@ static void run_dgemv(const Case *c) {
     fill_d(A,(size_t)lda*n); fill_d(x,n); fill_d(y,m);
     double *samples = NULL; int nreps = 0;
     TIMED_LOOP(dgemv_("N",&m,&n,&alpha,A,&lda,x,&inc,&beta,y,&inc));
-    emit("dgemv", m,n,0,c->lda_pad, samples, nreps, case_flops("dgemv",m,n,0), 1, "");
+    emit("dgemv", m,n,0,c->lda_pad, samples, nreps, case_flops("dgemv",m,n,0), VERIFIED_UNCHECKED, "corner_check_absent");
     free(samples); free(A); free(x); free(y);
 }
 
