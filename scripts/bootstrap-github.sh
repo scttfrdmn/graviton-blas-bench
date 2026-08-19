@@ -10,7 +10,7 @@
 #
 # Creates: the public repo, labels, milestones P0-P4, one umbrella issue per
 # phase, and a Projects v2 board. The umbrella issues are the back-and-forth
-# channel with Scott -- standing order 9 posts a session-end status comment on
+# channel with Scott -- standing order 13 posts a session-end status comment on
 # the active one.
 
 set -uo pipefail
@@ -59,7 +59,9 @@ LABELS=(
 )
 for spec in "${LABELS[@]}"; do
   IFS='|' read -r lname lcolour ldesc <<<"$spec"
-  if gh label list --repo "$REPO" --limit 200 2>/dev/null | grep -qP "^\Q$lname\E\t"; then
+  # cut+grep -xF, not `grep -P`: BSD grep has no -P, so on macOS the guard
+  # errored out and the "idempotent" claim held only on Linux.
+  if gh label list --repo "$REPO" --limit 200 2>/dev/null | cut -f1 | grep -qxF "$lname"; then
     log "label '$lname' exists"
   else
     log "creating label '$lname'"
@@ -93,7 +95,7 @@ done
 umbrella_body() {
   cat <<EOF
 Umbrella issue for **phase $1**. This is the back-and-forth channel for the
-phase: session-end status comments land here (standing order 9).
+phase: session-end status comments land here (standing order 13).
 
 **Gate:** \`gates/$(printf '%s' "$1" | tr 'A-Z' 'a-z').sh\` must exit 0 before the
 next phase starts.
@@ -160,4 +162,4 @@ else
   run gh project create --owner "$OWNER" --title "'graviton-blas-bench'"
 fi
 
-log "done. Umbrella issues are the status channel -- see standing order 9."
+log "done. Umbrella issues are the status channel -- see standing order 13."
