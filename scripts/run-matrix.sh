@@ -177,7 +177,7 @@ HAS_SVE2="$(envq has_sve2)"
 export GBB_INSTANCE="$INSTANCE"
 ship
 
-# numactl -H is required evidence for gate P2 -- whether c8g.48xlarge at 192 vCPU
+# numactl -H is required evidence for gate P2 -- whether c8g.metal-48xl at 192 vCPU
 # is one socket or two decides how to read every multithreaded number on it.
 { echo "=== numactl -H ==="; numactl -H 2>&1 || echo "(numactl unavailable)"
   echo; echo "=== lscpu ==="; lscpu 2>&1 || echo "(lscpu unavailable)"; } > "$TOPOFILE"

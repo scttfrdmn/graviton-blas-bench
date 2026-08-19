@@ -202,8 +202,8 @@ support opposite conclusions.
 - **ArmPL ships a serial and an OpenMP build.** Linking `libarmpl` instead of
   `libarmpl_mp` produces flat scaling that looks like an ArmPL threading bug
   and is not. The Makefile links `-larmpl_mp`.
-- **`c8g.48xlarge` at 192 vCPU is likely two sockets; `c9g.48xlarge` at 192 may
-  be one.** Confirm with `numactl -H` on first boot. A NUMA boundary in the
+- **`c8g.metal-48xl` at 192 vCPU is likely two sockets; `c9g.metal-48xl` at 192
+  may be one.** Confirm with `numactl -H` on first boot. A NUMA boundary in the
   middle of one arm and not the other will dominate the multithreaded numbers.
   The thread ladder always includes 64 so there is one directly comparable
   point across all five families, since `c6g`/`c7g`/`hpc7g` stop there.
@@ -240,10 +240,21 @@ support opposite conclusions.
 
 - **`us-east-1` and `us-east-2` are the only regions carrying all five
   families.** Pin the whole campaign to one of them.
-- **`hpc7g` has no metal size.** It is the one arm where tenancy cannot be
-  eliminated; run it repeatedly and lean on the p50/p90 spread.
+- **In `us-east-1`, `hpc7g.16xlarge` is offered in `us-east-1a` only**, so the
+  whole campaign is pinned to that AZ if the hosts are to be comparable in
+  placement as well as in region. The four metal types are offered in `1a`–`1d`,
+  and `c7g.metal`/`c6g.metal`/`c8g.metal-48xl` additionally in `1f`. From
+  `describe-instance-type-offerings`, 2026-08-19.
+- **`hpc7g` has no metal size and no spot.** It is the one arm where tenancy
+  cannot be eliminated; run it repeatedly and lean on the p50/p90 spread. It is
+  also on-demand only, while all four metal types support spot — so it is the one
+  host whose cost cannot be reduced and the one whose run cannot be reclaimed.
 - Graviton has **no SMT and no turbo**, so 1 vCPU is 1 core and the
-  iso-frequency machinery needed on x86 hosts is unnecessary here.
+  iso-frequency machinery needed on x86 hosts is unnecessary here. Confirmed for
+  all five types: `DefaultThreadsPerCore` is 1, at 64 vCPU on
+  `c6g.metal`/`c7g.metal`/`hpc7g.16xlarge` and 192 on the two metal-48xl sizes.
+  `capture-env.sh` still checks it per host and exits 3 if SMT is on, because an
+  API claim about an instance type is not a measurement of the host.
 - ArmPL is a download from developer.arm.com, not a build. Install it out of
   band and point `ARMPL_DIR` at the prefix; the arm is skipped cleanly if unset.
 

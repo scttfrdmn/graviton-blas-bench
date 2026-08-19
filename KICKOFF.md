@@ -125,7 +125,7 @@ targets the host lacks ISA for (mark unrunnable, do not crash), ArmPL install
 
 **Gate P2:** a complete NDJSON set from one host, `decompose.py` runs on it
 without warnings other than genuine findings, and `numactl -H` output is
-recorded — confirm whether `c8g.48xlarge` at 192 vCPU is one socket or two.
+recorded — confirm whether `c8g.metal-48xl` at 192 vCPU is one socket or two.
 
 ### P3 — full matrix
 All five families. Metal sizes where they exist; `hpc7g` has none, so run it

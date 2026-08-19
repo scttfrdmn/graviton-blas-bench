@@ -44,6 +44,14 @@ change can be compared.
   logic against stub binaries — the refusal paths, coretype verification, the
   census, and the pinning arithmetic. None of it needs a Graviton, and all of it
   is what would be most expensive to get wrong.
+- Instance-availability facts for the pinned region, from
+  `describe-instance-type-offerings` and `describe-instance-types` rather than
+  from documentation: `hpc7g.16xlarge` is offered in `us-east-1a` **only**, which
+  pins the campaign to one AZ; it is also the only one of the five without spot,
+  so it is the one host whose cost cannot be reduced. `DefaultThreadsPerCore` is
+  1 on all five, at 64 vCPU on `c6g.metal`/`c7g.metal`/`hpc7g.16xlarge` and 192
+  on the two `metal-48xl` sizes. `capture-env.sh` still verifies SMT per host: an
+  API claim about an instance type is not a measurement of a host.
 - `make openblas-omp`: links the `USE_OPENMP=1` OpenBLAS with `-lgomp` and
   *without* `-fopenmp`, so the harness compilation stays byte-identical across
   arms as standing order 6 requires.
@@ -141,6 +149,10 @@ change can be compared.
   installing over itself and emitting two identical manifest lines that the
   census would count as two arms. That inflated apparent coverage on exactly the
   hosts we know least about.
+- The campaign's 192-vCPU hosts were named `c8g.48xlarge`/`c9g.48xlarge` in prose
+  in README, `run-matrix.sh`, `bootstrap-github.sh` and KICKOFF. Those are real
+  but *virtualized* sizes; the campaign runs `c8g.metal-48xl`/`c9g.metal-48xl`,
+  and the one place the name appears operationally is a launch instruction.
 - The build manifest was written to `$GBB_PREFIX`, outside `results/`, so the
   analysis could not reach it. It is now copied to
   `results/manifest-<run_id>.ndjson`, which is what the P1 expected-arm census

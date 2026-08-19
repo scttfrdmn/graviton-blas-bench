@@ -121,7 +121,7 @@ No cloud spend in this phase."
 
 Expect and resolve: OpenBLAS builds for targets the host lacks ISA for (mark unrunnable, do not crash), ArmPL install (a download from developer.arm.com, not a build), BLIS config selection.
 
-Gate evidence required: a complete NDJSON set from one host, \`decompose.py\` running without warnings other than genuine findings, and \`numactl -H\` recorded — confirm whether \`c8g.48xlarge\` at 192 vCPU is one socket or two.
+Gate evidence required: a complete NDJSON set from one host, \`decompose.py\` running without warnings other than genuine findings, and \`numactl -H\` recorded — confirm whether \`c8g.metal-48xl\` at 192 vCPU is one socket or two.
 
 **Cost estimate must be posted here before any instance launches.**"
   [P3]="Scope: all five families. Metal sizes where they exist; \`hpc7g\` has none, so run it repeatedly and lean on the p50/p90 spread. Capture \`numactl -H\` and \`capture-env.sh\` on every host before any timing.
