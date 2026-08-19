@@ -49,6 +49,61 @@ mkdir -p "$PREFIX" "$SRCDIR"
 log() { printf '[gbb-build] %s\n' "$*" >&2; }
 die() { printf '[gbb-build] FATAL: %s\n' "$*" >&2; exit 1; }
 
+# ---- one build at a time, per prefix and per source tree -------------------
+# $GBB_PREFIX and $GBB_SRC are fixed paths, so two concurrent runs on one host
+# share both: they check out OpenBLAS into the same $SRCDIR, `make install` over
+# each other's $PREFIX/openblas-* trees, and append interleaved lines to the same
+# build-manifest.ndjson. The damage is not a failed build -- it is a *successful*
+# one whose manifest says a target was built while the tree at that path came from
+# the other run, which is standing order 10's mislabelling failure moved from the
+# runner into the builder, and a plausible wrong answer rather than a gap.
+#
+# A PID-suffixed path is the wrong remedy here, unlike the test fixtures: the whole
+# point of the prefix is that run-matrix.sh reads the libraries back out of it by
+# name, so making it unique per run breaks the consumer. Mutual exclusion is the
+# remedy -- the second run refuses and says who holds the lock.
+#
+# `mkdir` is the lock primitive because it is atomic on POSIX and needs no flock,
+# which busybox and macOS do not both have.
+LOCKS=()
+release_locks() {
+  local d
+  for d in "${LOCKS[@]:-}"; do [ -n "$d" ] && rm -rf "$d"; done
+}
+take_lock() {
+  local dir="$1" what="$2" lock="$1/.gbb-build.lock"
+  if ! mkdir "$lock" 2>/dev/null; then
+    local owner
+    owner="$(cat "$lock/owner" 2>/dev/null || echo 'unknown -- no owner file')"
+    if [ "${GBB_FORCE_UNLOCK:-0}" = 1 ]; then
+      log "WARNING: breaking the $what lock held by: $owner"
+      log "         GBB_FORCE_UNLOCK=1 was set. If that build is still running, the"
+      log "         manifest this run writes will describe trees it did not build."
+      rm -rf "$lock"
+      mkdir "$lock" || die "cannot take the $what lock at $lock even after forcing"
+    else
+      die "another build holds the $what lock at $lock
+     held by: $owner
+     Two builds sharing one $what install over each other and append to one
+     manifest, so the manifest can end up describing a tree the other run built.
+     Wait for it, or point this run elsewhere:
+       GBB_PREFIX=... GBB_SRC=... $0
+     If that build is definitely dead, GBB_FORCE_UNLOCK=1 breaks the lock."
+    fi
+  fi
+  printf 'pid=%s host=%s started=%s prefix=%s src=%s\n' \
+    "$$" "$(hostname)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PREFIX" "$SRCDIR" >"$lock/owner"
+  LOCKS+=("$lock")
+}
+trap release_locks EXIT
+take_lock "$PREFIX" "install prefix"
+# Locked separately: a second run pointed at a different prefix still checks out
+# and builds OpenBLAS in the same $GBB_SRC unless that is also redirected, and a
+# `git checkout` under a running `make` is its own kind of wrong answer.
+if [ "$SRCDIR" != "$PREFIX" ]; then
+  take_lock "$SRCDIR" "source tree"
+fi
+
 # ---- refs must be immutable ------------------------------------------------
 # The five hosts are built on different days. A branch name means host c6g and
 # host c9g can silently get different libraries, and the cross-host comparison

@@ -203,6 +203,23 @@ census() {
 
 # ---- provenance first, always ---------------------------------------------
 [ -r "$BUILD_MANIFEST" ] || die "no build manifest at $BUILD_MANIFEST -- run build-libs.sh first."
+# The other side of build-libs.sh's lock. A sweep against a prefix that is being
+# rebuilt is worse than a failed sweep: `make install` replaces the shared objects
+# under a running arm, so some records describe the old library and some the new,
+# every one of them stamped with the manifest's blas_sha. That is standing order 5
+# provenance that is present and wrong, which no later check can detect.
+if [ -d "$PREFIX/.gbb-build.lock" ]; then
+  OWNER="$(cat "$PREFIX/.gbb-build.lock/owner" 2>/dev/null || echo 'unknown')"
+  if [ "${GBB_IGNORE_BUILD_LOCK:-0}" = 1 ]; then
+    log "WARNING: build lock held ($OWNER) and GBB_IGNORE_BUILD_LOCK=1 -- the libraries"
+    log "         under $PREFIX may change during this sweep."
+  else
+    die "a build holds the lock on $PREFIX (held by: $OWNER).
+     Libraries installed under a running sweep produce records whose blas_sha
+     describes a tree they were not measured against. Wait for the build to
+     finish. GBB_IGNORE_BUILD_LOCK=1 overrides, and should not be needed."
+  fi
+fi
 # Stamped, not copied. build-libs.sh runs before anything knows which host this
 # is, so its records carry no instance -- and the analysis concatenates every
 # host's manifest into one stream, at which point "this build has no SVE

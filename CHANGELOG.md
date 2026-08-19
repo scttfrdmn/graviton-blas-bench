@@ -102,10 +102,16 @@ change can be compared.
   because every forced-coretype label on that host came from the same probe.
   `tests/arch-selected-assert.sh` covers all four paths against a stub, in
   `gates/p0.sh`.
-- Spend policy for P2 and P3 recorded in `CLAUDE.md`: spot for P2 on
-  `c8g.metal-48xl`, on-demand for P3, and P3 run **three times** on different
-  `instance_id`s. One clean pass is ~$96, so further independent passes buy more
-  than a 3× discount on the first buys; three rather than two because two passes
+- Spend policy for P2 and P3 recorded in `CLAUDE.md`: **on-demand throughout,
+  including P2** on `c8g.metal-48xl`, and P3 run **three times** on different
+  `instance_id`s, launched with truffle/spawn rather than with new in-tree tooling.
+  Spot for P2 was the earlier decision and is reversed: ~$100 of saving is not worth
+  putting untested reclaim handling on the critical path. Costed at **$500–650 for
+  three expanded passes** (30–37 instance-hours each); the earlier ~$96/pass figure
+  described the pre-expansion routine table and is **retired rather than
+  reconciled**. Sweep time is not proportional to case count — `MAX_REPS` caps the
+  small end and `MIN_REPS` floors the large end, so the #2 expansion is ~4× the
+  cases and ~1.6–2× the wall clock. Three passes rather than two because two passes
   have no breakdown point — the median of two is the mean, and a single bad pass
   moves the answer with nothing to outvote it. The passes must be independent,
   which means three separate launches days apart with the instance terminated
@@ -324,13 +330,69 @@ change can be compared.
   `replicate-majority` (three separately launched passes, two agreeing, the third
   losing its V1-set arms to a crash). Each was validated by mutation: reverting the
   behaviour it guards turns exactly that scenario red and nothing else.
-  `replicate-majority` also documents a live consequence of the pooling rule —
-  sections 1–7 pool by median across `run_id`s and refuse a cell with unequal N, so
-  one arm lost on one of three passes makes the *pooled* verdict `INCONCLUSIVE`
-  while section 8 shows two passes agreeing. The fixture asserts that as found
-  rather than fixing it: whether sections 1–7 should intersect passes per
-  comparison instead of refusing is an aggregation-policy change, which is Scott's
-  call.
+  `replicate-majority` also surfaced a live consequence of the pooling rule — one
+  arm lost on one of three passes made every *pooled* cell unequal-N and the verdict
+  `INCONCLUSIVE` while section 8 showed two passes agreeing at +22%. That was
+  escalated as an aggregation-policy question rather than fixed in place; the answer
+  is the intersection rule below.
+- **Each comparison is intersected to the passes carrying both of its arms.** Global
+  equal-N was stronger than the arithmetic requires: what a paired comparison needs
+  is equal N *within* the comparison. Three conditions come with it, and they are
+  the policy rather than details. (a) A 2-of-3 intersection is back at
+  median-of-2 = mean, so every such row carries `UNDER-REPLICATED`, the verdict line
+  says how many cells rest on how few passes, and `headline_eligible` is false —
+  a directional headline on intersected cells is not a full-replication claim.
+  (b) The intersection is licensed by a census reason: `pass_explain()` is keyed on
+  `(instance, run_id, arm[, threads])` and returning `None` keeps an unexplained
+  loss out, where the comparison stays `inconclusive(unequal-N-unexplained:…)`.
+  Pooled coverage is complete in that case, so section 7 and bit 4 cannot see it —
+  the per-pass view is the only thing that can. (c) Every row prints
+  `passes=UofA`, so 2-of-3 is never visually equal to 3-of-3.
+- **`coherent_subsets()` weights by routine family, normalised, not by raw cells.**
+  Cell counts follow `bench.c`'s ladder, not the hardware: a routine measured at
+  five pads and four transposes contributes twenty times the rows of one measured
+  once, all of them the same hardware claim repeated. Each family now contributes
+  one unit of weight to an axis value, divided among its own rows, so GEMM's row
+  count cannot decide whether a TRSM/TRMM/SYMM effect is coherent. This had to land
+  before any table edit: every item in the #2 matrix expansion multiplies GEMM's
+  rows faster than anything else's, and on raw counts the expansion would have made
+  the C11 false negative *worse* than it was before C11 was fixed.
+- **`transa`/`transb` in the comparison key, and as an axis of the coherence
+  guard.** NN routes A through `gemm_ncopy_*` and TN through `gemm_tcopy_*`, so
+  spanning them in one cell lets each arm be judged on whichever transpose
+  flattered it — the max-over-cell defect that the `incx` and `lda_pad` keys each
+  fixed once, in a third shape. The key alone was not enough: with the axis in the
+  key and not in `coherent_subsets()`, a 35% effect present at every size of one
+  transpose read out as "NULL — publish the negative result", because it is
+  confined to no routine, regime or instance. `canon_trans()` defaults an absent
+  field to `N`, so records written before `bench.c` emits the fields stay in one
+  cell and every existing fixture is unchanged.
+- Three P1 fixtures, taking `tools/synth.py` to 47 scenarios, each
+  mutation-validated: `replicate-loss-unexplained` (the pair to
+  `replicate-majority` — an arm's records absent from one pass while the census says
+  `measured`, which must *not* be intersected), `transpose-shopping` (an effect at
+  `TN` only) and `family-swamped` (GEMM at four transposes holding 32 of 41 rows
+  against a coherent TRSM/TRMM/SYMM effect: 27% of rows, 75% of families).
+  Mutation results: removing the intersection kills both replicate fixtures;
+  intersecting unconditionally kills only `replicate-loss-unexplained`; silencing
+  `UNDER-REPLICATED` kills only `replicate-majority`; counting raw rows kills
+  `family-swamped` and `full-routine-set`; dropping the transpose from either the
+  key or the guard kills `transpose-shopping` and `family-swamped`.
+- `full-routine-set` now also expects `regime:small:V1`. That is the normalisation
+  visible on the routine set a real host produces: `dgemm` and `sgemm` are one
+  family, so the small ladder is gemm and syrk at parity against trsm, trmm and
+  symm ahead — three of five families, where raw rows gave a minority.
+- **`build-libs.sh` takes a lock on `$GBB_PREFIX` and `$GBB_SRC`, and
+  `run-matrix.sh` refuses to sweep against a locked prefix.** Both paths are fixed,
+  so two concurrent builds on one host check OpenBLAS out into the same source tree,
+  `make install` over each other's `openblas-*` trees, and append interleaved lines
+  to one `build-manifest.ndjson`. The damage is not a failed build but a successful
+  one whose manifest describes a tree the other run built — standing order 10's
+  mislabelling, moved from the runner into the builder. A PID-suffixed path is the
+  wrong remedy here, unlike the test fixtures: `run-matrix.sh` reads the libraries
+  back out of the prefix by name. `mkdir` is the lock primitive because it is atomic
+  everywhere; `GBB_FORCE_UNLOCK=1` and `GBB_IGNORE_BUILD_LOCK=1` exist and say what
+  they risk. Five new stub assertions (66 total).
 
 ### Changed — affects comparability of numbers
 

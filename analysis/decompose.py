@@ -263,6 +263,38 @@ def canon_coretype(v):
     return CANON_UNFORCED if s.lower() in _UNFORCED_SPELLINGS else s
 
 
+def canon_trans(v):
+    """BLAS transpose flag, upper-cased, defaulting to N.
+
+    Absent means N: every record written before bench.c carried the field came
+    from a sweep that only ever issued "N","N". Defaulting rather than
+    None-propagating is what lets the comparison key be extended before the
+    producer emits the fields, without splitting old data into two cells."""
+    if v is None:
+        return "N"
+    s = str(v).strip().upper()
+    return s if s in ("N", "T", "C") else "N"
+
+
+# Routine families for verdict weighting. The family is the routine name minus
+# its precision prefix, so dgemm/sgemm/zgemm/cgemm are one family and adding
+# complex types cannot multiply GEMM's weight in the census. sbgemm -> bgemm
+# stays its own family on purpose: bf16 GEMM is a different kernel, not another
+# precision of the same one.
+_PRECISION_PREFIXES = ("s", "d", "c", "z")
+
+
+def routine_family(routine):
+    r = (str(routine) if routine is not None else "").strip().lower()
+    if not r:
+        return "unknown"
+    if r.startswith("sb"):
+        return r[1:]
+    if r[0] in _PRECISION_PREFIXES and len(r) > 1:
+        return r[1:]
+    return r
+
+
 # ---- regime boundaries ----------------------------------------------------
 # Deliberately coarse. The point is to separate "fits in cache and the fixed
 # overheads dominate" from "streaming from DRAM", not to draw a precise line.
@@ -750,12 +782,33 @@ def build_hosts(inp: Inputs) -> dict:
 
 
 @dataclass
+class Sample:
+    """One pass's representative for one condition. Kept per run_id rather than
+    flattened into a list of numbers so a comparison can be restricted to the
+    passes both its arms actually have -- see Cell.restrict()."""
+
+    run_id: str = ""
+    value: float = 0.0
+    spread: float = None
+    verified: bool = True
+
+
+@dataclass
 class Cell:
-    values: list = field(default_factory=list)  # one representative per run_id
-    runs: list = field(default_factory=list)
-    spreads: list = field(default_factory=list)
-    all_verified: bool = True
+    samples: list = field(default_factory=list)  # one Sample per run_id
     notes: set = field(default_factory=set)
+
+    @property
+    def values(self):
+        return [s.value for s in self.samples]
+
+    @property
+    def runs(self):
+        return [s.run_id for s in self.samples]
+
+    @property
+    def all_verified(self):
+        return all(s.verified for s in self.samples)
 
     @property
     def value(self):
@@ -763,18 +816,28 @@ class Cell:
 
     @property
     def n_runs(self):
-        return len(self.values)
+        return len(self.samples)
 
     @property
     def within_spread(self):
-        return statistics.median(self.spreads) if self.spreads else 0.0
+        sp = [s.spread for s in self.samples if s.spread is not None]
+        return statistics.median(sp) if sp else 0.0
 
     @property
     def run_spread(self):
-        if len(self.values) < 2:
+        vals = self.values
+        if len(vals) < 2:
             return 0.0
-        m = statistics.median(self.values)
-        return (max(self.values) - min(self.values)) / m if m else 0.0
+        m = statistics.median(vals)
+        return (max(vals) - min(vals)) / m if m else 0.0
+
+    def restrict(self, run_ids):
+        """This cell as measured on `run_ids` only. Equal N within a comparison
+        is what the aggregation requires; equal N across the whole dataset is
+        stronger than the requirement, and refusing on it let one arm lost on one
+        of three passes turn every pooled cell non-comparable."""
+        c = Cell(samples=[s for s in self.samples if s.run_id in run_ids], notes=set(self.notes))
+        return c
 
 
 def arm_of(r):
@@ -827,6 +890,13 @@ def build_cells(bench, hosts, exc: Excluded):
         # the arm64 tree's weakest point. Records written before bench.c carried
         # the field default to 1, which is correct for every level-3 routine and
         # merges the old level-1 pairs exactly as they used to merge.
+        # transa/transb are part of the condition for the same reason incx is, and
+        # the reason is sharper: NN and TN route the A operand through different
+        # packing kernels (gemm_ncopy_* vs gemm_tcopy_*), so a comparison that
+        # spans them lets each arm be represented by its favourite transpose --
+        # the max()-over-the-cell defect in a new shape. Records written before
+        # bench.c carried the fields default to "N"/"N", which is what the
+        # single-transpose sweep measured and merges old data unchanged.
         cond = (
             inst,
             r.get("threads"),
@@ -836,6 +906,8 @@ def build_cells(bench, hosts, exc: Excluded):
             r.get("k"),
             r.get("lda_pad"),
             r.get("incx", 1),
+            canon_trans(r.get("transa")),
+            canon_trans(r.get("transb")),
         )
         if not isinstance(gf, (int, float)) or isinstance(gf, bool):
             exc.no_gflops += 1
@@ -884,13 +956,18 @@ def build_cells(bench, hosts, exc: Excluded):
             # min within a run_id: if a condition was measured more than once in
             # one file, the luckiest sample must not be the one that survives.
             rec = min(recs, key=lambda x: x["gflops"])
-            c.values.append(rec["gflops"])
-            c.runs.append(run_id)
             tmin, tp50 = rec.get("t_min"), rec.get("t_p50")
+            spread = None
             if isinstance(tmin, (int, float)) and isinstance(tp50, (int, float)) and tmin > 0:
-                c.spreads.append((tp50 - tmin) / tmin)
-            if rec.get("verified") is not True:
-                c.all_verified = False
+                spread = (tp50 - tmin) / tmin
+            c.samples.append(
+                Sample(
+                    run_id=run_id,
+                    value=rec["gflops"],
+                    spread=spread,
+                    verified=rec.get("verified") is True,
+                )
+            )
             if rec.get("note"):
                 c.notes.add(rec["note"])
         cells[key] = c
@@ -910,6 +987,10 @@ class SizeDelta:
     verified: bool
     runs_a: int
     runs_b: int
+    passes_used: int = 0
+    passes_avail: int = 0
+    # (run_id, arm) pairs whose absence from this condition nothing accounts for.
+    unexplained: tuple = ()
 
 
 def band_for(ca: Cell, cb: Cell, min_effect: float) -> float:
@@ -936,13 +1017,40 @@ def band_for(ca: Cell, cb: Cell, min_effect: float) -> float:
     return max(min_effect, ca.within_spread, cb.within_spread, ca.run_spread, cb.run_spread)
 
 
-def per_size(cells, conds, arm_a, arm_b, min_effect):
-    """Signed deltas of arm_a against arm_b at identical conditions only."""
+def per_size(cells, conds, arm_a, arm_b, min_effect, pass_explain=None):
+    """Signed deltas of arm_a against arm_b at identical conditions only.
+
+    Each comparison is restricted to the passes both arms have -- a paired design,
+    which is the standard fix for unequal N and is weaker than the global equal-N
+    rule this replaces. Global equal-N was refusing far more than the arithmetic
+    requires: one arm lost on one of three passes made every pooled cell
+    non-comparable, so a headline two passes agreed on read INCONCLUSIVE.
+
+    Two limits are kept deliberately. The intersection is only taken when the
+    census explains why the arm is missing from that pass; an unexplained loss is
+    still `unequal-N-unexplained` and still refuses a direction, because
+    intersecting over a hole nobody can account for is how a truncated sweep gets
+    published as a clean one. And an intersection down to two passes is recorded
+    as under-replicated: the median of two is the mean, which is the thing three
+    passes were bought to prevent, so such a comparison may contribute a number
+    but may not carry the headline unqualified."""
     rows = []
     for cond in conds:
         ca = cells.get((cond, arm_a))
         cb = cells.get((cond, arm_b))
         if ca is None or cb is None:
+            continue
+        ra, rb = set(ca.runs), set(cb.runs)
+        used, avail = ra & rb, ra | rb
+        unexplained = []
+        if ra != rb:
+            for rid in sorted(avail - used, key=str):
+                missing = arm_b if rid in ra else arm_a
+                hit = pass_explain(cond[0], rid, missing, cond[1]) if pass_explain else None
+                if hit is None:
+                    unexplained.append((str(rid), arm_label(missing)))
+            ca, cb = ca.restrict(used), cb.restrict(used)
+        if not used:
             continue
         d = rel(ca.value, cb.value)
         if d is None:
@@ -957,6 +1065,9 @@ def per_size(cells, conds, arm_a, arm_b, min_effect):
                 verified=ca.all_verified and cb.all_verified,
                 runs_a=ca.n_runs,
                 runs_b=cb.n_runs,
+                passes_used=len(used),
+                passes_avail=len(avail),
+                unexplained=tuple(unexplained),
             )
         )
     return rows
@@ -979,6 +1090,10 @@ def summarise(rows, args, label_a, label_b):
             "mean_b": None,
             "runs_a": 0,
             "runs_b": 0,
+            "passes_used": 0,
+            "passes_avail": 0,
+            "under_replicated": False,
+            "unexplained_passes": [],
         }
     deltas = [r.delta for r in rows]
     band = statistics.median([r.band for r in rows])
@@ -987,7 +1102,14 @@ def summarise(rows, args, label_a, label_b):
     n_b = sum(1 for r in rows if r.delta < -r.band)
     runs_a = {r.runs_a for r in rows}
     runs_b = {r.runs_b for r in rows}
-    unequal = runs_a != runs_b or len(runs_a) > 1 or len(runs_b) > 1
+    # After per_size()'s intersection the two arms of every row hold the same
+    # passes, so what is left to report is how many passes each row could use and
+    # whether any pass went missing without a reason.
+    unexplained = sorted({u for r in rows for u in r.unexplained})
+    used = min(r.passes_used for r in rows)
+    avail = max(r.passes_avail for r in rows)
+    under = used < avail
+    unequal = under or bool(unexplained)
     verified = all(r.verified for r in rows)
     n = len(rows)
 
@@ -995,11 +1117,13 @@ def summarise(rows, args, label_a, label_b):
         verdict = f"inconclusive(thin:{n}<{args.min_sizes})"
     elif abs(med) <= band:
         verdict = "parity"
-    elif unequal:
-        # Unequal N between the arms of a comparison: max-of-N and
-        # median-of-N are both N-sensitive, so a directional call here would be
-        # partly a statement about sample counts.
-        verdict = f"inconclusive(unequal-N:{sorted(runs_a)}v{sorted(runs_b)})"
+    elif unexplained:
+        # An arm missing from a pass with nothing in the census accounting for it.
+        # Intersecting here would silently compare whatever survived, so this
+        # keeps the old refusal: absent-for-a-stated-reason and absent-for-no-
+        # reason are different claims, and only the first is poolable.
+        who = ", ".join(f"{rid}:{a}" for rid, a in unexplained[: args.max_listed])
+        verdict = f"inconclusive(unequal-N-unexplained:{who})"
     elif med > 0 and n_a / n >= args.win_fraction:
         verdict = f"{label_a}-ahead"
     elif med < 0 and n_b / n >= args.win_fraction:
@@ -1020,11 +1144,21 @@ def summarise(rows, args, label_a, label_b):
         "mean_b": statistics.fmean([r.b for r in rows]),
         "runs_a": max(runs_a),
         "runs_b": max(runs_b),
+        "passes_used": used,
+        "passes_avail": avail,
+        "under_replicated": under,
+        "unexplained_passes": [f"{rid}:{a}" for rid, a in unexplained],
     }
 
 
 def vflag(s):
     return "" if s["verified"] else "  UNVERIFIED"
+
+
+def under_flag(s):
+    """Printed on every row that used fewer passes than were available, so a
+    2-of-3 comparison is never visually equal to a 3-of-3 one."""
+    return "  UNDER-REPLICATED" if s.get("under_replicated") else ""
 
 
 # ---- absence explained -----------------------------------------------------
@@ -1077,7 +1211,32 @@ def build_absence(inp: Inputs):
             return ("MISSING-UNEXPLAINED", "manifest says the arm was built and runnable; no census record")
         return ("MISSING-UNEXPLAINED", "nothing in the census or the manifest accounts for this arm")
 
-    return explain, manifest
+    # Per-pass, which explain() cannot be: it keys on (instance, arm) and the
+    # passes of one instance_type share both, so the last pass loaded wins. An
+    # arm that ran on two passes and died on the third is exactly the case the
+    # intersection rule has to decide, and deciding it needs the run_id.
+    by_pass = {}
+    for o in inp.outcomes:
+        st = o.get("status") or "unknown"
+        if st in CENSUS_SUCCESS:
+            continue
+        arm = (o.get("library"), o.get("target"), canon_coretype(o.get("coretype")))
+        hit = (st, o.get("reason") or "no reason recorded")
+        by_pass.setdefault((o.get("instance"), o.get("run_id"), arm, o.get("threads")), hit)
+        by_pass.setdefault((o.get("instance"), o.get("run_id"), arm), hit)
+
+    def pass_explain(instance, run_id, arm, threads=None):
+        """Why this arm produced nothing on this one pass, or None if nothing in
+        the census accounts for it. None is load-bearing: it is what keeps an
+        unexplained hole out of the intersection."""
+        arm = (arm[0], arm[1], canon_coretype(arm[2]))
+        if threads is not None:
+            hit = by_pass.get((instance, run_id, arm, threads))
+            if hit:
+                return hit
+        return by_pass.get((instance, run_id, arm))
+
+    return explain, manifest, pass_explain
 
 
 # ---- 0. hosts --------------------------------------------------------------
@@ -1145,27 +1304,32 @@ def report_hosts(hosts, bench_instances, out):
 
 
 def cell_groups(cells):
-    """(instance, threads, routine, regime, lda_pad, incx) -> {arm: [conditions]}
+    """(instance, threads, routine, regime, lda_pad, incx, transa, transb)
+    -> {arm: [conditions]}
 
     lda_pad and incx are in the key, not just in the condition. bench.c puts both
     leading dimensions into one regime and both element strides into one routine,
     and a median taken across a mix of them is a statement about neither -- the
     same conflation as the max()-over-the-cell bug, one level up. Section 3 is
-    where the two leading dimensions are compared against each other."""
+    where the two leading dimensions are compared against each other. The
+    transposes are in the key on the same argument: NN and TN exercise different
+    packing kernels, so their median is a statement about neither."""
     g = defaultdict(lambda: defaultdict(list))
     for cond, arm in cells:
         inst, thr, routine, m, pad, incx = cond[0], cond[1], cond[2], cond[3], cond[6], cond[7]
-        g[(inst, thr, routine, regime(m or 0), pad, incx)][arm].append(cond)
+        ta, tb = cond[8], cond[9]
+        g[(inst, thr, routine, regime(m or 0), pad, incx, ta, tb)][arm].append(cond)
     return g
 
 
-def report_deficit_by_routine(cells, groups, hosts, explain, args, out):
+def report_deficit_by_routine(cells, groups, hosts, explain, pass_explain, args, out):
     out("\n" + "=" * 78)
     out("1. DEFICIT BY ROUTINE  — each named OpenBLAS arm vs a named reference arm")
     out("=" * 78)
     out("Signed: + = OpenBLAS behind the reference, - = OpenBLAS ahead. Compared size by")
-    out("size at identical (m,n,k,lda_pad); the regime line is the median of those.")
+    out("size at identical (m,n,k,lda_pad,transa,transb); the regime line is the median.")
     out("SHIPPED marks openblas/DYNAMIC/unforced, which is what NumPy wheels actually run.")
+    out("passes=UofA: U passes carry both arms of A available. U<A is under-replicated.")
 
     payload = []
     instances = sorted({k[0] for k in groups}, key=str)
@@ -1180,14 +1344,14 @@ def report_deficit_by_routine(cells, groups, hosts, explain, args, out):
         tag = "" if (h and h.admissible) else "  [HOST-NOT-ADMISSIBLE]"
         for k in sorted((k for k in groups if k[0] == inst), key=skey):
             arms = groups[k]
-            _, thr, routine, reg, pad, incx = k
+            _, thr, routine, reg, pad, incx, ta, tb = k
             present_refs = [a for a in arms if a in refs]
             if not present_refs:
                 for arm in sorted((a for a in arms if a[0] == "openblas"), key=arm_label):
                     st, why = explain(inst, ("armpl", "native", "unforced"), thr)
                     out(
                         f"  {inst!s:14s} t={thr!s:<4} {routine!s:6s} {reg:6s} pad={pad!s:<3} "
-                        f"incx={incx!s:<2} "
+                        f"incx={incx!s:<2} tr={ta}{tb} "
                         f"{arm_label(arm):30s} NO DATA — reference arm absent "
                         f"({st}: {why or 'no reason recorded'})"
                     )
@@ -1196,7 +1360,7 @@ def report_deficit_by_routine(cells, groups, hosts, explain, args, out):
             # here, named in every row. Never a max() over anonymous arms.
             ref = max(present_refs, key=lambda a: (len(arms[a]), arm_label(a)))
             for arm in sorted((a for a in arms if a[0] == "openblas"), key=arm_label):
-                rows = per_size(cells, arms[arm], arm, ref, args.min_effect)
+                rows = per_size(cells, arms[arm], arm, ref, args.min_effect, pass_explain)
                 s = summarise(rows, args, "openblas", arm_label(ref))
                 # Deficit is the reference-relative shortfall: negate the signed
                 # delta of openblas against the reference.
@@ -1204,20 +1368,24 @@ def report_deficit_by_routine(cells, groups, hosts, explain, args, out):
                 mark = " SHIPPED" if is_shipped(arm) else ""
                 out(
                     f"  {inst!s:14s} t={thr!s:<4} {routine!s:6s} {reg:6s} pad={pad!s:<3} "
-                    f"incx={incx!s:<2} "
+                    f"incx={incx!s:<2} tr={ta}{tb} "
                     f"{arm_label(arm):30s} "
                     f"ob={fmt_val(s['mean_a'])} ref={fmt_val(s['mean_b'])} ({arm_label(ref)}) "
                     f"deficit={fmt_pct(med)} band={100 * s['band']:4.1f}% "
-                    f"n={s['n_sizes']:<2} runs={s['runs_a']}/{s['runs_b']}{mark}{vflag(s)}{tag}"
+                    f"n={s['n_sizes']:<2} passes={s['passes_used']}of{s['passes_avail']}"
+                    f"{under_flag(s)}{mark}{vflag(s)}{tag}"
                 )
                 payload.append(
                     {
                         "instance": inst,
                         "threads": thr,
                         "routine": routine,
+                        "routine_family": routine_family(routine),
                         "regime": reg,
                         "lda_pad": pad,
                         "incx": incx,
+                        "transa": ta,
+                        "transb": tb,
                         "arm": arm_label(arm),
                         "reference_arm": arm_label(ref),
                         "shipped_arm": is_shipped(arm),
@@ -1228,6 +1396,10 @@ def report_deficit_by_routine(cells, groups, hosts, explain, args, out):
                         "n_sizes": s["n_sizes"],
                         "runs_openblas": s["runs_a"],
                         "runs_reference": s["runs_b"],
+                        "passes_used": s["passes_used"],
+                        "passes_available": s["passes_avail"],
+                        "under_replicated": s["under_replicated"],
+                        "unexplained_passes": s["unexplained_passes"],
                         "verified": s["verified"],
                         "host_admissible": bool(h and h.admissible),
                     }
@@ -1277,14 +1449,16 @@ def kernel_set_note(name):
     return SVE_KERNEL_SETS.get(name, f"{name} = SVE kernel count not recorded in this file")
 
 
-def report_target_cross(cells, groups, hosts, explain, inp, args, out):
+def report_target_cross(cells, groups, hosts, explain, pass_explain, inp, args, out):
     out("\n" + "=" * 78)
     out("2. TARGET CROSS  — same hardware, different OpenBLAS kernel set")
     out("=" * 78)
     out(f"{kernel_set_note(args.v1_set)}.  {kernel_set_note(args.v2_set)}.")
     out("Signed delta of the V1 set against the V2 set, per size, at identical")
-    out("(m,n,k,lda_pad). Positive = V1 set ahead. TARGET= and OPENBLAS_CORETYPE are")
-    out("compared separately: they are different claims.")
+    out("(m,n,k,lda_pad,transa,transb). Positive = V1 set ahead. TARGET= and")
+    out("OPENBLAS_CORETYPE are compared separately: they are different claims.")
+    out("passes=UofA: the comparison used U of the A passes; U<A is UNDER-REPLICATED and")
+    out("may contribute a number but not carry the headline unqualified.")
 
     payload = []
     pairs_by_inst = cross_pairs(cells, inp, args)
@@ -1298,18 +1472,19 @@ def report_target_cross(cells, groups, hosts, explain, inp, args, out):
             for k in keys:
                 arms = groups[k]
                 conds = sorted(set(arms.get(arm_a, [])) | set(arms.get(arm_b, [])), key=skey)
-                rows = per_size(cells, conds, arm_a, arm_b, args.min_effect)
-                _, thr, routine, reg, pad, incx = k
+                rows = per_size(cells, conds, arm_a, arm_b, args.min_effect, pass_explain)
+                _, thr, routine, reg, pad, incx, ta, tb = k
                 if rows:
                     comparable += 1
                     s = summarise(rows, args, "V1-set", "V2-set")
                     out(
                         f"  {inst!s:14s} t={thr!s:<4} {routine!s:6s} {reg:6s} pad={pad!s:<3} "
-                        f"incx={incx!s:<2} by={mech:8s} "
+                        f"incx={incx!s:<2} tr={ta}{tb} by={mech:8s} "
                         f"V1={fmt_val(s['mean_a'])} V2={fmt_val(s['mean_b'])} "
                         f"delta={fmt_pct(s['median_delta'])} band={100 * s['band']:4.1f}% "
                         f"sizes={s['n_sizes']:<2} (+{s['n_a_ahead']}/-{s['n_b_ahead']}) "
-                        f"runs={s['runs_a']}/{s['runs_b']}  {s['verdict']}{vflag(s)}{tag}"
+                        f"passes={s['passes_used']}of{s['passes_avail']}  "
+                        f"{s['verdict']}{under_flag(s)}{vflag(s)}{tag}"
                     )
                 else:
                     # A hole and a null must not look alike. The old code
@@ -1326,9 +1501,12 @@ def report_target_cross(cells, groups, hosts, explain, inp, args, out):
                         "instance": inst,
                         "threads": thr,
                         "routine": routine,
+                        "routine_family": routine_family(routine),
                         "regime": reg,
                         "lda_pad": pad,
                         "incx": incx,
+                        "transa": ta,
+                        "transb": tb,
                         "mechanism": mech,
                         "arm_v1": arm_label(arm_a),
                         "arm_v2": arm_label(arm_b),
@@ -1341,6 +1519,10 @@ def report_target_cross(cells, groups, hosts, explain, inp, args, out):
                         "n_v2_ahead": s["n_b_ahead"],
                         "runs_v1": s["runs_a"],
                         "runs_v2": s["runs_b"],
+                        "passes_used": s["passes_used"],
+                        "passes_available": s["passes_avail"],
+                        "under_replicated": s["under_replicated"],
+                        "unexplained_passes": s["unexplained_passes"],
                         "unequal_runs": s["unequal_runs"],
                         "verified": s["verified"],
                         "verdict": s["verdict"],
@@ -1365,7 +1547,8 @@ def report_target_cross(cells, groups, hosts, explain, inp, args, out):
                     shown += 1
                     out(
                         f"  {inst!s:14s} t={k[1]!s:<4} {k[2]!s:6s} {k[3]:6s} pad={k[4]!s:<3} "
-                        f"incx={k[5]!s:<2} by={mech2:8s} NO DATA — {arm_label(missing)} absent "
+                        f"incx={k[5]!s:<2} tr={k[6]}{k[7]} by={mech2:8s} NO DATA — "
+                        f"{arm_label(missing)} absent "
                         f"({st}: {why or 'no reason recorded'}); {arm_label(other)} present"
                     )
                 if len(deferred) > shown:
@@ -1388,8 +1571,8 @@ def report_lda_penalty(cells, hosts, args, out):
     tight = {}
     padded = {}
     for (cond, arm), c in cells.items():
-        inst, thr, routine, m, n, k, pad, incx = cond
-        base = (inst, arm, thr, routine, m, n, k, incx)
+        inst, thr, routine, m, n, k, pad, incx, ta, tb = cond
+        base = (inst, arm, thr, routine, m, n, k, incx, ta, tb)
         if pad == 0:
             tight[base] = c
         elif pad:
@@ -1402,7 +1585,18 @@ def report_lda_penalty(cells, hosts, args, out):
             cp = padded[pad][base]
             if ct is None:
                 continue
-            inst, arm, thr, routine, m, _n, _k, incx = base
+            inst, arm, thr, routine, m, _n, _k, incx, ta, tb = base
+            # Same paired rule as per_size(): a tight-vs-padded penalty measured
+            # over different passes on each side would be part stride and part
+            # box. Both sides are the same arm here, so a pass that has one and
+            # not the other is a truncated sweep, not an arm that failed -- there
+            # is no census reason to look for, and the intersection is the whole
+            # remedy.
+            shared = set(ct.runs) & set(cp.runs)
+            if not shared:
+                continue
+            avail = len(set(ct.runs) | set(cp.runs))
+            ct, cp = ct.restrict(shared), cp.restrict(shared)
             pen = rel(ct.value, cp.value)
             band = band_for(ct, cp, args.min_effect)
             h = hosts.get(inst)
@@ -1415,11 +1609,12 @@ def report_lda_penalty(cells, hosts, args, out):
                 )
             )
             ver = "" if (ct.all_verified and cp.all_verified) else "  UNVERIFIED"
+            under = "  UNDER-REPLICATED" if len(shared) < avail else ""
             out(
                 f"  {inst!s:14s} {arm_label(arm):30s} t={thr!s:<4} {routine!s:6s} n={m!s:<5} "
-                f"pad={pad!s:<3} tight={fmt_val(ct.value)} padded={fmt_val(cp.value)} "
+                f"pad={pad!s:<3} tr={ta}{tb} tight={fmt_val(ct.value)} padded={fmt_val(cp.value)} "
                 f"penalty={fmt_pct(pen)} band={100 * band:4.1f}% "
-                f"runs={ct.n_runs}/{cp.n_runs}  {verdict}{ver}{tag}"
+                f"passes={len(shared)}of{avail}  {verdict}{under}{ver}{tag}"
             )
             payload.append(
                 {
@@ -1427,9 +1622,12 @@ def report_lda_penalty(cells, hosts, args, out):
                     "arm": arm_label(arm),
                     "threads": thr,
                     "routine": routine,
+                    "routine_family": routine_family(routine),
                     "m": m,
                     "lda_pad": pad,
                     "incx": incx,
+                    "transa": ta,
+                    "transb": tb,
                     "regime": regime(m or 0),
                     "tight": ct.value,
                     "padded": cp.value,
@@ -1437,6 +1635,9 @@ def report_lda_penalty(cells, hosts, args, out):
                     "band": band,
                     "runs_tight": ct.n_runs,
                     "runs_padded": cp.n_runs,
+                    "passes_used": len(shared),
+                    "passes_available": avail,
+                    "under_replicated": len(shared) < avail,
                     "verdict": verdict,
                     "verified": ct.all_verified and cp.all_verified,
                     "host_admissible": bool(h and h.admissible),
@@ -1474,20 +1675,22 @@ def report_regime_profile(deficits, cross, args, out):
                 d["routine"],
                 d["lda_pad"],
                 d["incx"],
+                d.get("transa", "N"),
+                d.get("transb", "N"),
                 d["reference_arm"],
             )
         ][d["regime"]] = d
     if not by:
         out("      no reference-arm deficits to profile")
     for k in sorted(by, key=skey):
-        inst, thr, arm, routine, pad, incx, ref = k
+        inst, thr, arm, routine, pad, incx, ta, tb, ref = k
         r = by[k]
         vals = {reg: (r[reg]["median_deficit"] if reg in r else None) for reg in REGIMES}
         gap = None if vals["small"] is None or vals["large"] is None else vals["small"] - vals["large"]
         thin = [reg for reg in REGIMES if reg not in r]
         out(
             f"      {inst!s:14s} t={thr!s:<4} {arm:30s} {routine!s:6s} pad={pad!s:<3} "
-            f"incx={incx!s:<2} vs {ref:22s} "
+            f"incx={incx!s:<2} tr={ta}{tb} vs {ref:22s} "
             f"small={fmt_pct(vals['small'])} medium={fmt_pct(vals['medium'])} "
             f"large={fmt_pct(vals['large'])}  small-large={fmt_pct(gap)}"
             + (f"  MISSING:{','.join(thin)}" if thin else "")
@@ -1500,6 +1703,8 @@ def report_regime_profile(deficits, cross, args, out):
                 "routine": routine,
                 "lda_pad": pad,
                 "incx": incx,
+                "transa": ta,
+                "transb": tb,
                 "reference_arm": ref,
                 "small": vals["small"],
                 "medium": vals["medium"],
@@ -1524,19 +1729,21 @@ def report_regime_profile(deficits, cross, args, out):
                 c["routine"],
                 c["lda_pad"],
                 c["incx"],
+                c.get("transa", "N"),
+                c.get("transb", "N"),
             )
         ][c["regime"]] = c
     if not by2:
         out("      no comparable target-cross cell in any regime")
     for k in sorted(by2, key=skey):
-        inst, thr, mech, a1, _a2, routine, pad, incx = k
+        inst, thr, mech, a1, _a2, routine, pad, incx, ta, tb = k
         r = by2[k]
         vals = {reg: (r[reg]["median_delta"] if reg in r else None) for reg in REGIMES}
         gap = None if vals["small"] is None or vals["large"] is None else vals["small"] - vals["large"]
         thin = [reg for reg in REGIMES if reg not in r]
         out(
             f"      {inst!s:14s} t={thr!s:<4} by={mech:8s} {routine!s:6s} pad={pad!s:<3} "
-            f"incx={incx!s:<2} {a1:24s} "
+            f"incx={incx!s:<2} tr={ta}{tb} {a1:24s} "
             f"small={fmt_pct(vals['small'])} medium={fmt_pct(vals['medium'])} "
             f"large={fmt_pct(vals['large'])}  small-large={fmt_pct(gap)}"
             + (f"  MISSING:{','.join(thin)}" if thin else "")
@@ -1549,6 +1756,8 @@ def report_regime_profile(deficits, cross, args, out):
                 "routine": routine,
                 "lda_pad": pad,
                 "incx": incx,
+                "transa": ta,
+                "transb": tb,
                 "arm_v1": a1,
                 "small": vals["small"],
                 "medium": vals["medium"],
@@ -2017,7 +2226,7 @@ def _direction(code):
     return {"V1-SET-AHEAD": 1, "V2-SET-AHEAD": -1, "NULL": 0}.get(code)
 
 
-def report_replicates(inp, hosts, explain, args, out):
+def report_replicates(inp, hosts, explain, pass_explain, args, out):
     """Each pass analysed alone, then the verdicts compared.
 
     Deliberately NOT a pooled statistic. P3 spends the extra passes to find out
@@ -2074,7 +2283,7 @@ def report_replicates(inp, hosts, explain, args, out):
             # per pass would inflate section 5's counts.
             pcells = build_cells(bench, hosts, Excluded())
             pcross = report_target_cross(
-                pcells, cell_groups(pcells), hosts, explain, inp, args, lambda _line: None
+                pcells, cell_groups(pcells), hosts, explain, pass_explain, inp, args, lambda _line: None
             )
             v = compute_verdict(pcross, hosts, args)
             # Arms this pass lost. Reported here and nowhere else: section 7 lists
@@ -2229,9 +2438,22 @@ def coherent_subsets(cross, args):
 
     Found by C11: before this, gates/p1.sh certified the analysis on `dgemm` and
     `dgemv` only, and the routine-localised fixture read out as a global null.
-    """
-    buckets = defaultdict(lambda: defaultdict(int))
+
+    **The majority is over routine families, normalised, not over raw cells**, and
+    that is what makes the guard survive a larger matrix. Cell counts follow
+    bench.c's ladder: a routine measured at five pads and four transposes
+    contributes twenty times the rows of one measured at one pad and one
+    transpose, all of them the same hardware claim repeated. Counting rows would
+    let GEMM's row count decide whether an effect on TRSM/TRMM/SYMM is coherent,
+    so every family contributes one unit of weight to an axis value, divided among
+    its own rows. Expanding the matrix therefore cannot dilute the guard it was
+    built to be -- which it would have done, worse than before C11, since every
+    planned addition multiplies GEMM's rows faster than anything else's."""
+    weights = defaultdict(lambda: defaultdict(float))
+    raw = defaultdict(lambda: defaultdict(int))
+    fam_rows = defaultdict(lambda: defaultdict(int))
     deltas = defaultdict(list)
+    contributing = []
     for c in cross:
         if not c["host_admissible"]:
             continue
@@ -2244,22 +2466,35 @@ def coherent_subsets(cross, args):
             bucket = "v2"
         else:
             continue
-        for axis, value in (
+        fam = c.get("routine_family") or routine_family(c.get("routine"))
+        axes = (
             ("routine", c["routine"]),
             ("regime", c["regime"]),
             ("instance", c["instance"]),
-        ):
-            buckets[(axis, value)][bucket] += 1
-            if c["median_delta"] is not None:
-                deltas[(axis, value, bucket)].append(c["median_delta"])
+            ("trans", f"{canon_trans(c.get('transa'))}{canon_trans(c.get('transb'))}"),
+        )
+        contributing.append((axes, fam, bucket, c["median_delta"]))
+        for axis, value in axes:
+            fam_rows[(axis, value)][fam] += 1
+
+    for axes, fam, bucket, delta in contributing:
+        for axis, value in axes:
+            w = 1.0 / fam_rows[(axis, value)][fam]
+            weights[(axis, value)][bucket] += w
+            raw[(axis, value)][bucket] += 1
+            if delta is not None:
+                deltas[(axis, value, bucket)].append(delta)
 
     found = []
-    for (axis, value), t in sorted(buckets.items(), key=lambda kv: skey(kv[0])):
-        n = t["v1"] + t["v2"] + t["parity"]
-        if n < args.subset_min_cells:
+    for (axis, value), t in sorted(weights.items(), key=lambda kv: skey(kv[0])):
+        n_raw = sum(raw[(axis, value)].values())
+        if n_raw < args.subset_min_cells:
+            continue
+        total_w = t["v1"] + t["v2"] + t["parity"]
+        if not total_w:
             continue
         for direction, side in (("V1", "v1"), ("V2", "v2")):
-            if t[side] / n < args.verdict_majority:
+            if t[side] / total_w < args.verdict_majority:
                 continue
             d = deltas[(axis, value, side)]
             found.append(
@@ -2267,8 +2502,11 @@ def coherent_subsets(cross, args):
                     "axis": axis,
                     "value": value,
                     "direction": direction,
-                    "wins": t[side],
-                    "comparable": n,
+                    "wins": raw[(axis, value)][side],
+                    "comparable": n_raw,
+                    "weight": round(t[side], 4),
+                    "weight_total": round(total_w, 4),
+                    "families": sorted(fam_rows[(axis, value)]),
                     "median_delta": statistics.median(d) if d else None,
                 }
             )
@@ -2281,8 +2519,11 @@ def compute_verdict(cross, hosts, args):
     negative result"` both passed on a dataset with zero comparisons."""
     tally = defaultdict(int)
     per_ir = defaultdict(lambda: defaultdict(int))
+    fam_cells = defaultdict(int)
     deltas = []
     unverified = 0
+    under = 0
+    under_passes = set()
     for c in cross:
         v = c["verdict"]
         adm = c["host_admissible"]
@@ -2301,10 +2542,14 @@ def compute_verdict(cross, hosts, args):
         tally[bucket] += 1
         per_ir[(c["instance"], c["regime"])][bucket] += 1
         if bucket in ("v1_wins", "v2_wins", "parity"):
+            fam_cells[c.get("routine_family") or routine_family(c.get("routine"))] += 1
             if c["median_delta"] is not None:
                 deltas.append(c["median_delta"])
             if not c["verified"]:
                 unverified += 1
+            if c.get("under_replicated"):
+                under += 1
+                under_passes.add(f"{c.get('passes_used')}of{c.get('passes_available')}")
 
     total = sum(tally.values())
     comparable = tally["v1_wins"] + tally["v2_wins"] + tally["parity"]
@@ -2350,7 +2595,8 @@ def compute_verdict(cross, hosts, args):
         # negative result over a real, located effect.
         code = "MIXED"
         where = "; ".join(
-            f"{s['axis']} {s['value']}: {s['direction']} set ahead in {s['wins']}/{s['comparable']}"
+            f"{s['axis']} {s['value']}: {s['direction']} set ahead in {s['wins']}/{s['comparable']} cells "
+            f"({100 * s['weight'] / s['weight_total']:.0f}% of family weight)"
             + (f" (median {100 * s['median_delta']:+.1f}%)" if s["median_delta"] is not None else "")
             for s in subsets[: args.max_listed]
         )
@@ -2366,9 +2612,24 @@ def compute_verdict(cross, hosts, args):
             f"set, {tally['parity']} at parity, of {comparable} comparable; no majority at "
             f"{100 * args.verdict_majority:.0f}%"
         )
+    # A directional headline that rests on any intersected comparison is not a
+    # full-replication claim, and must not be able to be read as one. The code
+    # stays -- refusing the direction is what the intersection rule exists to stop
+    # -- but the line carries the marker and section 8 remains the arbiter of
+    # whether the headline reproduced.
+    headline_eligible = under == 0 or _direction(code) is None
+    if not headline_eligible:
+        line += (
+            f"  [UNDER-REPLICATED: {under} of {comparable} comparable cells used "
+            f"{'/'.join(sorted(under_passes))} passes]"
+        )
     return {
         "code": code,
         "line": line,
+        "headline_eligible": headline_eligible,
+        "under_replicated_cells": under,
+        "under_replicated_passes": sorted(under_passes),
+        "routine_family_cells": dict(sorted(fam_cells.items())),
         "cells_total": total,
         "cells_comparable": comparable,
         "v1_wins": tally["v1_wins"],
@@ -2425,21 +2686,32 @@ def report_verdict(verdict, lda, regimes, coverage, anomalies, replicates, exit_
         for a in p.get("arms_lost", [])
     ]
     if partial:
-        # Named because the pooled reading goes non-comparable and the verdict line
-        # does not say why. Sections 1-7 median across passes, so an arm measured on
-        # two passes and lost on a third makes every pooled cell unequal-N, and the
-        # campaign-level verdict reads INCONCLUSIVE while two independent passes sit
-        # in section 8 agreeing at +22%. That is a true statement about the pooled
-        # data and a badly misleading headline, so the cause is printed next to it.
-        # Restricting each comparison to the passes where both arms ran would be an
-        # aggregation-policy change, which is Scott's call, not this file's.
+        # Named because it is what put the UNDER-REPLICATED marks in sections 1-3.
+        # Sections 1-7 pool passes, and each comparison is restricted to the passes
+        # where both its arms ran, so an arm lost on one pass costs that comparison
+        # a pass rather than costing the whole pooled reading its direction. What
+        # the reader needs is which arms, on which box, and that the shortfall is
+        # explained: an unexplained loss is not intersected and shows as
+        # unequal-N-unexplained instead.
         arms = sorted({a for _i, _b, a in partial})
         out(
             f"  VERDICT-CAVEAT: {len(partial)} arm-pass(es) are missing from otherwise complete "
-            f"passes ({', '.join(arms[: args.max_listed])}). Sections 1-7 pool passes, so an arm "
-            f"present on some passes and absent on others makes every pooled cell unequal-N and "
-            f"non-comparable — read section 8's per-pass verdicts, and do not read a pooled "
+            f"passes ({', '.join(arms[: args.max_listed])}). Every comparison involving them was "
+            f"intersected to the passes carrying both arms and is marked UNDER-REPLICATED — read "
+            f"section 8's per-pass verdicts before publishing, and do not read a pooled "
             f"INCONCLUSIVE here as parity."
+        )
+    if verdict.get("under_replicated_cells") and not verdict.get("headline_eligible", True):
+        # The condition Scott put on intersecting: an intersection down to two
+        # passes is median-of-two, which is the mean, which is the breakdown point
+        # the third pass was bought to fix. Such a cell may carry a number; it may
+        # not carry the headline unqualified.
+        out(
+            f"  VERDICT-CAVEAT: {verdict['under_replicated_cells']} of "
+            f"{verdict['cells_comparable']} comparable cells rest on "
+            f"{'/'.join(verdict['under_replicated_passes'])} passes, not the full set. The median of "
+            f"two passes is their mean and can be moved by one bad box, so the line above is not a "
+            f"full-replication claim: section 8 decides whether the headline reproduced."
         )
     short = [r for r in replicates if r.get("under_replicated")]
     if short and _direction(verdict["code"]) is not None:
@@ -2622,7 +2894,7 @@ def main(argv=None):
         hosts.setdefault(inst, Host(instance=inst))
     exc = Excluded()
     cells = build_cells(inp.bench, hosts, exc)
-    explain, _manifest = build_absence(inp)
+    explain, _manifest, pass_explain = build_absence(inp)
 
     lines = []
     out = lines.append
@@ -2639,15 +2911,15 @@ def main(argv=None):
 
     host_payload = report_hosts(hosts, {r.get("instance") for r in inp.bench}, out)
     groups = cell_groups(cells)
-    deficits = report_deficit_by_routine(cells, groups, hosts, explain, args, out)
-    cross = report_target_cross(cells, groups, hosts, explain, inp, args, out)
+    deficits = report_deficit_by_routine(cells, groups, hosts, explain, pass_explain, args, out)
+    cross = report_target_cross(cells, groups, hosts, explain, pass_explain, inp, args, out)
     lda = report_lda_penalty(cells, hosts, args, out)
     regimes = report_regime_profile(deficits, cross, args, out)
     scaling = compute_scaling(cells, inp.roof, args)
     anomalies, coverage_table, unver_cells = report_anomalies(inp, cells, hosts, exc, scaling, args, out)
     report_scaling(scaling, out)
     coverage = report_coverage(cells, inp, explain, hosts, exc, args, out)
-    replicates = report_replicates(inp, hosts, explain, args, out)
+    replicates = report_replicates(inp, hosts, explain, pass_explain, args, out)
     verdict = compute_verdict(cross, hosts, args)
 
     exit_code = 0

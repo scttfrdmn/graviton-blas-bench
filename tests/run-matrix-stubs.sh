@@ -416,6 +416,28 @@ print(d.get(("openblas","DYNAMIC")), d.get(("openblas","NEOVERSEV1")), d.get(("a
      "$RES/manifest-instr-M2.ndjson")" "yes no n/a"
 
 echo
+echo "== N. a sweep refuses to run against a prefix a build is holding =="
+# build-libs.sh takes a lock on $GBB_PREFIX because two builds sharing one prefix
+# install over each other. The sweep side matters just as much: `make install`
+# under a running arm swaps the shared object mid-sweep, so some records describe
+# the old library and some the new, all of them stamped with the manifest's
+# blas_sha. That is provenance which is present and wrong, and nothing downstream
+# can detect it -- so the refusal is asserted, not trusted.
+mk_manifest
+mk_env 0 true true available
+mkdir -p "$W/libs/.gbb-build.lock"
+printf 'pid=4242 host=stub started=2026-08-19T00:00:00Z\n' > "$W/libs/.gbb-build.lock/owner"
+rc=$(run N)
+chk "exit 3" "$rc" "3"
+chk "message names the lock holder" "$(grep -c 'pid=4242' "$W/results/N.stderr")" "1"
+chk "no bench records were produced" "$(ls "$RES" | grep -c '^bench-instr-N')" "0"
+rc=$(run N2b GBB_IGNORE_BUILD_LOCK=1)
+chk "the override runs and warns" "$rc" "0"
+chk "the warning names the risk" \
+  "$(grep -c 'may change during this sweep' "$W/results/N2b.stderr")" "1"
+rm -rf "$W/libs/.gbb-build.lock"
+
+echo
 echo "== missing build manifest =="
 rm -f "$W/libs/build-manifest.ndjson"
 mk_env 0 true true available

@@ -169,6 +169,11 @@ class Arm:
     gain_sizes: dict = field(default_factory=dict)  # size -> multiplier, overrides gain
     gain_incx: dict = field(default_factory=dict)  # incx -> multiplier, multiplies gain
     gain_pad: dict = field(default_factory=dict)  # lda_pad -> multiplier, multiplies gain
+    # "NN"/"TN"/"NT"/"TT" -> multiplier, multiplies gain. NN and TN route A through
+    # gemm_ncopy_* and gemm_tcopy_* respectively, so a kernel-set difference confined
+    # to one transpose is the ordinary shape, not a contrived one -- and it is
+    # unreachable unless transa/transb are part of the comparison key.
+    gain_trans: dict = field(default_factory=dict)
     measured: bool = True
     census_status: str = "measured"
     census_reason: str = ""
@@ -207,8 +212,10 @@ class Arm:
     def key(self):
         return (self.library, self.target, self.coretype)
 
-    def multiplier(self, routine, m, incx, pad=0):
+    def multiplier(self, routine, m, incx, pad=0, trans=None):
         g = self.gain_incx.get(incx, 1.0) * self.gain_pad.get(pad, 1.0)
+        if trans:
+            g *= self.gain_trans.get(trans, 1.0)
         if self.gain_sizes and m in self.gain_sizes:
             return g * self.gain_sizes[m]
         if self.gain_routines is not None and routine not in self.gain_routines:
@@ -287,6 +294,14 @@ class HostSpec:
     # realistic shape of a three-launch P3 -- the passes are independent, so a
     # crash on one of them takes out that pass's arm and not the campaign's.
     failed_arms: dict = field(default_factory=dict)  # target or coretype name -> reason
+    # Arms whose records are absent from this pass with NOTHING in the census to say
+    # why: the runner exited 0 and censused `measured`, and the records did not
+    # arrive. Standing order 12 ships per-arm, so a dropped or truncated shipment is
+    # exactly this shape. Keyed like failed_arms. The distinction from failed_arms is
+    # the whole point of the pair: an explained per-pass loss may be intersected out
+    # of a comparison, an unexplained one may not, because the missing records could
+    # have said anything and there is no record of them having said nothing.
+    lost_arms: tuple = ()
 
     def failure_reason(self, arm):
         """Why this arm produced no records on this pass, or None if it ran."""
@@ -294,6 +309,10 @@ class HostSpec:
             if token in (arm.target, arm.coretype):
                 return reason
         return None
+
+    def lost(self, arm):
+        """True if this arm's records vanished on this pass without a census reason."""
+        return any(token in (arm.target, arm.coretype) for token in self.lost_arms)
 
     def core_clusters(self):
         if self.clusters is not None:
@@ -319,6 +338,15 @@ class Scenario:
     arms: list
     routines: tuple = ("dgemm", "dtrsm", "dgemv")
     level1: bool = True
+    # (transa, transb) pairs the GEMM-shaped routines were swept at, and the ONE
+    # place this file is deliberately ahead of its producer: src/bench.c does not
+    # emit transa/transb yet (that is item 3 of the landing order, and the analysis
+    # is item 1). Off by default, so every other scenario stays byte-faithful to
+    # what bench.c writes today; the scenarios that turn it on are testing that the
+    # comparison key can carry the axis before the sweep produces it. When bench.c
+    # does emit the fields, add a ladder_check for this tuple in gates/p1.sh
+    # section 2 like the size ladders, and drop this paragraph.
+    transposes: tuple = ()
     expect: list = field(default_factory=list)
     blas_sha: str = "a" * 40
     blas_sha_overrides: dict = field(default_factory=dict)  # (library,target) -> sha
@@ -329,31 +357,42 @@ class Scenario:
 # against a real file is readable.
 
 
-def conditions(routines, level1):
-    """Every (routine, m, n, k, lda_pad, incx) bench.c would emit for `all`."""
+def conditions(routines, level1, transposes=()):
+    """Every (routine, m, n, k, lda_pad, incx, transa, transb) bench.c would emit
+    for `all`.
+
+    transa/transb are None unless the scenario asked for them, and None means the
+    record carries no such field -- which is what bench.c writes today. A scenario
+    that names transposes gets one condition per pair on the GEMM-shaped routines
+    only, because that is where the copy kernels differ; TRSM's side/uplo/diag
+    axis is a separate question and is not being modelled here."""
     out = []
+    pairs = tuple(transposes) or ((None, None),)
+    gemmish = ("dgemm", "sgemm")
     for r in routines:
         if r in ("dgemm", "sgemm", "dtrsm", "dtrmm", "dsyrk", "dsymm"):
             for sizes in (SIZES_SMALL, SIZES_MEDIUM, SIZES_LARGE):
                 for m in sizes:
-                    if r in ("dgemm", "sgemm") or r == "dsyrk":
-                        out.append((r, m, m, m, 0, 1))
-                    else:
-                        out.append((r, m, m, 0, 0, 1))
+                    for ta, tb in pairs if r in gemmish else ((None, None),):
+                        if r in gemmish or r == "dsyrk":
+                            out.append((r, m, m, m, 0, 1, ta, tb))
+                        else:
+                            out.append((r, m, m, 0, 0, 1, ta, tb))
     if "dgemm" in routines:
         for sizes in (SIZES_MEDIUM, SIZES_LARGE):
             for m in sizes:
-                out.append(("dgemm", m, m, m, 8, 1))
+                for ta, tb in pairs:
+                    out.append(("dgemm", m, m, m, 8, 1, ta, tb))
     if "dgemv" in routines:
         for sizes in (SIZES_MEDIUM, SIZES_LARGE):
             for m in sizes:
-                out.append(("dgemv", m, m, 0, 0, 1))
+                out.append(("dgemv", m, m, 0, 0, 1, None, None))
     if level1:
         for m in LEVEL1_LENS:
             for incx in (1, 4):
-                out.append(("daxpy", m, 0, 0, 0, incx))
+                out.append(("daxpy", m, 0, 0, 0, incx, None, None))
             for incx in (1, 4):
-                out.append(("ddot", m, 0, 0, 0, incx))
+                out.append(("ddot", m, 0, 0, 0, incx, None, None))
     return out
 
 
@@ -381,7 +420,7 @@ def arm_sha(sc: Scenario, host: HostSpec, arm: Arm):
 def bench_records(sc: Scenario, host: HostSpec):
     """src/bench.c emit(), field for field."""
     recs = []
-    conds = conditions(sc.routines, sc.level1)
+    conds = conditions(sc.routines, sc.level1, sc.transposes)
     # A diverging replicate pass is generated by giving the two kernel-set arms
     # each other's gain, not by editing gflops afterwards. Both the target
     # mechanism (openblas/V1 vs openblas/V2) and the coretype mechanism
@@ -396,7 +435,7 @@ def bench_records(sc: Scenario, host: HostSpec):
             other = (lib, swap.get(tgt, tgt), swap.get(ct, ct))
             gain_of[a.key] = next((b for b in sc.arms if b.key == other), a)
     for arm in sc.arms:
-        if not arm.measured or host.failure_reason(arm) is not None:
+        if not arm.measured or host.failure_reason(arm) is not None or host.lost(arm):
             continue
         eff = gain_of[arm.key]
         sha = arm_sha(sc, host, arm)
@@ -405,15 +444,23 @@ def bench_records(sc: Scenario, host: HostSpec):
             if token in (arm.target, arm.coretype):
                 boost *= mult
         for threads in host.threads:
-            for routine, m, n, k, pad, incx in conds:
+            for routine, m, n, k, pad, incx, ta, tb in conds:
                 if m in arm.omit_sizes or routine in arm.omit_routines:
                     continue
+                trans = f"{ta}{tb}" if ta is not None else None
+                # The transpose enters the noise key only when it exists, so adding
+                # the axis leaves every pre-existing fixture's numbers bit-identical:
+                # a scenario whose verdict moved because an unrelated field joined a
+                # hash would be a fixture change masquerading as an analysis change.
+                noise_key = (host.run_id, arm.key, threads, routine, m, pad, incx)
+                if trans is not None:
+                    noise_key += (trans,)
                 base = (
                     base_gflops(routine, m, threads)
-                    * eff.multiplier(routine, m, incx, pad)
+                    * eff.multiplier(routine, m, incx, pad, trans)
                     * host.host_scale
                     * boost
-                    * jitter(host.run_id, arm.key, threads, routine, m, pad, incx, amp=arm.noise)
+                    * jitter(*noise_key, amp=arm.noise)
                 )
                 flops = case_flops(routine, m, n, k)
                 # The real record first, then the lucky duplicate. Emission order
@@ -458,6 +505,11 @@ def bench_records(sc: Scenario, host: HostSpec):
                             "k": k,
                             "lda_pad": pad,
                             "incx": incx,
+                            # Present only where the scenario asked for transposes,
+                            # and in the position bench.c will write them: a field
+                            # the producer does not emit must not appear in a
+                            # fixture that claims to be faithful to the producer.
+                            **({"transa": ta, "transb": tb} if ta is not None else {}),
                             "reps": 15,
                             "batch": 1,
                             "calls": 15,
@@ -498,6 +550,8 @@ def honest_records(bench):
             r["k"],
             r["lda_pad"],
             r["incx"],
+            r.get("transa"),
+            r.get("transb"),
         )
         cur = best.get(key)
         if cur is None or r["gflops"] < cur["gflops"]:
@@ -895,7 +949,15 @@ def _host(**kw):
     )
 
 
-def _arms(v1_gain=None, v2_gain=None, shipped_gain=None, routines=None, v1_incx=None, **kw):
+def _arms(
+    v1_gain=None,
+    v2_gain=None,
+    shipped_gain=None,
+    routines=None,
+    v1_incx=None,
+    v1_trans=None,
+    **kw,
+):
     """The standard six-arm set: the shipped arm, two forced coretypes, two
     static targets, and ArmPL as the named reference.
 
@@ -913,11 +975,15 @@ def _arms(v1_gain=None, v2_gain=None, shipped_gain=None, routines=None, v1_incx=
     v2_gain = v2_gain or {}
     shipped_gain = shipped_gain if shipped_gain is not None else v2_gain
     common = dict(gain_routines=routines, **kw)
+    # The stride and transpose gains go on the V1 arms only, by both mechanisms:
+    # an axis-localised effect that showed up under one mechanism and not the other
+    # would be testing the label plumbing, not the axis.
+    v1_axes = {"gain_incx": v1_incx or {}, "gain_trans": v1_trans or {}}
     return [
         Arm("openblas", "DYNAMIC", "unforced", gain=shipped_gain, **common),
-        Arm("openblas", "DYNAMIC", V1, gain=v1_gain, gain_incx=v1_incx or {}, in_manifest=False, **common),
+        Arm("openblas", "DYNAMIC", V1, gain=v1_gain, **v1_axes, in_manifest=False, **common),
         Arm("openblas", "DYNAMIC", V2, gain=v2_gain, in_manifest=False, **common),
-        Arm("openblas", V1, "unforced", gain=v1_gain, gain_incx=v1_incx or {}, **common),
+        Arm("openblas", V1, "unforced", gain=v1_gain, **v1_axes, **common),
         Arm("openblas", V2, "unforced", gain=v2_gain, **common),
         Arm("armpl", "native", "unforced", thread_backend="openmp", **kw),
     ]
@@ -1589,13 +1655,23 @@ def sc_replicate_majority():
     that end, this one holds this end, and the pair is what makes the rule a rule
     rather than a preference for the answer we want.
 
-    It also found the cost of a partial pass, which was not obvious before the
-    fixture existed: sections 1-7 pool passes, so the V1 arms having 2 samples where
-    the V2 arms have 3 makes all 72 pooled cells unequal-N, and the campaign-level
-    verdict reads INCONCLUSIVE while section 8 shows +22.1% and +21.9% on the two
-    complete passes. Asserted here as it stands, with the caveat that names the
-    cause; changing the pooling to intersect passes per comparison would be an
-    aggregation-policy decision rather than a fix."""
+    It also found the cost of a partial pass, and that cost is what the aggregation
+    rule now answers. Sections 1-7 used to refuse any cell whose two sides had
+    unequal N, so the V1 arms having 2 samples where the V2 arms have 3 made all 72
+    pooled cells non-comparable: the campaign line read INCONCLUSIVE while section 8
+    showed +22.1% and +21.9% on the two complete passes -- the same false-negative
+    shape as C11, reached by a different route. Global equal-N was stronger than the
+    arithmetic needs; what a paired comparison needs is equal N *within* the
+    comparison. So each comparison is now intersected down to the passes carrying
+    BOTH arms, and this scenario asserts the directional verdict that recovers.
+
+    What the intersection must not do is launder two passes into three. A 2-of-3
+    intersection is back at median-of-2 = mean, breakdown point zero, which is the
+    exact failure the three-pass policy was bought to prevent -- so every such row
+    prints `passes=2of3`, the verdict line carries UNDER-REPLICATED, and the
+    headline is explicitly not a full-replication claim. `replicate-loss-unexplained`
+    holds the other half of the rule: intersecting is licensed by a census reason,
+    not by convenience."""
     reason = "harness exited 134 on this pass; see /opt/gbb/stderr.log"
     return Scenario(
         name="replicate-majority",
@@ -1622,20 +1698,72 @@ def sc_replicate_majority():
             # majority rule; a status without the box is not actionable.
             {"kind": "stdout_contains", "text": "i-000000000000000c"},
             {"kind": "exit_bits_clear", "bits": [4, 16]},
-            # The POOLED verdict is INCONCLUSIVE, and that is the finding, not a
-            # fixture artefact: sections 1-7 median across passes, so an arm present
-            # on two passes and absent on the third makes every pooled cell
-            # unequal-N. Two independent passes agree at +22% and the campaign-level
-            # line says "no comparable measurement" — the same false-negative shape
-            # as C11, reached by a different route. Asserted as it stands rather than
-            # fixed here: restricting each comparison to the passes where both arms
-            # ran is an aggregation-policy change and Scott's call.
-            {"kind": "verdict_code", "one_of": ["INCONCLUSIVE"]},
+            # The pooled verdict is the effect the two complete passes agree on. The
+            # loss is census-explained, so the comparison is intersected to the two
+            # passes carrying both arms rather than refused -- one lost arm must not
+            # nuke a 22% finding two passes agree on.
+            {"kind": "verdict_code", "one_of": ["V1-SET-AHEAD"]},
+            # ...and must not be readable as a three-pass claim. Both halves are
+            # asserted, because either alone is a policy this scenario rejects.
+            {"kind": "stdout_contains", "text": "UNDER-REPLICATED"},
+            {"kind": "stdout_contains", "text": "passes=2of3"},
+            {"kind": "json_number", "path": "verdict.under_replicated_cells", "op": ">", "value": 0},
+            {"kind": "json_bool", "path": "verdict.headline_eligible", "value": False},
+            {"kind": "stdout_contains", "text": "not a full-replication claim"},
             {"kind": "stdout_contains", "text": "do not read a pooled"},
             # Standing order 11 on a per-pass failure: the crash carries its reason
             # into the report, not just into the census file. Section 7 cannot do
             # this — the arm has cells, from the other two passes.
             {"kind": "stdout_contains", "text": "harness exited 134 on this pass"},
+        ],
+    )
+
+
+def sc_replicate_loss_unexplained():
+    """The same three-pass shape as `replicate-majority`, with the reason removed.
+
+    The intersection rule is licensed by an explanation, not by the arithmetic. Here
+    the runner exited 0 and censused the V1 arms `measured` on pass 3, and their
+    records are simply not in the directory -- the shape of a per-arm S3 shipment
+    that was dropped or truncated (standing order 12 ships per arm, so this is the
+    ordinary way for one pass to lose one arm without anyone noticing).
+
+    Nothing in the census says those records would have looked like the other two
+    passes', and there is no record of them having said anything, so the comparison
+    is NOT intersected: it stays `inconclusive(unequal-N-unexplained:...)` and the
+    campaign verdict stays INCONCLUSIVE. This is the pair to `replicate-majority`,
+    and the pair is the rule -- with only the explained case in the suite, an
+    implementation that intersected unconditionally would be green, and the
+    difference between "we know why that arm is missing" and "we do not" is exactly
+    the difference standing order 11 exists to keep.
+
+    Pooled coverage is complete, so section 7 cannot catch this and bit 4 stays
+    clear: the arm has every condition, from the other two passes. Only the per-pass
+    view sees the hole, which is why `pass_explain` had to be keyed on run_id."""
+    return Scenario(
+        name="replicate-loss-unexplained",
+        description=(
+            "Three passes; on the third, both V1-set arms' records are absent while the "
+            "census says they ran. An unexplained loss is not intersected away -- the "
+            "comparison stays unequal-N and the verdict stays INCONCLUSIVE."
+        ),
+        hosts=[
+            _host(instance_id="i-000000000000000a", run_id="synth-c7g-pass1"),
+            _host(instance_id="i-000000000000000b", run_id="synth-c7g-pass2", host_scale=1.03),
+            _host(instance_id="i-000000000000000c", run_id="synth-c7g-pass3", lost_arms=(V1,)),
+        ],
+        arms=_arms(v1_gain=flat(1.22)),
+        expect=[
+            {"kind": "verdict_code", "one_of": ["INCONCLUSIVE"]},
+            {"kind": "stdout_contains", "text": "unequal-N-unexplained"},
+            # The pass and the arm that went missing are both named. "unexplained"
+            # without saying which pass is a dead end for whoever has to go and look.
+            {"kind": "stdout_contains", "text": "synth-c7g-pass3"},
+            {"kind": "json_len", "path": "verdict.coherent_subsets", "op": "==", "value": 0},
+            # Refusing is not the same as flagging a coverage hole: pooled, every
+            # condition is present. Bit 4 firing here would mean the two rules are
+            # reading the same evidence, and then only one of them is needed.
+            {"kind": "exit_bits_clear", "bits": [4]},
         ],
     )
 
@@ -1720,6 +1848,149 @@ def sc_incx_axis():
                 "expect": "parity",
                 "min_rows": 1,
             },
+        ],
+    )
+
+
+def sc_transpose_shopping():
+    """The transpose axis, and the reason it has to be part of the comparison key.
+
+    The V1 set is 35% ahead at TN and at parity at NN, NT and TT. NN routes A
+    through `gemm_ncopy_*` and TN through `gemm_tcopy_*`, so "ahead on one
+    transpose" is an ordinary kernel-set result rather than a contrived one -- and
+    it is also the shape that breaks the aggregation if the key does not carry the
+    axis. Four transposes sharing one cell means each arm's cell value is the best
+    of its four, so every arm is compared on whichever transpose flattered it most:
+    the max-over-cell defect that `incx-axis` and the lda_pad key each fixed once,
+    returning in a third shape. The effect is then neither reportable nor
+    localisable, and worse, a transpose where the V1 set is *behind* is invisible
+    because the NN measurement covered for it.
+
+    Deliberately ahead of the producer: src/bench.c does not emit transa/transb yet
+    (landing order item 3). The analysis is item 1 and lands first, so the key must
+    accept the axis before the sweep produces it, and must default absent to "N" so
+    the same code reads today's data unchanged -- which `full-routine-set` and every
+    other scenario go on asserting, since none of them carry the fields."""
+    return Scenario(
+        name="transpose-shopping",
+        description=(
+            "A GEMM effect that exists only at transa=T: 35% at TN, parity at NN/NT/TT. "
+            "Recovering it requires transa/transb in the comparison key; without them the "
+            "four transposes share a cell and each arm is judged on its favourite."
+        ),
+        hosts=[_host()],
+        routines=("dgemm",),
+        level1=False,
+        transposes=(("N", "N"), ("T", "N"), ("N", "T"), ("T", "T")),
+        arms=_arms(v1_trans={"TN": 1.35}),
+        expect=[
+            {"kind": "cross_rows_have_trans", "routine": "dgemm", "values": ["NN", "NT", "TN", "TT"]},
+            {
+                "kind": "cross_verdicts_where",
+                "routine": "dgemm",
+                "transa": "T",
+                "transb": "N",
+                "expect": "V1-set-ahead",
+                "min_rows": 3,
+            },
+            {
+                "kind": "cross_verdicts_where",
+                "routine": "dgemm",
+                "transa": "N",
+                "transb": "N",
+                "expect": "parity",
+                "min_rows": 3,
+            },
+            # The verdict is transpose-localised, which means it is not global: with
+            # one transpose of four affected, MIXED is the honest answer and a
+            # directional headline would be the fixture's own hypothesis leaking in.
+            {"kind": "verdict_code", "not_one_of": ["V1-SET-AHEAD", "NULL", "NO-DATA"]},
+            # ...and the transpose has to be an axis of the coherence guard, not only
+            # of the key. With the key extended and the axis missing, this dataset
+            # read out as "NULL -- publish the negative result" over a 35% effect
+            # present at every size of one transpose: 20 of 80 rows carry it, the
+            # parity rows clear the 60% majority, and no routine, regime or instance
+            # subset can see an effect that is confined to none of them. The key
+            # extension created that hole and this closes it in the same commit.
+            {"kind": "coherent_subsets", "expect": ["trans:TN:V1"]},
+            {"kind": "stdout_contains", "text": "trans TN: V1 set ahead"},
+            {"kind": "stdout_absent", "text": "publish the negative result"},
+            {"kind": "exit_bits_clear", "bits": [2, 4, 16]},
+        ],
+    )
+
+
+def sc_family_swamped():
+    """GEMM's row count outvoting every other family -- the matrix expansion's cost
+    to the C11 guard, planted.
+
+    This is the failure mode the per-family normalisation exists for, and it does
+    not exist in `full-routine-set`: there, one row per routine per regime meant raw
+    cell counts and family counts differed only mildly. Give GEMM four transposes
+    and the census is 32 GEMM rows against 3 each for TRSM, TRMM and SYMM, all of
+    them the same hardware claim repeated at a different copy kernel. Counting rows,
+    `regime:small` is 27% V1 and reaches no direction; counting families it is 75%
+    V1 -- three of the four families measured at that size say the same thing.
+
+    So the guard's majority is over families, normalised, with each family's one
+    unit of weight divided among its own rows. Without that, every item in the
+    matrix expansion makes the guard weaker than it was before C11 was fixed: the
+    additions multiply GEMM's rows faster than anything else's, and the coherent
+    TRSM/TRMM/SYMM effect the campaign was built to price gets diluted by rows that
+    contain no independent information about it.
+
+    The regime and instance subsets are the discriminating assertions. Per-routine
+    subsets qualify either way -- one family per routine makes the normalisation a
+    no-op there -- so a scenario asserting only those would be green on the raw-count
+    implementation this one exists to reject."""
+    return Scenario(
+        name="family-swamped",
+        description=(
+            "The V1 set is 22% ahead on dtrsm/dtrmm/dsymm and at parity on dgemm/sgemm, "
+            "which carry four transposes each and so hold 32 of 41 rows. Weighted by row "
+            "the effect is a minority; weighted by routine family it is 3 of 4."
+        ),
+        hosts=[_host()],
+        routines=("dgemm", "sgemm", "dtrsm", "dtrmm", "dsymm"),
+        level1=False,
+        transposes=(("N", "N"), ("T", "N"), ("N", "T"), ("T", "T")),
+        arms=_arms(v1_gain=flat(1.22), routines=N2_GAP_ROUTINES),
+        expect=[
+            # The effect is where it was planted, per routine, whatever the weighting.
+            {"kind": "cross_verdicts_where", "routine": "dtrsm", "expect": "V1-set-ahead", "min_rows": 3},
+            {"kind": "cross_verdicts_where", "routine": "dtrmm", "expect": "V1-set-ahead", "min_rows": 3},
+            {"kind": "cross_verdicts_where", "routine": "dsymm", "expect": "V1-set-ahead", "min_rows": 3},
+            {"kind": "cross_verdicts_where", "routine": "dgemm", "expect": "parity", "min_rows": 8},
+            # ...and the regime and instance axes recover it only under family
+            # normalisation. Asserted as an exact set, so a guard that over-fires
+            # fails here too.
+            {
+                "kind": "coherent_subsets",
+                "expect": [
+                    "routine:dtrsm:V1",
+                    "routine:dtrmm:V1",
+                    "routine:dsymm:V1",
+                    "regime:small:V1",
+                    "regime:medium:V1",
+                    "regime:large:V1",
+                    "instance:c7g.metal:V1",
+                    # TRSM/TRMM/SYMM carry no transpose field, so they land in the
+                    # NN bucket with the untransposed GEMM rows -- canon_trans()
+                    # defaults absent to N deliberately, and the consequence is that
+                    # NN is where three of the four families favour V1. True as
+                    # stated; the transposed GEMM rows do not qualify.
+                    "trans:NN:V1",
+                ],
+            },
+            # The whole point: 22% on three of four families is not a null.
+            {"kind": "stdout_absent", "text": "publish the negative result"},
+            {"kind": "verdict_code", "not_one_of": ["NULL"]},
+            # The MIXED line reports family weight, not row count -- a reader shown
+            # "22% of cells" would conclude the effect is marginal when it is 3 of 4
+            # families, and that sentence is what the campaign's answer to "where"
+            # rests on.
+            {"kind": "stdout_contains", "text": "of family weight"},
+            {"kind": "exit_bits_clear", "bits": [2, 4, 16]},
         ],
     )
 
@@ -2188,7 +2459,20 @@ def sc_full_routine_set():
             {"kind": "verdict_code", "one_of": ["MIXED"]},
             {
                 "kind": "coherent_subsets",
-                "expect": ["routine:dtrsm:V1", "routine:dtrmm:V1", "routine:dsymm:V1"],
+                "expect": [
+                    "routine:dtrsm:V1",
+                    "routine:dtrmm:V1",
+                    "routine:dsymm:V1",
+                    # The small regime qualifies once the majority is over families
+                    # rather than rows, and it did not before: dgemm and sgemm are one
+                    # family, so the small ladder is gemm and syrk at parity against
+                    # trsm, trmm and symm ahead -- three of five, which is the 60%
+                    # majority exactly. Medium and large also carry dgemv, daxpy and
+                    # ddot, so three of eight there, and they do not qualify. This
+                    # entry is the normalisation's visible effect on the routine set a
+                    # real host actually produces.
+                    "regime:small:V1",
+                ],
             },
             {"kind": "stdout_contains", "text": "CONSEQUENCE: the difference is routine-localised"},
             {"kind": "stdout_absent", "text": "publish the negative result"},
@@ -2629,9 +2913,12 @@ SCENARIOS = {
         sc_replicate_reproduces,
         sc_replicate_diverges,
         sc_replicate_majority,
+        sc_replicate_loss_unexplained,
         sc_replicate_same_box,
         sc_blas_sha_conflict,
         sc_incx_axis,
+        sc_transpose_shopping,
+        sc_family_swamped,
         sc_reference_arm,
         sc_reference_arm_uncensused,
         sc_sve_kernels_unknown,
@@ -2777,6 +3064,15 @@ def check_one(exp, report, stdout, exit_code, root):
             return False, f"{exp['path']} is {got!r}, not a number"
         return OPS[exp["op"]](got, exp["value"]), f"{exp['path']}={got} {exp['op']} {exp['value']}"
 
+    if kind == "json_bool":
+        # Separate from json_number because that check rejects bools on purpose:
+        # `headline_eligible: false` and `headline_eligible: 0` are the same to `==`
+        # and only one of them is the field this asserts.
+        got = dig(report, exp["path"])
+        if not isinstance(got, bool):
+            return False, f"{exp['path']} is {got!r}, not a boolean"
+        return got == exp["value"], f"{exp['path']}={got}, want {exp['value']}"
+
     if kind == "routines_covered":
         # Every routine the fixture emitted must reach the named report section.
         # Cheap, and the only assertion that fails when the analysis drops a
@@ -2830,7 +3126,11 @@ def check_one(exp, report, stdout, exit_code, root):
         )
 
     if kind == "cross_verdicts_where":
-        f = {k: v for k, v in exp.items() if k in ("regime", "routine", "mechanism", "incx", "threads")}
+        f = {
+            k: v
+            for k, v in exp.items()
+            if k in ("regime", "routine", "mechanism", "incx", "threads", "transa", "transb")
+        }
         rows, thin = comparable(cross_rows(report, **f))
         if len(rows) < exp.get("min_rows", 1):
             return False, (
@@ -3102,6 +3402,20 @@ def check_one(exp, report, stdout, exit_code, root):
             + (f" (arm contains {exp['arm_contains']!r})" if exp.get("arm_contains") else "")
             + f", want >= {want}"
         )
+
+    if kind == "cross_rows_have_trans":
+        # The structural half of the transpose claim: the cross must carry one row
+        # per transpose pair. A verdict assertion alone would pass on an analysis
+        # that collapsed the four into one and happened to land on the right side.
+        got = sorted(
+            {
+                f"{r.get('transa')}{r.get('transb')}"
+                for r in cross_rows(report)
+                if r.get("routine") == exp["routine"]
+            }
+        )
+        want = sorted(exp["values"])
+        return got == want, f"{exp['routine']} cross rows carry transposes {got}, want {want}"
 
     if kind == "cross_rows_have_incx":
         got = sorted({r.get("incx") for r in cross_rows(report) if r.get("routine") == "daxpy"})

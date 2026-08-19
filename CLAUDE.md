@@ -92,23 +92,35 @@ until it finds something.
 
 ## Spend policy
 
-Decided 2026-08-19, after costing the design as built. One clean pass across all
-five hosts is ~18.6 instance-hours and ~$96 on-demand, which is low enough to
-change the question: the right use of the next $200 is **two further independent
-passes**, not a 3× discount on the first.
+Decided 2026-08-19, after costing the design as built, and revised the same day
+once the matrix expansion on #2 was costed. **The ~$96/pass figure is retired, not
+adjusted**: it described the pre-expansion routine table, and reconciling the two
+numbers would only invite someone to compare them. One expanded pass across all
+five hosts is **30–37 instance-hours**, and three of them land at **$500–650**.
 
-- **P2 runs on spot, on `c8g.metal-48xl`.** Several iterations, throwaway data,
-  harness debugging. A reclaim costs a restart, not integrity, and the
-  iteration-count uncertainty lives here. ~$47 at four iterations, against ~$148
-  on-demand. The host is not the cheap one on purpose: `c8g` is where the central
-  cross lives, and debugging P2 anywhere else would leave the most important
-  analysis path untested until P3.
-- **P3 runs on-demand, three times.** A spot reclaim mid-sweep means arms
-  *within one host's dataset* were measured on different physical hardware — a
-  between-host variable smuggled inside what the analysis treats as one host.
-  Per-arm S3 shipping makes that data survivable, not comparable. `us-east-1a`
-  single-AZ bare metal on a new instance type is also the thinnest spot pool
-  obtainable, and `c9g.metal-48xl` capacity is already the campaign's gating risk.
+The expansion is ~4× the case count and only ~1.6–2× the wall clock, because sweep
+time is not proportional to cases: `MAX_REPS` caps the small end at microseconds
+while `MIN_REPS` floors the large end, so one `n=8192` DGEMM case costs more than a
+whole small ladder. Densify below 2048 freely; be selective above.
+
+- **Everything runs on-demand, including P2.** Spot was the earlier decision and is
+  reversed: ~$100 of saving is not worth putting untested reclaim handling on the
+  critical path, and a reclaim mid-sweep means arms *within one host's dataset* were
+  measured on different physical hardware. P2 still runs on `c8g.metal-48xl`, and
+  not on the cheap host, on purpose: `c8g` is where the central cross lives, and
+  debugging P2 anywhere else would leave the most important analysis path untested
+  until P3.
+- **Launch with truffle/spawn, not with new in-tree tooling.** Those already drive
+  AWS instances for the keel host pool, so the lifecycle path — launch, tag, wait,
+  terminate — is already exercised. Writing `scripts/launch.sh` for this campaign
+  would put an unexercised lifecycle between the spend and the data, and the three
+  P3 passes are exactly where a hand-driven or newly-written procedure drifts
+  between launches. A drift between passes is indistinguishable from the effect the
+  passes exist to test.
+- **P3 runs three times.** Per-arm S3 shipping makes a reclaimed pass's data
+  survivable, not comparable. `us-east-1a` single-AZ bare metal on a new instance
+  type is also the thinnest spot pool obtainable, and `c9g.metal-48xl` capacity is
+  already the campaign's gating risk.
 - **Three, because two passes have no breakdown point.** The median of two *is*
   the mean: one bad pass moves it, and there is no way to tell which pass was
   bad. Three passes reject one bad pass by majority. The campaign's whole output
@@ -137,15 +149,48 @@ passes**, not a 3× discount on the first.
   one directional verdict and every dissenter is non-directional. Two passes
   disagreeing in *direction* is still a divergence at any pass count: no majority
   makes a contradiction publishable.
-- Budget: P2 spot ~$47 + P3 on-demand ×3 ~$288 = **~$335**, ~$503 at 1.5×
-  contingency. `hpc7g` is on-demand-only and has no metal size, so its tenancy
-  stays inside the measurement; it gets the repeat runs and the p50/p90 spread is
-  read accordingly.
+- **A pass that loses one arm is intersected, not discarded — and says so.**
+  Sections 1–7 pool by median across passes, and equal N is required *within* a
+  comparison, not globally: each comparison is restricted to the passes carrying
+  both of its arms. Three conditions, and they are the policy, not an
+  implementation detail. (a) A 2-of-3 intersection is back at median-of-2 = mean,
+  so it carries `UNDER-REPLICATED` and cannot carry the headline. (b) Intersect
+  only where the loss is explained by a census reason; an unexplained loss stays
+  `INCONCLUSIVE`, because the missing records could have said anything and there
+  is no record of them having said nothing. (c) Every number prints its own pass
+  count (`passes=2of3`), so a partial comparison is never visually equal to a
+  complete one.
+- Budget: **$500–650** for three expanded passes across five hosts, all
+  on-demand, ~$975 at 1.5× contingency. `hpc7g` is on-demand-only and has no metal
+  size, so its tenancy stays inside the measurement; it gets the repeat runs and
+  the p50/p90 spread is read accordingly.
+
+## The matrix expansion — approved 2026-08-19, tracked on #2
+
+Denser size ladders, `transa`/`transb`, complex types, more `lda_pad` values, and
+BF16. Approved by Scott as a scope change, and it lands in this order because every
+later item degrades the verdict without the first:
+
+1. `coherent_subsets()` normalised per routine family, `transa`/`transb` in the
+   comparison key, and the pass-intersection rule — **with fixtures**. Nothing else
+   lands first. The expansion is not neutral with respect to the C11 false negative,
+   it makes it worse: every addition multiplies GEMM's cell count faster than
+   anything else's, so on raw counts an effect confined to TRSM/TRMM/SYMM would be
+   *harder* to see after the expansion than before C11 was fixed.
+2. Size ladders and `lda_pad`.  3. Transposes.  4. Complex types.
+5. BF16, as its own commit: OpenBLAS-vs-OpenBLAS only, weak-linked `sbgemm_`,
+   HWCAP-gated, its absence explained rather than bit 8, its own report section.
+
+Item 1 landed with the family normalisation, the key extension, the transpose axis
+in the coherence guard, and the intersection rule; `transpose-shopping`,
+`family-swamped`, `replicate-majority` and `replicate-loss-unexplained` are the
+fixtures, each mutation-validated.
 
 ## Ask before
 
 - Launching **any** EC2 instance.
-- Changing the size regimes or the routine set.
+- Changing the size regimes or the routine set (the #2 expansion above is already
+  approved; anything beyond it is not).
 - Altering the denominator policy in standing order 1.
 - Relaxing a verification tolerance.
 

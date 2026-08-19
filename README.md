@@ -200,8 +200,11 @@ support opposite conclusions.
   only, an effect at one stride only, a leading-dimension penalty, a dead arm, a
   mislabelled arm, an arm that never ran, an arm that ran only half its sizes, a
   lucky duplicate sample, a flattered pass, two passes that disagree, three passes
-  where two agree and the third lost its arms to a crash, all nine
-  routines with the effect on the three in the N2 gap, a reference library
+  where two agree and the third lost its arms to a crash, three passes where the
+  third lost an arm for no recorded reason, all nine
+  routines with the effect on the three in the N2 gap, the same effect on those
+  three while GEMM contributes four times the rows, an effect confined to one
+  transpose, a reference library
   that is absent either entirely or for one routine, two reference libraries
   competing to be the named one, a host whose DYNAMIC_ARCH probe never ran, a host
   with no DYNAMIC build to probe in the first place, and a
@@ -297,6 +300,34 @@ support opposite conclusions.
   instance, in either direction — carries a direction of its own. The guard is
   asserted in both directions, because a rule that could manufacture a localised
   effect out of a genuine null would be worse than the false negative it fixes.
+- **The fix by cell count is undone by the next table edit, so the counting is
+  now per routine family.** The subset guard above counted rows, which means it
+  inherits exactly the property it was written to defend against: whichever
+  routine contributes the most rows decides whether anything is coherent. The #2
+  matrix expansion makes that acute rather than theoretical — 31 sizes × 4
+  transposes × 5 pads is DGEMM growing faster than every other routine, so a
+  coherent TRSM/TRMM/SYMM effect would have been *harder* to see after the
+  expansion than before the guard existed. `coherent_subsets()` therefore weights
+  each row by `1/rows-in-its-family`: every family contributes one unit of weight
+  regardless of how long its ladder is, and `dgemm`/`sgemm` are one family, not
+  two. The `family-swamped` fixture plants the effect on TRSM/TRMM/SYMM with GEMM
+  at parity across four transposes, which is the shape the 94-vs-5 kernel gap
+  predicts and the shape raw row counting drowns.
+- **A comparison key that omits an axis lets each target shop along it.** The
+  same max-over-cell defect that size shopping produced returns for any axis the
+  key does not name, and transposes are the next one: with `transa`/`transb`
+  outside the key, NN and TN land in the same cell and each target is compared at
+  whichever transpose flatters it. They are not interchangeable in the library
+  either — NN goes through `gemm_ncopy_*` and TN through `gemm_tcopy_*`, so a
+  packing-kernel difference is *exactly* a transpose-confined difference. The key
+  is extended, and `trans` is also a subset axis, because the key alone still
+  leaves a false negative: an effect confined to one transpose is confined to no
+  routine, no regime and no instance, so it reads as a global null. The
+  `transpose-shopping` fixture plants +35% on TN alone; without the subset axis
+  the report says `NULL … publish the negative result`, with it `MIXED` and
+  `trans TN: V1 set ahead in 20/20 cells`. `canon_trans()` defaults an absent
+  field to `N`, so extending the key does not split data recorded before
+  `bench.c` emitted one.
 - **A reason recorded is not a reason reported.** Standing order 11 says every gap
   in the results carries a reason, and every gap did — in `census-*.ndjson`. The
   analysis read those reasons, used them to classify each absence, and then printed
@@ -316,9 +347,23 @@ support opposite conclusions.
   cell non-comparable, and the report then says `INCONCLUSIVE` while section 8
   shows two passes agreeing on a 22% effect. Pooled `INCONCLUSIVE` is not parity,
   and the verdict now carries a caveat saying so and pointing at the per-pass
-  verdicts. Whether sections 1–7 should instead intersect the passes available per
-  comparison is an aggregation-policy question, not a bug fix, and is Scott's call:
-  intersecting recovers the headline but changes what the pooled number means.
+  verdicts. The remaining question — whether to intersect instead of refusing —
+  was an aggregation-policy call rather than a bug fix, and it was escalated
+  rather than fixed in place. The answer: **intersect per comparison, on three
+  conditions.** Equal N is needed *within* a comparison, not globally, so each
+  cell uses the passes on which both sides ran. But an intersection down to two
+  passes is median-of-2, which is the mean, with breakdown point zero — so a
+  2-of-3 cell carries `UNDER-REPLICATED` and is barred from the headline
+  (`headline_eligible` is false unless every contributing cell is full, or the
+  verdict has no direction to over-claim). Intersecting is licensed by the loss
+  being *explained*: a pass whose missing arm has a census reason is intersected,
+  a pass whose arm is missing for no stated reason stays `INCONCLUSIVE` — absent
+  and unexplained-absent are different claims one level up, exactly as they are in
+  section 7. And the per-comparison pass count prints beside every number, so
+  `2of3` is never visually equal to `3of3`. The `replicate-majority` and
+  `replicate-loss-unexplained` fixtures hold the two branches apart; refusing
+  wholesale kills both, intersecting unconditionally kills only the second, and
+  dropping the `UNDER-REPLICATED` label kills only the first.
 - **An exit bit that fires routinely costs you the bit.** Bit 8 says the
   provenance is incomplete, which is a claim worth reading — but only if it fires
   when the evidence *should* have existed and does not. A missing DYNAMIC_ARCH
@@ -328,6 +373,18 @@ support opposite conclusions.
   routine data until nobody read the exit code. Both cases now go to section 7's
   explained-absence machinery as notes. The severity of a bit is worth less than
   its signal-to-noise.
+- **Two builds on one host collide silently, and the damage is a build that
+  succeeds.** `$GBB_PREFIX` and `$GBB_SRC` are fixed paths, so two concurrent
+  `build-libs.sh` runs share one install tree and one source tree. The failure to
+  worry about is not the one that errors — it is the run that finishes and writes a
+  manifest describing libraries the *other* run installed, which is standing order
+  10's mislabelled arm arriving via the builder. Giving each run a PID-suffixed
+  path is the wrong remedy, because `run-matrix.sh` finds libraries by name under
+  the prefix; the right one is mutual exclusion. Both scripts now take a `mkdir`
+  lock on each tree they write, `run-matrix.sh` refuses to sweep against a prefix a
+  build is holding, and every refusal names the holder's pid, host and start time
+  so a stale lock is diagnosable rather than merely annoying
+  (`GBB_FORCE_UNLOCK=1`, `GBB_IGNORE_BUILD_LOCK=1`).
 - **The alarming dispatch outcome is narrower than the above.** Generic `ARMV8`
   selected on a host that *has* SVE would mean the SVE detection itself failed;
   `NO_SVE` set at build time would mean the SVE kernels were never compiled in.
@@ -374,7 +431,16 @@ number. So passes are **compared, never pooled**: each `(instance_type,
 instance_id)` pair is analysed independently and the resulting verdict codes are
 set against each other. If they disagree in direction, that is exit bit 16 and a
 `VERDICT-CAVEAT:` line, because a headline that does not reproduce is not a
-headline.
+headline. With three passes, agreement by majority is what the third pass was
+bought for, so `REPRODUCES-MAJORITY` is reported when a majority carry one
+directional verdict and every dissenter is non-directional — but two passes
+disagreeing in *direction* is a divergence at any pass count.
+
+Sections 1–7 do pool, and they pool by **intersection per comparison**: each cell
+uses the passes on which both sides ran, prints its own pass count, and is marked
+`UNDER-REPLICATED` and barred from the headline if that count is short of the
+full set. A pass whose arm is missing without a census reason is not intersected
+away — that comparison is `INCONCLUSIVE`. See the hazard note on one lost arm.
 
 The `DECISION` block is **computed, not a guide to be read against**. It emits
 exactly one machine-greppable `VERDICT:` line, so `gates/p4.sh` can assert on it
