@@ -152,33 +152,78 @@ change can be compared.
   independent questions get four answers instead of stopping at the first no.
   `gate-p0` requires both jobs, since its bar is "CI green on a clean clone".
 
-- **`tests/sve-probe-assert.sh`'s own fixture was a race, and unmasking the `shell`
-  job is what revealed it.** The suite's central claim is that its fixture still
-  reproduces the SIGPIPE bug — it asserts the *old* `nm | grep -q` form returns `no`,
-  precisely so that section 3 cannot pass against a broken implementation. That
-  assertion needs `nm` to still be writing when `grep -q` exits, and the fixture was
-  6×500 short-named symbols: about **93 KB of `nm` output against a 64 KiB pipe
-  buffer**. `grep`'s first read drains the whole buffer, and if `nm` can write the
-  remaining ~29 KB *during* that scan it exits 0, there is no SIGPIPE, and the old
-  form returns `yes`. So the fixture reproduced the bug on the dev host and not on
-  x86 CI — the suite was green here and red there, on identical code.
+- **`tests/sve-probe-assert.sh` could not reproduce the bug it exists to guard, on
+  CI, because SIGPIPE is ignored there — and unmasking the `shell` job is what
+  revealed it.** The suite's central claim is that its fixture still reproduces the
+  SIGPIPE bug: it asserts the *old* `nm | grep -q` form returns `no`, precisely so
+  that section 3 cannot pass against a broken implementation. On the x86 runner it
+  returned `yes`.
 
-  The earlier note in the file that "a 60 KB fixture reproduced the bug fine" was
-  **recording luck as evidence**, and it is quoted in the source now rather than
-  deleted, because it is the reasoning that shipped the race: outlasting `grep`'s
-  first match is exactly what a size comparable to the buffer cannot guarantee.
-  Margin is now measured in **multiples of the buffer, not kilobytes** — 8×1500
-  symbols with 64-character padded names is **12,038 symbols / 1,152 KB, over 20×**,
-  and the whole suite still runs in ~1.1 s.
+  **The bug needs `nm` to be KILLED by SIGPIPE.** If SIGPIPE is ignored, `nm`'s write
+  returns `EPIPE` instead, `nm` exits 0, the pipeline succeeds, and the old form
+  returns `yes` — at *any* fixture size. And a signal's disposition is inherited
+  across `fork` and `exec`, so whether this suite can reproduce the bug depends on
+  **who launched it**: GitHub Actions runs each step from a Node.js process, and Node
+  sets SIGPIPE to `SIG_IGN`. Measured on aarch64 Linux, same fixture, same bytes:
 
-  Two **deterministic** assertions now sit alongside the inherently racy one, so that
-  a fixture which stops reproducing the bug says *which* property it lost: the first
-  matching symbol is within the first tenth of `nm`'s lines (so `grep -q` really does
-  exit early), and the output exceeds 8× a 64 KiB buffer (so `nm` cannot drain inside
-  one scan). Writing them promptly reproduced the original defect in miniature —
+  | parent | `/proc/self/status` `SigIgn` | `PIPESTATUS` | status | probe answers |
+  |---|---|---|---|---|
+  | interactive bash | `0000000000000000` | `141 0` | 141 | `no` — bug reproduces |
+  | SIGPIPE ignored | `0000000001001000` (bit 13) | `0 0` | 0 | `yes` — **cannot reproduce** |
+
+  The suite now **measures that precondition and restores it**: a `yes | head -1`
+  probe reads `PIPESTATUS[0]`, and if it is not 141 the suite re-execs itself once
+  through `python3` with `SIGPIPE` set to `SIG_DFL` — which survives `exec`, whereas
+  `SIG_IGN` is what persists by default and is the whole problem. If it cannot be
+  restored the suite **FAILS loudly**; it never skips, because a skip here is exactly
+  the vacuous pass the file exists to prevent. Verified 13/13 under both dispositions,
+  and mutation-validated by suppressing the re-exec under an ignored SIGPIPE: the
+  guard fires, exits 1, and reports the observed producer status of 1 rather than 141,
+  which is the `EPIPE` path confirming the mechanism.
+
+  **This was first misdiagnosed as a fixture-size race, and the wrong diagnosis is
+  recorded rather than quietly replaced.** The story was that 6×500 short-named
+  symbols gave ~93 KB of `nm` output against a 64 KiB pipe buffer, so `nm` could
+  finish during `grep`'s first scan; it fit the platform split exactly and it was
+  wrong. Enlarging the fixture 12× to **1,152 KB** left x86 CI failing with *both*
+  size preconditions passing and a byte count identical to the host where it passed.
+  Size was never the variable. The falsification is the reason the two deterministic
+  size assertions are **kept**: the first matching symbol is within the first tenth of
+  `nm`'s lines, and the output exceeds 8× a 64 KiB buffer. A precondition that can be
+  checked separately is what lets "the fixture degraded" be told apart from "the
+  environment differs" — which is how the size hypothesis was killed rather than
+  argued about. The enlargement is kept on its own merits (93 KB against 64 KiB is a
+  thin margin, and margin costs ~1 s), explicitly *not* as the fix.
+
+  Writing those assertions reproduced the original defect in miniature:
   `nm | grep -nE -m1 | cut` under the suite's own `pipefail` killed the suite on the
-  measurement line — so `nm`'s output is captured to a file once and every count is
-  taken from there, which is the same fix the probe itself got. 12/12.
+  measurement line. `nm`'s output is now captured to a file once and every count taken
+  from there — the same fix the probe itself got.
+
+- **Two more live instances of that defect class, found by auditing for it.** Neither
+  is a measurement bug; both are environment-dependent failures on paths that have to
+  behave identically across five hosts and three passes.
+  - `install-armpl.sh` located the installer and the licence text with
+    `find … | head -1` under `set -euo pipefail`. `head` exits after one line, `find`
+    is killed by SIGPIPE on its next write, `pipefail` reports 141, the command
+    substitution fails, and `set -e` **aborts the install with no message,
+    immediately after a ~1 GB download and extraction** — but only when `find` still
+    had output buffered *and* SIGPIPE is deliverable, so it would fail on an
+    interactive host and succeed under a parent that ignores SIGPIPE. Now
+    `find … -print -quit`, which stops `find` itself: no pipe, no early-exit
+    consumer, and the exit status means what it appears to mean. The adjacent
+    `[ -n "$LICENCE" ] && log …` is now an `if` — checked rather than assumed, since
+    bash's `set -e` *exempts* a non-final element of an `&&` list and the old form
+    did **not** abort; it is changed because it leaves a non-zero status behind.
+  - `bootstrap-github.sh` tested for existing labels, umbrella issues and the project
+    board with `gh … | grep -q`. A SIGPIPE-killed `gh` reports 141, so an **existing**
+    label reads as absent and the script tries to create it — silently inverting the
+    idempotency this file's own comments claim. All three now capture first and match
+    a `printf`, whose small builtin write cannot induce SIGPIPE in its producer.
+
+  `gates/p2.sh`'s `grep … | head -6 | sed` is the same shape and was left alone
+  deliberately: the script has no `-e`, and the pipeline's status is discarded because
+  it is a diagnostic print, so a 141 there changes nothing.
 
 - Tree-wide `shellcheck --severity=warning` is clean, which the `shell` job has
   been failing on: five `cd` without `|| exit` (these scripts run `set -uo

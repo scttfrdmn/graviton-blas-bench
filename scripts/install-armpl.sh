@@ -201,10 +201,29 @@ fi
 WORK="$CACHE/extract"
 rm -rf "$WORK"; mkdir -p "$WORK"
 tar xf "$TARBALL" -C "$WORK"
-INSTALLER="$(find "$WORK" -maxdepth 2 -name "${BASE}.sh" -type f | head -1)"
+# `-print -quit`, NOT `| head -1`. These two lines were `find ... | head -1` under
+# this script's `set -euo pipefail`, which is the defect class that made
+# build-libs.sh's SVE probe a constant function: `head` exits after one line, `find`
+# is killed by SIGPIPE on its next write, pipefail reports 141, and the command
+# substitution fails -- so `set -e` would abort the script here, without a message,
+# immediately after a ~1 GB download and extraction. Whether it aborts depends on
+# whether `find` still had output buffered when `head` exited AND on whether SIGPIPE
+# is deliverable in the launching environment, which is inherited (a Node or Go
+# parent that ignores SIGPIPE makes the same line succeed). A failure mode that
+# depends on who invoked the script is the last thing wanted on the path that has to
+# behave identically on five hosts across three passes.
+#
+# `-print -quit` makes `find` stop after the first match by itself: no pipe, no
+# early-exit consumer, and the exit status means what it appears to mean.
+INSTALLER="$(find "$WORK" -maxdepth 2 -name "${BASE}.sh" -type f -print -quit)"
 [ -n "$INSTALLER" ] || die "no ${BASE}.sh inside the tarball; its layout has changed"
-LICENCE="$(find "$WORK" -maxdepth 3 -name 'license_agreement.txt' -type f | head -1)"
-[ -n "$LICENCE" ] && log "licence text: $LICENCE"
+LICENCE="$(find "$WORK" -maxdepth 3 -name 'license_agreement.txt' -type f -print -quit)"
+# `if`, not `[ -n ... ] && log`. Checked rather than assumed: bash's `set -e` exempts
+# a non-final element of an && list, so the old form did NOT abort on an absent
+# licence file -- it is written as an `if` because the && form leaves a non-zero
+# status behind, which becomes the script's exit status wherever it lands last, and
+# the licence text is a courtesy log line rather than a gate.
+if [ -n "$LICENCE" ]; then log "licence text: $LICENCE"; fi
 
 SUDO=""
 if [ ! -w "$(dirname "$INSTALL_TO")" ] && [ "$(id -u)" -ne 0 ]; then

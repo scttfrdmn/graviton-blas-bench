@@ -64,7 +64,14 @@ for spec in "${LABELS[@]}"; do
   IFS='|' read -r lname lcolour ldesc <<<"$spec"
   # cut+grep -xF, not `grep -P`: BSD grep has no -P, so on macOS the guard
   # errored out and the "idempotent" claim held only on Linux.
-  if gh label list --repo "$REPO" --limit 200 2>/dev/null | cut -f1 | grep -qxF "$lname"; then
+  # Captured first, not piped into `grep -q`. `grep -q` exits on its first match and
+  # `gh` is then killed by SIGPIPE, which under this script's `pipefail` reports 141 --
+  # so an EXISTING label reads as absent and the script tries to create it. Same
+  # defect class as build-libs.sh's SVE probe, and here it silently inverts the
+  # idempotency this file's own comments claim. `printf` is a builtin writing a small
+  # buffer, so the pipeline below cannot induce SIGPIPE in its producer.
+  existing_labels="$(gh label list --repo "$REPO" --limit 200 2>/dev/null | cut -f1 || true)"
+  if printf '%s\n' "$existing_labels" | grep -qxF "$lname"; then
     log "label '$lname' exists"
   else
     log "creating label '$lname'"
@@ -141,8 +148,11 @@ Gate evidence required: the report states a clear answer to \"is the N2 gap wort
 
 for m in P0 P1 P2 P3 P4; do
   TITLE="$m umbrella: ${MILESTONES[$m]%% —*}"
-  if gh issue list --repo "$REPO" --state all --limit 200 --search "\"$m umbrella\" in:title" \
-       --json title --jq '.[].title' 2>/dev/null | grep -q "$m umbrella"; then
+  # Captured before matching -- see the label loop above for why `| grep -q` inverts
+  # this check when the producer is killed by SIGPIPE.
+  existing_titles="$(gh issue list --repo "$REPO" --state all --limit 200 \
+       --search "\"$m umbrella\" in:title" --json title --jq '.[].title' 2>/dev/null || true)"
+  if printf '%s\n' "$existing_titles" | grep -q "$m umbrella"; then
     log "umbrella issue for $m exists"
   else
     log "creating umbrella issue for $m"
@@ -157,8 +167,9 @@ for m in P0 P1 P2 P3 P4; do
 done
 
 # ---- project board --------------------------------------------------------
-if gh project list --owner "$OWNER" --format json 2>/dev/null \
-     | grep -q '"title":"graviton-blas-bench"'; then
+# Captured before matching -- see the label loop above.
+existing_projects="$(gh project list --owner "$OWNER" --format json 2>/dev/null || true)"
+if printf '%s\n' "$existing_projects" | grep -q '"title":"graviton-blas-bench"'; then
   log "project board exists"
 else
   log "creating project board"

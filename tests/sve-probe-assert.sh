@@ -21,21 +21,83 @@
 # a suite and not a comment: standing order 8 is the one condition CLAUDE.md says
 # outweighs every other question in the repo, and its trigger had no test.
 #
-# TWO PROPERTIES THIS SUITE HOLDS ITSELF TO
+# THREE PROPERTIES THIS SUITE HOLDS ITSELF TO
 #
 #   1. It runs under `set -euo pipefail`, because a bare `bash test.sh` does NOT
 #      inherit pipefail and the bug is invisible without it. Forty standalone runs
 #      of the broken function returned `yes` during the investigation, which is
 #      precisely how it survived review.
-#   2. It proves its own fixture is adequate. A pipeline only induces SIGPIPE if
+#   2. SIGPIPE must be DELIVERABLE, and that is a property of the environment, not
+#      of this file -- see the next block. It is measured and, if absent, restored.
+#   3. It proves its own fixture is adequate. A pipeline only induces SIGPIPE if
 #      the producer is still writing when the consumer exits, so an archive whose
-#      whole nm output fits in the 64 KiB pipe buffer would let the OLD form
-#      return `yes` and this suite would pass against the bug. So the suite
-#      asserts the old form returns `no` on this fixture. If that assertion fails,
-#      the fixture is too small -- and the suite FAILS and says so rather than
-#      reporting a green it did not earn.
+#      whole nm output fits in the pipe buffer would let the OLD form return `yes`
+#      and this suite would pass against the bug. So the suite asserts the old form
+#      returns `no` on this fixture. If that assertion fails, the suite FAILS and
+#      says so rather than reporting a green it did not earn.
 
 set -euo pipefail
+
+# ---- SIGPIPE has to be deliverable, or section 2 cannot ask its question ----
+#
+# The bug under test is `nm | grep -q` reporting 141 because grep exits first and
+# nm is KILLED BY SIGPIPE. If SIGPIPE is ignored, nm's write returns EPIPE
+# instead, nm exits 0, the pipeline succeeds, and the old form returns `yes` --
+# so the fixture cannot reproduce the bug at ANY size.
+#
+# And SIGPIPE's disposition is inherited across fork and exec, so whether this
+# suite can reproduce the bug depends on WHO LAUNCHED IT. GitHub Actions runs each
+# step from a Node.js process, and Node sets SIGPIPE to SIG_IGN; every child
+# inherits it. Measured on aarch64 Linux, same fixture, same bytes:
+#
+#   parent               /proc/self/status SigIgn   PIPESTATUS   status  answer
+#   interactive bash     0000000000000000           141 0        141     no  (bug reproduces)
+#   SIGPIPE ignored      0000000001001000 (bit 13)  0 0          0       yes (cannot reproduce)
+#
+# This was first misdiagnosed as a fixture-size race -- 93 KB of nm output against
+# a 64 KiB pipe buffer, so nm could finish during grep's scan. That story was
+# plausible, matched the platform split, and was WRONG: enlarging the fixture 12x
+# to 1,152 KB left x86 CI failing with the two size preconditions below both
+# passing and the byte count identical to the host where it passes. Size was never
+# the variable. The lesson is the one this suite already encodes for the probe --
+# measure the precondition instead of arguing about it -- applied to the suite
+# itself, one level up.
+#
+# So: measure it, restore it via a one-shot re-exec, and FAIL loudly if it cannot
+# be restored. Never skip -- a skip here is the vacuous pass this whole file exists
+# to prevent.
+sigpipe_producer_status() {
+  # `yes` writes forever; `head -1` exits after one line. With SIGPIPE at its
+  # default disposition the producer is killed and bash reports 141; with SIGPIPE
+  # ignored, `yes` gets EPIPE and exits on its own. Run in a subshell so turning
+  # pipefail off to read PIPESTATUS cannot leak into the suite.
+  ( set +o pipefail
+    yes 2>/dev/null | head -1 >/dev/null 2>&1
+    printf '%s' "${PIPESTATUS[0]}" )
+}
+SIGPIPE_STATUS="$(sigpipe_producer_status)"
+if [ "$SIGPIPE_STATUS" != 141 ]; then
+  if [ "${GBB_SIGPIPE_REEXEC:-0}" = 1 ]; then
+    printf 'FAIL: SIGPIPE is still not deliverable after re-exec (producer exited %s,\n' \
+      "$SIGPIPE_STATUS" >&2
+    printf '      expected 141). Section 2 cannot reproduce the bug in this environment,\n' >&2
+    printf '      so every assertion below would pass vacuously. Refusing to report a\n' >&2
+    printf '      green this suite has not earned.\n' >&2
+    exit 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'FAIL: SIGPIPE is ignored in this environment (producer exited %s, not 141)\n' \
+      "$SIGPIPE_STATUS" >&2
+    printf '      and there is no python3 to restore it. A shell cannot reset a signal\n' >&2
+    printf '      that was ignored on entry, so this is not fixable from inside bash.\n' >&2
+    exit 1
+  fi
+  # python3 is used only to set SIG_DFL and exec; SIG_DFL survives exec, whereas
+  # SIG_IGN is what persists by default and is the whole problem.
+  exec env GBB_SIGPIPE_REEXEC=1 python3 -c 'import signal, os, sys
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])' bash "$0" "$@"
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/scripts/build-libs.sh"
@@ -66,6 +128,13 @@ if [ ! -s "$FN" ]; then
   exit 1
 fi
 ok "extracted sve_kernels() from scripts/build-libs.sh ($(wc -l <"$FN" | tr -d ' ') lines)"
+# Asserted, not assumed, and asserted AFTER any re-exec so it describes the
+# environment the rest of the suite actually runs in.
+if [ "$(sigpipe_producer_status)" = 141 ]; then
+  ok "SIGPIPE is deliverable to pipeline producers${GBB_SIGPIPE_REEXEC:+ (restored by re-exec)}"
+else
+  bad "SIGPIPE is not deliverable, so section 2 cannot reproduce the bug"
+fi
 
 # sve_kernels() calls log(); build-libs.sh sends it to stderr and so must we, or
 # the log lines would be captured as part of the probe's answer.
@@ -111,20 +180,25 @@ mkfixture() {   # mkfixture <dir> <with-sve: yes|no>
   # leaves nm still writing. Names deliberately free of `sve_`, `_sve` and
   # `ARMV8SVE`.
   #
-  # THE SIZE IS NOT ARBITRARY AND "past the pipe buffer" IS NOT ENOUGH. This started
-  # at 6x500 short-named symbols -- about 93 KB of nm output against a 64 KiB pipe
-  # buffer -- and section 2 failed it on x86 CI while passing on the dev host. The
-  # margin was the whole problem: grep's first read drains the full 64 KiB, and while
-  # grep is still scanning that block for a match, nm writes the remaining ~29 KB and
-  # exits 0. No SIGPIPE, so the old form returns `yes` and the fixture stops
-  # reproducing the bug. It is a race, so it was never reliably reproducing it -- it
-  # won on one platform and lost on another, and the earlier note in section 1 that
-  # "a 60 KB fixture reproduced the bug fine" was recording luck as evidence.
+  # THE SIZE IS PRECAUTIONARY, AND IT IS NOT WHAT FIXED CI. Being explicit because
+  # the history here is a wrong diagnosis followed by a real one.
   #
-  # The fix is margin measured in multiples, not in kilobytes: names are padded so
-  # each nm line is long, which buys bytes far more cheaply than more symbols buys
-  # compile time. ~12k symbols at ~100 bytes a line is ~1.4 MB, more than 20x the
-  # buffer, so nm cannot possibly finish inside one of grep's scans.
+  # This started at 6x500 short-named symbols, ~93 KB of nm output against a 64 KiB
+  # pipe buffer, and section 2 failed on x86 CI while passing on the dev host. The
+  # thin margin looked like the cause: grep's first read drains the full buffer, and
+  # if nm can write the remaining ~29 KB during grep's scan it exits 0, so no SIGPIPE
+  # and the old form returns `yes`. That story fit the platform split exactly. It was
+  # still wrong -- enlarging to 1,152 KB (over 20x the buffer) left x86 CI failing
+  # with both size preconditions below passing and a byte count identical to the host
+  # where it passed. The real cause was the inherited SIGPIPE disposition; see the
+  # block at the top of the file.
+  #
+  # The enlargement is KEPT, on its own merits rather than as the fix: 93 KB against
+  # 64 KiB is a thin margin for an argument that depends on the producer still being
+  # mid-write, and buying margin costs ~1 s. Names are padded so each nm line is
+  # long, which buys bytes far more cheaply than more symbols buys compile time.
+  # ~12k symbols at ~100 bytes a line is ~1.15 MB. What must NOT be carried forward
+  # is the belief that this is what made CI green.
   local pad=________________________________________________________________
   for i in 1 2 3 4 5 6 7 8; do
     seq 1 1500 | awk -v b="$i" -v p="$pad" \
@@ -150,23 +224,17 @@ NMATCH=$(grep -cE '(ARMV8SVE|_sve|sve_)' "$TMP/with.nm" || true)
 ok "with-SVE archive: $NSYM defined symbols, $NBYTES bytes of nm output, $NMATCH matching"
 # The two halves of the SIGPIPE window, asserted separately from section 2's
 # end-to-end reproduction so that a fixture which stops reproducing the bug says
-# WHICH property it lost instead of only that it lost one. Section 2 is a race by
-# nature -- it depends on grep and nm interleaving -- and these two are not, so they
-# are what keeps section 2 from being flaky rather than merely lucky.
+# WHICH property it lost instead of only that it lost one:
 #   (a) the match is early, so grep -q exits with most of the output unwritten;
 #   (b) there is far more output than one pipe buffer, so nm cannot drain to
-#       completion inside a single one of grep's scans. 93 KB against a 64 KiB
-#       buffer did exactly that and cost this suite a red on CI and a green here.
-#
-# An earlier note here called the byte count "informational, NOT an assertion",
-# on the grounds that nm's output "only has to outlast grep's first match rather
-# than exceed any particular size -- a 60 KB fixture reproduced the bug fine."
-# That reasoning is why this suite shipped a race. The first clause is true and the
-# conclusion does not follow: outlasting grep's first match is exactly what a size
-# comparable to the buffer cannot guarantee, and "reproduced the bug fine" was one
-# platform's scheduler, not a property of the fixture. The buffer is 64 KiB on
-# Linux and starts smaller on macOS, so the bound below is conservative on the
-# platform that matters and slack on the other.
+#       completion inside a single one of grep's scans.
+# Both are cheap and deterministic, and both PASSED on the CI runner where section 2
+# failed -- which is how the size hypothesis was falsified rather than argued about,
+# and the reason to keep them: a precondition that can be checked separately is what
+# lets you tell "the fixture degraded" from "the environment differs". The third
+# precondition, and the one that was actually absent, is asserted at the top of
+# section 1. The buffer is 64 KiB on Linux and starts smaller on macOS, so the bound
+# below is conservative on the platform that matters and slack on the other.
 FIRST=$(grep -nE -m1 '(ARMV8SVE|_sve|sve_)' "$TMP/with.nm" | cut -d: -f1)
 if [ "${FIRST:-0}" -gt 0 ] && [ "$FIRST" -lt $((NSYM / 10)) ]; then
   ok "first matching symbol is at line $FIRST of $NSYM -- grep -q exits early (the SIGPIPE window)"
