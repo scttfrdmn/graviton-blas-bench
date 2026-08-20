@@ -331,8 +331,9 @@ class Arm:
     # "some sizes absent" on a merged cell rather than as a whole missing transpose.
     omit_trans: tuple = ()
     # Routines this arm produced no record for at all. The reference arm's version
-    # of omit_sizes, and the only way to reach section 1's per-arm "NO DATA --
-    # reference arm absent" branch: a reference library that ran but has no kernel
+    # of omit_sizes, and the only way to reach section 1's per-arm "NO DATA -- this
+    # host's reference arm produced nothing here" branch: a reference library that
+    # ran but has no kernel
     # for one routine is the ordinary case (ArmPL and netlib do not cover the same
     # set), and until this existed that branch was unreachable from any fixture.
     omit_routines: tuple = ()
@@ -3236,6 +3237,282 @@ def sc_manifest_shapes():
     )
 
 
+def sc_reference_regime_flip():
+    """Two reference candidates whose coverage disagrees BETWEEN regimes, which is
+    how a per-group reference choice flips inside one comparison.
+
+    The defect this is the regression test for: section 1 used to choose its
+    reference arm per comparison group, by cell count. The group key contains the
+    regime, so the arm with more cells in the small regime could differ from the arm
+    with more cells in the large regime, and section 1 would then measure the small
+    rows against one reference and the large rows against another -- with nothing in
+    either row looking wrong.
+
+    That is a count-derived SELECTION feeding a count-derived CONSEQUENCE, and the
+    consequence is section 9's "deficit concentrated in the small regime", which is a
+    decision-guide output: it is the sentence that says which kernels to fix. Section
+    4a keys on reference_arm (it has to -- rows measured against different references
+    are not one profile), so a flip splits the profile in two, `small_minus_large`
+    becomes None in both halves, and the whole thing presents as `MISSING:large` /
+    `MISSING:small` rather than as an error. A reader sees thin coverage, not a
+    reference that moved under them.
+
+    So the planted shape: armpl is missing two SMALL sizes and blis is missing three
+    medium plus two large ones. Per group that is a flip -- blis covers small better,
+    armpl covers medium and large better. Per host, armpl covers more conditions in
+    total, so it is chosen everywhere and every regime of every profile is measured
+    against the same library.
+
+    ARMPL WINNING IS THE LOAD-BEARING PART, and it is why the coverage is planted in
+    this direction rather than the other: the tie-break after coverage and conditions
+    is `arm_label`, and `max()` on labels prefers "blis/auto/unforced" over
+    "armpl/native/unforced". A fixture in which the conditions-winner and the
+    alphabet-winner were the same arm would pass just as well against a selector that
+    read only the alphabet.
+
+    The deficit is planted small-concentrated (15% small, 0% large) so that section
+    9's consequence has something to say, and the two kernel sets are at parity so
+    that nothing else in the report competes for the verdict."""
+    small_led = {"small": 0.85, "medium": 0.95, "large": 1.0}
+    arms = _arms(v1_gain=small_led, v2_gain=small_led)
+    for a in arms:
+        if a.library == "armpl":
+            # Two of sixteen small sizes: enough to lose the small groups on count,
+            # not enough to lose the group entirely (it must stay PRESENT everywhere,
+            # or breadth-of-coverage would decide the choice and the conditions
+            # tie-break -- the thing under test -- would never be reached).
+            a.omit_sizes = (8, 16)
+    arms.append(
+        Arm(
+            "blis",
+            "auto",
+            "unforced",
+            # Three medium and the two smallest large rungs. At one thread the large
+            # ladder is capped at 4096, so this leaves blis exactly one large size
+            # there: still present, comfortably outcounted.
+            omit_sizes=(320, 384, 448, 2048, 3072),
+        )
+    )
+    return Scenario(
+        name="reference-regime-flip",
+        description=(
+            "Two reference candidates, armpl thinner in small and blis thinner in "
+            "medium+large. A per-group reference choice flips between regimes and nulls "
+            "section 4a's small-large gap; the per-host choice must name armpl in every "
+            "regime and keep the gap computable."
+        ),
+        hosts=[_host()],
+        arms=arms,
+        expect=[
+            # The invariant, asserted at host scope: ONE reference arm across every
+            # section-1 row on this instance, and it is the conditions-winner rather
+            # than the alphabet-winner.
+            {
+                "kind": "deficit_reference_invariant",
+                "instance": "c7g.metal",
+                "arm": "armpl/native/unforced",
+                "min_rows": 24,
+            },
+            {"kind": "stdout_contains", "text": "chosen ONCE for this host"},
+            {"kind": "stdout_contains", "text": "not chosen: blis/auto/unforced"},
+            # The consequence the flip used to break, on the slice the design fills in
+            # every regime: dgemm at pad 0 and NN. Every profile there carries all
+            # three regimes and a computable small-large gap at the planted magnitude.
+            # Under a per-group reference these rows split in two and both halves go
+            # to MISSING, which is what `complete` refuses.
+            {
+                "kind": "regime_gap_deficit",
+                "routine": "dgemm",
+                "lda_pad": 0,
+                "transa": "N",
+                "transb": "N",
+                "op": ">=",
+                "value": 0.10,
+                "min_rows": 8,
+                "complete": True,
+            },
+            {
+                "kind": "regime_gap_deficit",
+                "routine": "dgemm",
+                "lda_pad": 0,
+                "transa": "N",
+                "transb": "N",
+                "op": "<=",
+                "value": 0.20,
+                "min_rows": 8,
+            },
+            {"kind": "stdout_contains", "text": "deficit concentrated in the small regime"},
+            # The planted deficit reaches section 1 on the arm the wheels ship, and
+            # the kernel sets stay at parity so nothing competes for the verdict.
+            {"kind": "deficit_shipped", "min_rows": 12},
+            {"kind": "cross_verdicts_all", "expect": "parity", "min_rows": 12},
+            {"kind": "verdict_code", "one_of": ["NULL"]},
+            # The thinned coverage is PARTIAL, not a hole: both references ran every
+            # cell they appear in and produced some of its sizes, which is what
+            # omit_sizes models. Zero MISSING-UNEXPLAINED is the load-bearing half --
+            # a fixture that planted the flip by making a reference vanish from whole
+            # cells would be testing the coverage census instead. 52 = armpl's 20 thin
+            # small cells + blis's 22 medium and 10 large, and it moves with the pad
+            # and transpose axes, which is why it is asserted rather than described.
+            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "coverage.partial", "op": "==", "value": 52},
+            {"kind": "exit_bits_set", "bits": [4]},
+            {"kind": "exit_bits_clear", "bits": [2, 8, 16]},
+        ],
+    )
+
+
+def sc_denominator_intersection():
+    """The per-rung max sits above the common-size set, so the two denominator
+    policies give different numbers and the fixture can tell them apart.
+
+    Standing order 1's denominator is the best large dgemm on the host at that
+    thread count. bench.c caps the large ladder at n=4096 below 8 threads, so the
+    1-thread ladder has three rungs and the 64-thread ladder has five: a per-rung max
+    would divide 1-thread efficiency by a ceiling drawn from one ladder and 64-thread
+    efficiency by a ceiling drawn from another. Those are not the same quantity, and
+    section 6 puts them in adjacent rows.
+
+    The policy is therefore the max over the sizes this host ran at EVERY thread
+    count. Here the reference arm is 8% faster at 6144 and 8192 -- deterministically,
+    by size rather than by regime, so the winning rung cannot move with the noise
+    key -- which puts the unrestricted max at n=8192 and the restricted one at n=4096.
+    A revert to per-rung maxima moves `best_dgemm_m` from 4096 to 8192 at 64 threads,
+    which is asserted, and it also silently raises that row's ceiling by ~8% while
+    leaving the 1-thread row alone, which is the harm.
+
+    peak_factor is 1.0 so that the headroom cross-check is quiet: the restriction
+    raises `peak_fma / best_dgemm` by construction (the ratio's denominator got
+    smaller), and that direction is deliberate -- standing order 1's flag should fire
+    on the published ceiling, not on a ceiling nothing divides by -- but it is a
+    different claim from this one and `headroom` has its own scenario."""
+    arms = _arms(v1_gain=flat(1.0), v2_gain=flat(1.0))
+    for a in arms:
+        if a.library == "armpl":
+            a.gain_sizes = {6144: 1.08, 8192: 1.08}
+    return Scenario(
+        name="denominator-intersection",
+        description=(
+            "An arm 8% faster at n=6144/8192, which the 1-thread ladder does not reach. "
+            "Standing order 1's denominator must come from the sizes common to both "
+            "thread points (n=4096), not from each thread point's own best rung."
+        ),
+        hosts=[_host(peak_factor=1.0)],
+        arms=arms,
+        expect=[
+            # 64 threads: five rungs available, three shared, and the denominator is
+            # the best of the three -- not the 8192 rung that only this thread point
+            # has. The unrestricted max is kept as provenance and must still name 8192.
+            {
+                "kind": "scaling_denominator",
+                "instance": "c7g.metal",
+                "threads": 64,
+                "basis": "common",
+                "best_m": 4096,
+                "common_sizes": [2048, 3072, 4096],
+                "unrestricted_m": 8192,
+                "op": ">=",
+                "value": 0.05,
+            },
+            # 1 thread: the ladder IS the common set, so the restriction costs exactly
+            # nothing and the second line must not print. Asserted as == 0 rather than
+            # "small": a policy that restricted only some rows would show up here.
+            {
+                "kind": "scaling_denominator",
+                "instance": "c7g.metal",
+                "threads": 1,
+                "basis": "common",
+                "best_m": 4096,
+                "common_sizes": [2048, 3072, 4096],
+                "op": "==",
+                "value": 0.0,
+            },
+            {"kind": "stdout_contains", "text": "not used: that size is absent at some thread point"},
+            {"kind": "stdout_contains", "text": "at n=4096 of 5 size(s)"},
+            {"kind": "stdout_contains", "text": "at n=4096 of 3 size(s)"},
+            # Both failure flags stay down: the intersection is non-empty, so nothing
+            # fell back, and peak_factor keeps the cross-check inside its threshold.
+            {"kind": "anomaly_kind_absent", "kind_name": "denominator_not_comparable"},
+            {"kind": "anomaly_kind_absent", "kind_name": "headroom"},
+            {"kind": "verdict_code", "one_of": ["NULL"]},
+            # Nothing is missing here -- the restriction is policy operating on a
+            # complete dataset, and it must not read as a coverage problem.
+            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "coverage.partial", "op": "==", "value": 0},
+            {"kind": "exit_bits_clear", "bits": [2, 4, 8, 16]},
+        ],
+    )
+
+
+def sc_denominator_thread_point_dark():
+    """A thread point with NO large dgemm at all must drop out of the intersection,
+    not empty it.
+
+    The intersection is over the thread points that HAVE large dgemm. Without that
+    filter, one thread point missing the whole regime contributes an empty set, the
+    intersection is empty for the entire host, and every other thread point's
+    denominator falls back to its own per-rung max -- so one missing rung would
+    silently un-comparable the rows that were fine. That is the opposite of what the
+    restriction is for, and it presents as a section-5 anomaly on rows whose data is
+    complete.
+
+    Planted by removing dgemm's three cheapest large rungs from every arm. At one
+    thread the cap has already removed 6144 and 8192, so that thread point has no
+    large dgemm whatsoever; at 64 threads it has 6144 and 8192 and they are shared
+    with nothing, so they are the whole common set. The 1-thread row then carries no
+    denominator of its own -- which is the honest answer, and is reported where it
+    happens rather than propagated -- while the 64-thread row stays `common`.
+
+    The removal is per routine, not per size across the board, so the other large
+    ladders are intact and the loss is confined to the one the denominator reads."""
+    arms = _arms(v1_gain=flat(1.0), v2_gain=flat(1.0))
+    for a in arms:
+        a.omit_routine_sizes = {"dgemm": (2048, 3072, 4096)}
+    return Scenario(
+        name="denominator-thread-point-dark",
+        description=(
+            "No large dgemm at 1 thread at all (the cap took 6144/8192, the fixture took "
+            "the rest). That thread point must drop out of the intersection rather than "
+            "empty it, leaving the 64-thread denominator comparable and the 1-thread row "
+            "explicitly without one."
+        ),
+        hosts=[_host()],
+        arms=arms,
+        expect=[
+            {
+                "kind": "scaling_denominator",
+                "instance": "c7g.metal",
+                "threads": 64,
+                "basis": "common",
+                "best_m": 8192,
+                "common_sizes": [6144, 8192],
+                "op": "==",
+                "value": 0.0,
+            },
+            {
+                "kind": "scaling_denominator",
+                "instance": "c7g.metal",
+                "threads": 1,
+                "basis": "absent",
+                "best_m": None,
+            },
+            # The mutation kill: drop the "thread points that HAVE large dgemm" filter
+            # and the 64-thread row goes to per-rung-fallback and raises this.
+            {"kind": "anomaly_kind_absent", "kind_name": "denominator_not_comparable"},
+            {"kind": "stdout_contains", "text": "best_large_dgemm=absent"},
+            # The omission is invisible to the coverage census at 1 thread and that is
+            # correct: no arm measured dgemm's small large rungs there, so the census
+            # -- which derives its expectation from what some arm did measure -- has no
+            # cell to call missing. It is asserted so that the fixture cannot be read
+            # as "the census caught this"; the intersection filter is the only thing
+            # standing between the dark thread point and every other row's denominator.
+            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "coverage.partial", "op": "==", "value": 0},
+            {"kind": "exit_bits_clear", "bits": [2, 4, 8, 16]},
+        ],
+    )
+
+
 def sc_probe_unavailable():
     """`capture-env.sh` could not run the DYNAMIC_ARCH probe, so nobody knows what
     the shipped library selects on this host.
@@ -4146,6 +4423,9 @@ SCENARIOS = {
         sc_reference_library_absent,
         sc_reference_arm_partial,
         sc_manifest_shapes,
+        sc_reference_regime_flip,
+        sc_denominator_intersection,
+        sc_denominator_thread_point_dark,
         sc_probe_unavailable,
         sc_probe_inapplicable,
         sc_topology_defaulted,
@@ -4582,6 +4862,145 @@ def check_one(exp, report, stdout, exit_code, root):
             + ("; wrong: " + "; ".join(wrong[:3]) if wrong else "")
         )
 
+    if kind == "deficit_reference_invariant":
+        # `deficit_reference` above asserts uniqueness per CELL, which is the weaker
+        # claim and the one that let the flip through: two cells differing only in
+        # regime can each name one reference and name a different one. The reference
+        # has to be invariant to every axis the report compares ALONG -- regime (4a),
+        # routine (9), thread count (6), pad and transposes (2) -- and per host is
+        # the only scope invariant to all of them. So this asserts one reference arm
+        # across every section-1 row on the instance, plus the declared scope: a
+        # per-group selector that happened to agree everywhere on this fixture would
+        # satisfy the first half and fail the second.
+        rows = deficit_rows(report, **_pick(exp, ("instance", "routine", "regime", "incx", "lda_pad")))
+        if len(rows) < exp.get("min_rows", 1):
+            return False, f"{len(rows)} section-1 rows, want >= {exp.get('min_rows', 1)}"
+        by_inst = collections.defaultdict(set)
+        scopes = collections.defaultdict(set)
+        for r in rows:
+            by_inst[r["instance"]].add(r.get("reference_arm"))
+            scopes[r["instance"]].add(r.get("reference_scope"))
+        wrong = []
+        for inst, refs in sorted(by_inst.items()):
+            if len(refs) != 1:
+                # Named with the regimes each reference was used for, because
+                # "2 references" and "the small rows used the other one" are the
+                # same defect described at two different levels of use.
+                per_ref = {
+                    ref: sorted({r["regime"] for r in rows if r.get("reference_arm") == ref})
+                    for ref in refs
+                }
+                wrong.append(f"{inst}: {len(refs)} reference arms across regimes {per_ref}")
+                continue
+            ref = next(iter(refs))
+            if "arm" in exp and ref != exp["arm"]:
+                wrong.append(f"{inst}: reference is {ref!r}, want {exp['arm']!r}")
+            if scopes[inst] != {"instance"}:
+                wrong.append(f"{inst}: reference_scope is {sorted(map(str, scopes[inst]))}, want instance")
+        return not wrong, (
+            f"{len(by_inst) - len(wrong)}/{len(by_inst)} instances name ONE reference arm "
+            f"({exp.get('arm', 'any')}) across all {len(rows)} section-1 rows"
+            + ("; wrong: " + "; ".join(wrong[:3]) if wrong else "")
+        )
+
+    if kind == "regime_gap_deficit":
+        # The section-4a twin of regime_gap_cross, and the reason it exists as its own
+        # kind: 4a's group key carries reference_arm and 4b's does not, so 4a is the
+        # only one of the two a reference flip can null out. `complete` additionally
+        # requires that no profile is missing a regime -- the flip's actual
+        # presentation was `MISSING:large`, which is indistinguishable from thin
+        # coverage unless the fixture says the coverage is not thin.
+        #
+        # FILTERED, and it has to be: most 4a profiles are legitimately missing a
+        # regime by design, not by defect. Level-1 lengths reach medium and large and
+        # never small; the extra lda_pads exist at small and medium and only pad 0 at
+        # large; and dgemm carries NT/TT at small and medium and only NN/TN at large.
+        # So `complete` is only a meaningful claim on a slice the design fills in every
+        # regime, and asserting it globally would assert the design's shape instead of
+        # the reference's invariance.
+        keys = ("instance", "threads", "routine", "lda_pad", "incx", "transa", "transb")
+        want = _pick(exp, keys)
+        rows = [
+            r
+            for r in (dig(report, "regime_profile.deficit") or [])
+            if all(r.get(k) == v for k, v in want.items())
+        ]
+        if exp.get("complete"):
+            thin = [r for r in rows if r.get("regimes_missing")]
+            if thin:
+                return False, (
+                    f"{len(thin)}/{len(rows)} section-4a profiles matching {want} are missing a "
+                    "regime: "
+                    + ", ".join(
+                        f"{r['arm']}/{r['routine']} t={r['threads']} vs {r['reference_arm']} "
+                        f"missing {r['regimes_missing']}"
+                        for r in thin[:3]
+                    )
+                )
+        have = [r for r in rows if r.get("small_minus_large") is not None]
+        if len(have) < exp.get("min_rows", 1):
+            return False, (
+                f"{len(have)} section-4a profiles with a small-large gap of {len(rows)} rows, "
+                f"want >= {exp.get('min_rows', 1)}"
+            )
+        bad = [r for r in have if not OPS[exp["op"]](r["small_minus_large"], exp["value"])]
+        return not bad, (
+            f"{len(have) - len(bad)}/{len(have)} section-4a small-large gaps satisfy "
+            f"{exp['op']} {exp['value']}"
+            + (
+                "; failing: "
+                + ", ".join(f"{r['arm']}/{r['routine']}={r['small_minus_large']:+.3f}" for r in bad[:5])
+                if bad
+                else ""
+            )
+        )
+
+    if kind == "scaling_denominator":
+        # Standing order 1's denominator, asserted field by field rather than by its
+        # value: the value moves with the surface, but WHICH SIZE won and out of which
+        # set is the policy. A revert to per-rung maxima changes best_m and nothing
+        # else, so best_m is the assertion that has to be there.
+        rows = [
+            s
+            for s in (report.get("scaling") or [])
+            if s.get("instance") == exp["instance"] and s.get("threads") == exp["threads"]
+        ]
+        if len(rows) != 1:
+            return False, (
+                f"{len(rows)} section-6 rows for {exp['instance']} t={exp['threads']}, want exactly 1"
+            )
+        s = rows[0]
+        checks = [
+            ("denom_basis", "basis"),
+            ("best_dgemm_m", "best_m"),
+            ("denom_common_sizes", "common_sizes"),
+        ]
+        wrong = [
+            f"{field}={s.get(field)!r}, want {exp[key]!r}"
+            for field, key in checks
+            if key in exp and s.get(field) != exp[key]
+        ]
+        if "unrestricted_m" in exp and s.get("best_dgemm_unrestricted_m") != exp["unrestricted_m"]:
+            wrong.append(
+                f"best_dgemm_unrestricted_m={s.get('best_dgemm_unrestricted_m')!r}, "
+                f"want {exp['unrestricted_m']!r}"
+            )
+        if "op" in exp:
+            # None and 0.0 are different claims here -- absent means there was no
+            # denominator to restrict -- so the None case is named rather than
+            # coerced into the comparison.
+            cost = s.get("denom_restriction_cost")
+            if cost is None:
+                wrong.append(f"denom_restriction_cost is None, want {exp['op']} {exp['value']}")
+            elif not OPS[exp["op"]](cost, exp["value"]):
+                wrong.append(f"denom_restriction_cost={cost:+.4f}, want {exp['op']} {exp['value']}")
+        return not wrong, (
+            f"{exp['instance']} t={exp['threads']}: basis={s.get('denom_basis')} "
+            f"best_dgemm_m={s.get('best_dgemm_m')} common={s.get('denom_common_sizes')} "
+            f"cost={s.get('denom_restriction_cost')}"
+            + ("; wrong: " + "; ".join(wrong[:4]) if wrong else "")
+        )
+
     if kind == "deficit_absent":
         # The other half of a NO-DATA claim: nothing was quietly computed anyway.
         # A branch that prints "NO DATA" and still appends a row would satisfy
@@ -4610,9 +5029,16 @@ def check_one(exp, report, stdout, exit_code, root):
         # The per-arm branch prints but does not append, by design: a row with no
         # number must not enter the payload the report averages. So it is asserted
         # on stdout, and the count matters -- one line per OpenBLAS arm.
-        n = stdout.count("NO DATA — reference arm absent")
+        #
+        # The string moved with the per-host reference choice, and deliberately: the
+        # line now names WHICH reference produced nothing, because with the reference
+        # fixed per host "absent" alone leaves a reader unable to tell whether the gap
+        # is that library's coverage or this campaign's. Matched on the invariant
+        # prefix rather than the whole sentence, which carries the arm label.
+        marker = "NO DATA — this host's reference arm"
+        n = stdout.count(marker)
         return n >= exp.get("min_rows", 1), (
-            f"{n} 'NO DATA — reference arm absent' lines in section 1, want >= {exp.get('min_rows', 1)}"
+            f"{n} {marker!r} lines in section 1, want >= {exp.get('min_rows', 1)}"
         )
 
     if kind == "regime_gap_cross":

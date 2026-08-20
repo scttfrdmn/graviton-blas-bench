@@ -1707,31 +1707,70 @@ def report_deficit_by_routine(cells, groups, hosts, explain, pass_explain, args,
     payload = []
     instances = sorted({k[0] for k in groups}, key=str)
     for inst in instances:
-        refs = {arm for k in groups if k[0] == inst for arm in groups[k] if arm[0] not in (None, "openblas")}
+        inst_keys = [k for k in groups if k[0] == inst]
+        refs = {arm for k in inst_keys for arm in groups[k] if arm[0] not in (None, "openblas")}
         if not refs:
             why = "no non-OpenBLAS library produced a record on this host"
             out(f"  {inst!s:14s} NO DATA — reference library absent: {why}")
             payload.append({"instance": inst, "no_data": why})
             continue
+        # THE REFERENCE IS CHOSEN ONCE PER HOST, not once per group.
+        #
+        # It used to be `max(present_refs, ...)` inside the group loop, which made the
+        # selection a function of every axis in the group key -- thread count, regime,
+        # lda_pad, transposes. That is the same cell-count defect class as the
+        # thresholds, one level up: a count-derived SELECTION feeding count-derived
+        # CONSEQUENCES. Concretely, when the reference flipped between the small and
+        # large regime for one arm+routine, section 4a split into rows carrying
+        # `MISSING: regimes`, `small_minus_large` silently became None, and section
+        # 9's "deficit concentrated in the small regime" count dropped -- so which fix
+        # the campaign recommends could change, and it presented as missing coverage
+        # rather than as an error.
+        #
+        # A comparison's reference must be invariant to the axis being compared along,
+        # and downstream sections compare along ALL of them: regime (4a), routine (9),
+        # thread count (6), pad and transposes (2). Per host is the only scope
+        # invariant to all four. It costs the rows where the host's chosen reference
+        # is absent -- those become an explicit NO DATA naming it, which is the
+        # correct failure: an absence with a reason beats a silent substitution
+        # (standing order 11).
+        #
+        # Breadth of coverage first, conditions second, name third. Breadth before
+        # depth because a reference present in 90% of groups is more useful than one
+        # with more records concentrated in a few; arm_label last so the choice is
+        # deterministic on a tie and cannot reorder between passes.
+        ref_groups, ref_conds = defaultdict(int), defaultdict(int)
+        for k in inst_keys:
+            for a in groups[k]:
+                if a in refs:
+                    ref_groups[a] += 1
+                    ref_conds[a] += len(groups[k][a])
+        ref = max(refs, key=lambda a: (ref_groups[a], ref_conds[a], arm_label(a)))
         h = hosts.get(inst)
         tag = "" if (h and h.admissible) else "  [HOST-NOT-ADMISSIBLE]"
-        for k in sorted((k for k in groups if k[0] == inst), key=skey):
+        others = sorted((a for a in refs if a != ref), key=arm_label)
+        out(
+            f"  {inst!s:14s} reference arm := {arm_label(ref)} — chosen ONCE for this host "
+            f"(present in {ref_groups[ref]} of {len(inst_keys)} comparison groups, "
+            f"{ref_conds[ref]} conditions)"
+            + (f"; not chosen: {', '.join(arm_label(a) for a in others)}" if others else "")
+        )
+        for k in sorted(inst_keys, key=skey):
             arms = groups[k]
             _, thr, routine, reg, pad, incx, ta, tb, floor = k
-            present_refs = [a for a in arms if a in refs]
-            if not present_refs:
+            if ref not in arms:
+                # Distinct from "no reference library on this host": this host HAS one
+                # and it produced nothing here. Named, so a reader can tell whether the
+                # gap is the library's coverage or this campaign's.
+                st, why = explain(inst, ref, thr)
                 for arm in sorted((a for a in arms if a[0] == "openblas"), key=arm_label):
-                    st, why = explain(inst, ("armpl", "native", "unforced"), thr)
                     out(
                         f"  {inst!s:14s} t={thr!s:<4} {routine!s:6s} {reg:6s} pad={pad!s:<3} "
                         f"incx={incx!s:<2} tr={ta}{tb} "
-                        f"{arm_label(arm):30s} NO DATA — reference arm absent "
-                        f"({st}: {why or 'no reason recorded'})"
+                        f"{arm_label(arm):30s} NO DATA — this host's reference arm "
+                        f"{arm_label(ref)} produced nothing here ({st}: {why or 'no reason recorded'})"
                     )
                 continue
-            # Reference arm: the non-OpenBLAS arm covering the most conditions
-            # here, named in every row. Never a max() over anonymous arms.
-            ref = max(present_refs, key=lambda a: (len(arms[a]), arm_label(a)))
             for arm in sorted((a for a in arms if a[0] == "openblas"), key=arm_label):
                 rows = per_size(cells, arms[arm], arm, ref, args.min_effect, pass_explain)
                 s = summarise(rows, args, "openblas", arm_label(ref))
@@ -1762,6 +1801,10 @@ def report_deficit_by_routine(cells, groups, hosts, explain, pass_explain, args,
                         "min_seconds": floor,
                         "arm": arm_label(arm),
                         "reference_arm": arm_label(ref),
+                        # The scope the reference was chosen at, carried in the payload
+                        # so a fixture can assert invariance rather than eyeball it:
+                        # every row for one instance must name the same reference_arm.
+                        "reference_scope": "instance",
                         "shipped_arm": is_shipped(arm),
                         "mean_openblas": s["mean_a"],
                         "mean_reference": s["mean_b"],
@@ -2330,6 +2373,19 @@ def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, overlap, args, o
         )
 
     for s in scaling:
+        # The denominator policy's own failure mode, and it has to be loud: an
+        # efficiency figure divided by a per-rung max looks exactly like one divided
+        # by the common-size max, and the whole point of the restriction is that
+        # those are not the same quantity.
+        if s.get("denom_basis") == "per-rung-fallback":
+            add(
+                "!",
+                "denominator_not_comparable",
+                f"{s['instance']} t={s['threads']}: no large dgemm size was run at every "
+                f"thread point on this host, so standing order 1's denominator fell back to "
+                f"this thread point's own max — efficiency here is NOT comparable to other "
+                f"thread counts on the same host",
+            )
         if s["peak_fma"] is None:
             add(
                 ".",
@@ -2381,12 +2437,50 @@ def compute_scaling(cells, roof, args):
     """Primary denominator: the best GFLOP/s any arm achieved on that host at
     that thread count over large dgemm (standing order 1 -- changing this needs
     Scott). max() over arms is the policy here and only here; it is computed
-    from aggregated cells so a lucky repeat cannot become the ceiling."""
+    from aggregated cells so a lucky repeat cannot become the ceiling.
+
+    THE MAX IS TAKEN OVER THE SIZES COMMON TO EVERY THREAD COUNT ON THAT HOST,
+    not over each thread count's own ladder. Decided with Scott after the
+    thread-dependent large cap landed: bench.c truncates the large ladder at
+    n=4096 below 8 threads, so a per-rung max would draw the 1-thread
+    denominator from a 3-size ladder and the 192-thread one from a 5-size
+    ladder. Those are not the same quantity, and every efficiency figure in the
+    report is a ratio against one of them -- so a reader comparing 1-thread
+    efficiency against 192-thread efficiency would be dividing by two different
+    ceilings, with nothing in the arithmetic to stop them. Printing which size
+    won documents that inconsistency; it does not remove it.
+
+    Restricting to the intersection costs a little headroom wherever the
+    unrestricted max sat above the common set (DGEMM is flat-to-declining above
+    n=2048, so on c8g the cost is expected to be near zero and is reported
+    either way rather than assumed). What it buys is that efficiency is
+    comparable along the thread axis, which is the axis the denominator exists
+    to be compared along."""
     best = defaultdict(list)
     for (cond, _arm), c in cells.items():
         inst, thr, routine, m = cond[0], cond[1], cond[2], cond[3]
         if routine == "dgemm" and regime(m or 0) == "large":
             best[(inst, thr)].append((c.value, m))
+
+    # Intersected over the thread points that HAVE large dgemm, not over all the
+    # thread points on the host -- and the difference is load-bearing. A thread
+    # point with none at all would contribute an empty set, which would empty the
+    # common set and take every OTHER thread point's denominator down with it:
+    # one missing rung turned into a host-wide loss of comparability, announced as
+    # an anomaly on rows whose own data is complete. That thread point simply has
+    # no denominator, which is reported where it happens.
+    #
+    # The keys are therefore drawn from `best`, which by construction only gains a
+    # key when a large dgemm cell exists there; the dark thread point contributes
+    # no key rather than an empty one. Enumerating the host's thread points from
+    # the cells instead -- the obvious-looking alternative -- reintroduces exactly
+    # the failure above, which is what `denominator-thread-point-dark` is for.
+    sizes_at = {k: {m for _v, m in v if m is not None} for k, v in best.items()}
+    common = {}
+    for inst in {k[0] for k in sizes_at}:
+        per_thread = [s for k, s in sizes_at.items() if k[0] == inst]
+        common[inst] = set.intersection(*per_thread) if per_thread else set()
+
     peaks = defaultdict(list)
     for r in roof:
         if r.get("metric") in ("peak_fma", "peak_fma_allcore"):
@@ -2397,22 +2491,35 @@ def compute_scaling(cells, roof, args):
     rows = []
     for key in sorted(set(best) | set(peaks), key=skey):
         inst, thr = key
-        # WHICH SIZE the denominator came from, and how many sizes it was chosen
-        # over. bench.c truncates the large ladder at low thread counts
-        # (large_cap_for_threads), so at one thread this max() is taken over three
-        # sizes rather than five. Single-thread DGEMM GFLOP/s is flat to declining
-        # above n=2048, so the max is not expected to move -- but standing order 1
-        # is the one policy in this repo that is not allowed to rest on "not
-        # expected to". Printing the winning size makes a max sitting AT the top of
-        # a truncated ladder visible to a reader, which is the case where the
-        # truncation could be holding the denominator down.
-        top = max(best[key], key=lambda vm: vm[0]) if best.get(key) else None
+        pool = best.get(key) or []
+        shared = common.get(inst) or set()
+        # The denominator: max over the sizes this host ran at EVERY thread point.
+        restricted = [(v, m) for v, m in pool if m in shared]
+        # The per-rung max is kept as provenance, never as the denominator. It is
+        # what the policy used to report, and printing both is how a reader sees
+        # what the restriction cost rather than being told it was negligible.
+        top_u = max(pool, key=lambda vm: vm[0]) if pool else None
+        # Fallback only when the intersection is empty, which means no size was run
+        # at every thread point on this host -- a coverage failure, not a policy
+        # case. It falls back to the per-rung max so the section still reports a
+        # number, and says so in `denom_basis` so nobody reads it as comparable.
+        basis = "common" if restricted else ("per-rung-fallback" if pool else "absent")
+        top = max(restricted, key=lambda vm: vm[0]) if restricted else top_u
         emp = top[0] if top else None
         emp_m = top[1] if top else None
-        n_sizes = len({m for _v, m in best[key]}) if best.get(key) else 0
+        n_sizes = len(sizes_at.get(key) or set())
+        emp_u = top_u[0] if top_u else None
+        # What the restriction cost, signed and relative. Zero is the expected
+        # answer on DGEMM above n=2048 and is reported rather than assumed.
+        cost = None if (emp is None or not emp or emp_u is None) else (emp_u - emp) / emp
         # An empty peak list must stay None. It used to collapse to 0, so the
         # cross-check printed `nan` and vanished instead of announcing itself.
         pk = max(peaks[key]) if peaks.get(key) else None
+        # The cross-check divides by the SAME denominator the efficiency figures
+        # use. Against the unrestricted max the ratio would be smaller, so standing
+        # order 1's headroom flag would fire less often than the published ceiling
+        # warrants -- the wrong direction for a check whose whole job is to notice
+        # that every arm is leaving performance on the floor.
         ratio = None if (emp is None or not emp or pk is None) else pk / emp
         rows.append(
             {
@@ -2421,6 +2528,11 @@ def compute_scaling(cells, roof, args):
                 "best_dgemm": emp,
                 "best_dgemm_m": emp_m,
                 "large_sizes_available": n_sizes,
+                "denom_basis": basis,
+                "denom_common_sizes": sorted(shared),
+                "best_dgemm_unrestricted": emp_u,
+                "best_dgemm_unrestricted_m": top_u[1] if top_u else None,
+                "denom_restriction_cost": cost,
                 "peak_fma": pk,
                 "headroom_ratio": ratio,
                 "peak_fma_status": (
@@ -2439,21 +2551,39 @@ def report_scaling(rows, out):
     out("\n" + "=" * 78)
     out("6. SCALING  — against measured all-core peak, never theoretical")
     out("=" * 78)
+    out("Denominator = best large dgemm over the sizes this host ran at EVERY thread")
+    out("count, so efficiency is comparable along the thread axis. The per-rung max is")
+    out("shown where it differs; it is provenance, not the denominator.")
     for s in rows:
         pk = "absent (cross-check NOT performed)" if s["peak_fma"] is None else f"{s['peak_fma']:9.2f}"
         emp = "absent" if s["best_dgemm"] is None else f"{s['best_dgemm']:9.2f}"
         flag = "  <-- headroom, see section 5" if s["peak_fma_status"] == "headroom" else ""
-        # Which size won, and out of how many. bench.c runs a shorter large ladder at
-        # low thread counts, so a denominator that came from the largest size STILL
-        # AVAILABLE is the one a reader should look at twice — that is where a longer
-        # ladder could have found a higher max and the truncation would be holding
-        # standing order 1's denominator down.
+        # Which size won, and out of how many this thread point had. Kept from the
+        # annotate-only version of this policy because it is good provenance either
+        # way: a denominator sitting at the top of a truncated ladder is the case to
+        # read twice, and now the reader can also see whether the common-size
+        # restriction is what put it there.
         at = (
             ""
             if s["best_dgemm_m"] is None
             else f" at n={s['best_dgemm_m']} of {s['large_sizes_available']} size(s)"
         )
         out(f"  {s['instance']!s:14s} t={s['threads']!s:<4} best_large_dgemm={emp}{at} peak_fma={pk}{flag}")
+        # Second line only when there is something to say. Printing "cost 0.0%" on
+        # every row would train a reader to skip the line that matters.
+        if s.get("denom_basis") == "per-rung-fallback":
+            out(
+                "      ^ NO COMMON SIZE across this host's thread points, so this is the "
+                "per-rung max and is NOT comparable across the thread axis — a coverage "
+                "failure, see section 7"
+            )
+        elif s.get("denom_restriction_cost"):
+            out(
+                f"      ^ common sizes {s['denom_common_sizes']}; the per-rung max was "
+                f"{s['best_dgemm_unrestricted']:.2f} at n={s['best_dgemm_unrestricted_m']} "
+                f"(+{100 * s['denom_restriction_cost']:.2f}%), not used: that size is absent "
+                f"at some thread point on this host"
+            )
     if not rows:
         out("  no large dgemm and no peak_fma record")
 

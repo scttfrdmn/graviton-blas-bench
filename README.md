@@ -76,7 +76,8 @@ Per host:
 
 ```bash
 export GBB_PREFIX=$HOME/graviton-blas-bench-libs
-export ARMPL_DIR=/opt/arm/armpl_24.10_gcc     # optional but wanted
+# The reference arm. Optional but wanted; see Hazards for why it is pinned by digest.
+export ARMPL_DIR="$(GBB_ARMPL_ACCEPT_EULA=1 bash scripts/install-armpl.sh --print-dir)"
 export GBB_S3_URI=s3://your-bucket/gbb        # strongly advised, see below
 export GBB_AWS_REGION=us-east-1
 bash scripts/build-libs.sh                     # ~40 min
@@ -111,6 +112,7 @@ src/bench.c            routine sweep, Fortran BLAS ABI, NDJSON per measurement
 src/roofline.c         measured peak FMA + triad bandwidth (the denominators)
 src/coreprobe.c        what OpenBLAS actually selected, per OPENBLAS_CORETYPE
 scripts/build-libs.sh  DYNAMIC_ARCH + control builds, ArmPL link, BLIS
+scripts/install-armpl.sh the reference arm: digest-pinned download, EULA left to you
 scripts/capture-env.sh MIDR per core, HWCAP, NUMA, cgroups, governor, dispatch
 scripts/run-matrix.sh  orchestrates arm x coretype x threads on one host
 analysis/decompose.py  the reports, the coverage census, and an anomaly section
@@ -199,6 +201,15 @@ support opposite conclusions.
   decision can inflate. `peak_fma` from the microbenchmark is a cross-check: if
   it materially exceeds the best observed GEMM, every arm on that host is
   leaving headroom, and *that gap* is the headline.
+- **…and it is taken over the sizes that host ran at every thread count.** The
+  large ladder is capped below 8 threads, so a per-thread-point maximum would draw
+  the 1-thread ceiling from a 3-rung ladder and the 192-thread ceiling from a
+  5-rung one — two different quantities printed as adjacent rows of section 6, and
+  every efficiency figure is a ratio against one of them. So the denominator is
+  the maximum over the intersection. Section 6 prints what the restriction cost
+  and which rung it declined to use, so the reader can see that rather than be
+  told it was negligible; a thread point with no large dgemm at all drops out of
+  the intersection instead of emptying it, and carries no denominator.
 - **Thread control is set for every library every time.** `OPENBLAS_NUM_THREADS`,
   `OMP_NUM_THREADS` and `BLIS_NUM_THREADS` all get the same value. Setting only
   one silently leaves the others at their defaults.
@@ -540,7 +551,10 @@ support opposite conclusions.
   `incx-axis` fixture caught exactly that by losing its non-unit-stride axis. It
   does touch standing order 1's denominator at low thread counts, so `decompose.py`
   reports which size the peak came from and out of how many — `at n=4096 of 3
-  size(s)` — and the policy question is Scott's, asked rather than assumed.
+  size(s)` — and the policy question went to Scott rather than being assumed. It
+  was answered by changing the policy, not the annotation: the denominator is the
+  maximum over the sizes common to every thread point, so the cap costs capacity
+  and not comparability.
 - **The per-regime floor put a change of instrument at n=256, which is where the
   effect is expected to be.** `GEMM_SMALL_*`'s crossover is hypothesised to sit at
   about the same size as the 0.05/0.30 transition, so a step in the section 4
@@ -631,8 +645,21 @@ support opposite conclusions.
   `c6g.metal`/`c7g.metal`/`hpc7g.16xlarge` and 192 on the two metal-48xl sizes.
   `capture-env.sh` still checks it per host and exits 3 if SMT is on, because an
   API claim about an instance type is not a measurement of the host.
-- ArmPL is a download from developer.arm.com, not a build. Install it out of
-  band and point `ARMPL_DIR` at the prefix; the arm is skipped cleanly if unset.
+- ArmPL is a download from developer.arm.com, not a build, and it is behind a
+  click-through EULA. `scripts/install-armpl.sh` does it reproducibly — the tarball
+  is **pinned by sha256 per package family**, not by URL, because the CDN permalink
+  is stable by name and says nothing about what it returns, and `ARMPL_DIR` is
+  discovered from the install rather than guessed. The licence is accepted by you,
+  not by the script: it refuses to run without `GBB_ARMPL_ACCEPT_EULA=1` and leaves
+  the licence text on disk with its path printed.
+
+  ```bash
+  export ARMPL_DIR="$(GBB_ARMPL_ACCEPT_EULA=1 bash scripts/install-armpl.sh --print-dir)"
+  ```
+
+  The arm is skipped cleanly if `ARMPL_DIR` is unset, with the reason in the
+  census — which is admissible for a single-host pass and not for the campaign,
+  whose framing is OpenBLAS against what the silicon can do.
 
 ## What the output supports
 

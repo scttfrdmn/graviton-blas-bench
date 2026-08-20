@@ -56,7 +56,33 @@ change can be compared.
   fixture caught it by losing its whole non-unit-stride axis. **It touches standing
   order 1's denominator at low thread counts**, so `decompose.py` now reports which
   size the peak came from and out of how many (`at n=4096 of 3 size(s)`) and the
-  policy question has been put to Scott rather than assumed.
+  policy question has been put to Scott rather than assumed. **Answered**: see the
+  intersection denominator below. The annotation stays either way.
+- **Standing order 1's denominator is the best large dgemm over the sizes the host
+  ran at *every* thread count — the intersection, not each thread point's own best
+  rung.** Scott's call, and the instruction was to change the policy rather than
+  annotate it: a denominator drawn from a truncated ladder is not the same quantity
+  as one drawn from the full ladder, and printing `at n=… of … size(s)` documents
+  the inconsistency without removing it — a reader comparing 1-thread against
+  192-thread efficiency would be dividing by two different ceilings with nothing in
+  the arithmetic to stop them. On `c8g` the common size is `n=4096`. The
+  restriction's cost is computed and printed per row (`the per-rung max was … not
+  used: that size is absent at some thread point`) rather than assumed negligible,
+  and the per-rung max is kept in the payload as provenance
+  (`best_dgemm_unrestricted`). `peak_fma`'s headroom cross-check divides by the
+  **same restricted** denominator: against the unrestricted one the ratio is
+  smaller, so standing order 1's flag would fire *less* often than the published
+  ceiling warrants, which is the wrong direction for a check whose job is to notice
+  everyone leaving performance on the floor. A thread point with no large dgemm at
+  all drops out of the intersection rather than emptying it — the alternative turns
+  one dark rung into a host-wide loss of comparability, announced as an anomaly on
+  rows whose own data is complete — and an empty intersection is reported as
+  `denominator_not_comparable`, a `!`-severity anomaly, because an efficiency figure
+  divided by a per-rung max looks identical to one divided by the common-size max.
+  Fixtures: `denominator-intersection` (the per-rung max sits 8% above the common
+  set, so the two policies give different answers) and
+  `denominator-thread-point-dark`, both mutation-validated, and each caught by
+  exactly one fixture and by none of the pre-existing 61.
 - **`gates/p2.sh` section 3 now checks `measured + declined == matrix_cases`**, not
   `measured == matrix_cases`, and requires every declined case to carry a reason, a
   `thread_prime` record per stream, and `cal_reused` to appear only inside its
@@ -80,6 +106,25 @@ change can be compared.
 
 ### Changed
 
+- **Section 1's reference arm is chosen once per host, not per comparison group.**
+  The last of the count-derived-selection defects and the worst of them: the group
+  key carries the regime, so on a host with two reference candidates whose coverage
+  differs by regime the choice could flip *inside* one comparison — a count-derived
+  selection moving a count-derived consequence, where the consequence is section 9's
+  "deficit concentrated in the small regime", the line that says which kernels to
+  fix. Section 4a keys on `reference_arm`, as it must, so a flip split the profile,
+  nulled `small_minus_large` in both halves, and surfaced as `MISSING: regimes` —
+  indistinguishable from thin coverage. Per host is the only scope invariant to all
+  four axes the report compares along (regime, routine, thread count,
+  pad/transposes). The scope is declared in the payload as `reference_scope` so it
+  can be asserted rather than eyeballed; the tie-break is coverage breadth, then
+  conditions, then `arm_label`, which is deterministic and cannot reorder between
+  passes; and where the chosen reference produced nothing the row is an explicit
+  `NO DATA — this host's reference arm … produced nothing here (status: reason)`,
+  naming it, because an absence with a reason beats a silent substitution. Fixture:
+  `reference-regime-flip`, mutation-validated against the per-group selector, and it
+  plants the coverage so the conditions-winner is *not* the alphabet-winner —
+  otherwise it would pass against a selector that read only the label.
 - **Every threshold in `analysis/decompose.py` that was a fraction of raw cells
   is now either balanced-weighted or an absolute count.** Two defects found
   separately — cell-count majorities, so the longest size ladder voted, and
@@ -314,6 +359,26 @@ change can be compared.
 
 ### Added
 
+- **`scripts/install-armpl.sh` — the reference arm becomes reproducible.** ArmPL was
+  absent from the first P2 pass because acquiring it was a manual,
+  registration-gated step; the census recorded the absence honestly, but a manual
+  step discovered at launch time is discovered on five hosts across three passes, and
+  the campaign's framing is OpenBLAS against what the silicon can do. **Pinned by
+  content, not by URL**: the Arm CDN permalink is stable by name and says nothing
+  about what it returns, so the tarball is checked against a sha256 recorded per
+  package family (rpm and deb are different files) and the install aborts on
+  mismatch. Both digests were verified by independent download and agree with the
+  digests Spack publishes for the same version — two independent sources, which is
+  the most a vendor binary admits of. **The EULA is accepted by a human**: the script
+  refuses to run without `GBB_ARMPL_ACCEPT_EULA=1`, and prints where it left the
+  licence text. `ARMPL_DIR` is **discovered** from the install rather than guessed —
+  the directory name carries the GCC version, which is part of the provenance
+  `build-libs.sh` records, and a guessed path either fails at link time or, worse,
+  exists and holds a different build. Everything conversational goes to stderr so
+  `--print-dir` emits exactly one path. Verified end to end on aarch64 Linux
+  (download, digest, install, discovery, `make armpl`, `ldd` resolving
+  `libarmpl_mp.so` through the rpath), on an instrument-check host and not on a
+  campaign host.
 - **`gates/p2.sh`, and a self-test that makes it a gate rather than a wish.** P2 is
   the first phase whose gate is written before its data exists, so the ordinary
   failure mode is a gate that runs for the first time on the dataset that cost

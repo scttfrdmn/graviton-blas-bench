@@ -28,10 +28,21 @@ until it finds something.
 ## The fourteen standing orders
 
 1. **Measured peak, never theoretical.** The primary denominator is the best
-   GFLOP/s any arm achieved on that host. `peak_fma` is a cross-check only; if
-   it materially exceeds the best observed GEMM, every arm on that host is
-   leaving headroom and *that gap* is the headline. Changing this policy
-   requires asking Scott first.
+   GFLOP/s any arm achieved on that host, **over the large-dgemm sizes that host
+   ran at every thread count** — the intersection, not each thread point's own
+   best rung. Decided with Scott 2026-08-19, once the thread-dependent large cap
+   made the two differ: a per-rung max draws the 1-thread ceiling from a 3-rung
+   ladder and the 192-thread ceiling from a 5-rung one, so the two efficiency
+   columns in section 6 would be ratios against different quantities with nothing
+   in the arithmetic to stop a reader comparing them. Annotating that was
+   considered and rejected — it documents the inconsistency without removing it.
+   It costs a little headroom wherever the unrestricted max sat above the common
+   set; `decompose.py` prints that cost per row and never uses it. A thread point
+   with **no** large dgemm drops out of the intersection rather than emptying it,
+   and carries no denominator of its own. `peak_fma` is a cross-check only, and
+   against the **same restricted** denominator: if it materially exceeds the best
+   observed GEMM, every arm on that host is leaving headroom and *that gap* is
+   the headline. Changing any of this requires asking Scott first.
 2. **Do not reintroduce the optimizer hazard.** The first draft of
    `src/roofline.c` reported 927 TFLOP/s on one core because the FMA chain was
    folded away. Constants are read from volatile storage and `sanity_check()`
@@ -218,6 +229,27 @@ in the coherence guard, and the intersection rule; `transpose-shopping`,
 `family-swamped`, `replicate-majority` and `replicate-loss-unexplained` are the
 fixtures, each mutation-validated.
 
+### A comparison's reference must be invariant to the axis compared along
+
+Section 1's reference arm is chosen **once per host** and named in the payload as
+`reference_scope`. Not per comparison group, which is what it was: the group key
+carries the regime, so on a host with two reference candidates whose coverage differs
+by regime the choice could flip *inside* one comparison — a count-derived selection
+moving a count-derived consequence, and the consequence is section 9's "deficit
+concentrated in the small regime", which is the sentence that says which kernels to
+fix. Section 4a keys on `reference_arm` (it must; rows measured against different
+references are not one profile), so a flip splits the profile, nulls
+`small_minus_large`, and presents as `MISSING: regimes` rather than as an error. Per
+host is the only scope invariant to all four axes the report compares along — regime,
+routine, thread count, and pad/transposes. Where the chosen reference produced
+nothing, the row is an explicit NO DATA **naming it**, which is standing order 11's
+answer: an absence with a reason beats a silent substitution. The tie-break is
+coverage breadth, then conditions, then `arm_label` — deterministic, so it cannot
+reorder between passes. `reference-regime-flip` is the fixture, mutation-validated
+against the per-group selector, and it plants the coverage so that the
+conditions-winner is *not* the alphabet-winner; otherwise it would pass against a
+selector that read only the label.
+
 ### The axis assignment — decided 2026-08-19, do not widen it
 
 The cross is **pads × {NN, TN}**, not the full cross and not NN-only. Transposes
@@ -341,23 +373,56 @@ make this principled rather than economising, and all three are asserted:
   `n=4194304` — a 32 MB vector, not a 512 MB working set — and did, until the
   `incx-axis` fixture lost its non-unit-stride axis and said so.
 
-**This touches standing order 1's denominator input set at low thread counts**, and
-that is Scott's call, not the harness's: the measured peak at 1 thread is now taken
-over a 3-rung large ladder rather than 5. DGEMM is flat-to-declining above n=2048 so
-the max is not expected to move, but "not expected to" is not the standard this repo
-holds denominators to. `decompose.py` therefore reports **which** size the max came
-from and out of how many (`best_large_dgemm=… at n=4096 of 3 size(s)`), and a max
-sitting at the top of a truncated ladder is the case to read twice.
+**This touched standing order 1's denominator input set at low thread counts**, and
+it was Scott's call, not the harness's: the measured peak at 1 thread is taken over a
+3-rung large ladder rather than 5. DGEMM is flat-to-declining above n=2048 so the max
+was not expected to move, but "not expected to" is not the standard this repo holds
+denominators to. **Resolved 2026-08-19 by changing the policy rather than annotating
+it** — see standing order 1: the denominator is now the max over the sizes present at
+*every* thread count, so both thread points divide by a ceiling drawn from the same
+input set and the cap costs no comparability. The annotation stays regardless
+(`best_large_dgemm=… at n=4096 of 3 size(s)`) because it is good provenance either
+way, and a max sitting at the top of a truncated ladder is still the case to read
+twice; alongside it, `decompose.py` prints what the restriction cost and which size
+it declined to use. `denominator-intersection` and `denominator-thread-point-dark`
+are the fixtures, each mutation-validated — the second one because the obvious
+implementation (intersect over the host's thread points rather than over the thread
+points that *have* large dgemm) turns one dark rung into a host-wide loss of
+comparability.
+
+### Reference arms are a P3 prerequisite, not a P3 discovery
+
+- **ArmPL absent is admissible for P2 and not for P3.** Standing order 1's
+  denominator is measured peak, so the P2 gate stands without it and the census
+  recorded the absence honestly (`ARMPL_DIR unset or not a directory`). But the
+  published framing is OpenBLAS against what the silicon can do, and a manual,
+  registration-gated download discovered at launch time is discovered on five hosts
+  across three passes. `scripts/install-armpl.sh` is the reproducible path: version
+  and **sha256 pinned per package family** (the Arm CDN permalink is stable by name
+  and says nothing about what it returns), the EULA accepted by a human via
+  `GBB_ARMPL_ACCEPT_EULA=1` and never by the script, and `ARMPL_DIR` **discovered**
+  after install rather than guessed — the directory name carries the GCC version and
+  is part of what `build-libs.sh` records. Verified end to end on aarch64 Linux
+  2026-08-19, through `make armpl` and `ldd`.
+- **Pin `BLIS_REF` before P3.** In the P2 pass it was `master` and resolved to
+  `061c2ebef87eda9189e6cdf38af4ea3d4a8efe7b` with a recorded warning. A mutable ref
+  means two hosts, or two passes days apart, can build different trees — so the
+  cross-host reference comparison would be comparing two libraries and nothing in the
+  report would say so. Exactly the failure a mutable `OPENBLAS_REF` would be, one
+  library over, and the P3 gate's `blas_sha` check does not cover it.
 
 ## Ask before
 
 - Launching **any** EC2 instance.
 - Changing the size regimes or the routine set (the #2 expansion above is already
   approved; anything beyond it is not).
-- Altering the denominator policy in standing order 1. **Open, awaiting Scott:**
-  whether the thread-dependent large cap's effect on the 1-thread denominator is
-  acceptable, or whether `n=6144`/`8192` should run at low thread counts purely to
-  keep the peak's input set uniform across thread points.
+- Altering the denominator policy in standing order 1. **Closed 2026-08-19:** the
+  question was whether the thread-dependent large cap's effect on the 1-thread
+  denominator was acceptable, or whether `n=6144`/`8192` should run at low thread
+  counts purely to keep the peak's input set uniform. Neither — the input set is
+  made uniform in the *analysis* instead, by intersecting the sizes across thread
+  points, so no instance-hours are spent on rungs nobody would cite. The cap
+  stays.
 - Relaxing a verification tolerance.
 
 ## Phase gates
