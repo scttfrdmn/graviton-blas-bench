@@ -85,13 +85,32 @@ jstr() {
 # cannot promote it. A genuinely new Graviton part also fails (2), which is
 # correct and deliberate: standing order 8 makes an unrecognised MIDR a
 # stop-and-escalate, so adding one is a human edit here and in capture-env.sh.
+#
+# AND THERE IS A THIRD CONDITION, added 2026-08-20 because the second one turned
+# out to rest on an assumption about the test host rather than on construction.
+# `GBB_TEST_IMDS_TYPE` forges (1); the comment on it claimed (2) "on any machine a
+# test runs on it does not" hold. That is false, and CI found it: gate p0 runs on
+# `ubuntu-24.04-arm`, whose cpu0 MIDR part IS in GRAVITON_PARTS, so the forged type
+# promoted the runner to campaign role and the stub suite's own anti-forgery
+# assertion failed. The same hole is open on any Neoverse host in the part list --
+# including, most sharply, the campaign hosts themselves: running the stub suite on
+# the c8g would have written campaign-namespace records from a test.
+#
+# So a forged instance type now refuses campaign role by construction, whatever the
+# silicon says. The MIDR leg is kept and checked FIRST, so that where it does apply
+# -- castor, a laptop, an x86 runner -- it is still what fires and is still what the
+# suite exercises; the forgery leg catches the hosts where the MIDR leg cannot.
+# CLAUDE.md's rule for these boxes is "quarantine by construction, not by
+# discipline", and a hook whose safety depends on which machine ran the tests was
+# discipline wearing construction's clothes.
 CAMPAIGN_TYPES="${GBB_CAMPAIGN_TYPES:-c6g.metal c7g.metal hpc7g.16xlarge c8g.metal-48xl c9g.metal-48xl}"
 GRAVITON_PARTS="0xd0c 0xd40 0xd49 0xd4f 0xd83 0xd84"
 
 imds_instance_type() {
   # GBB_TEST_IMDS_TYPE exists so the stub suite can reach this code without an
-  # EC2 network. It cannot manufacture campaign data on its own: condition (2)
-  # still has to hold, and on any machine a test runs on it does not.
+  # EC2 network. It cannot manufacture campaign data, and that is now enforced by
+  # condition (3) below rather than by an assumption about the test host -- see the
+  # block above for the assumption and how CI falsified it.
   if [ -n "${GBB_TEST_IMDS_TYPE:-}" ]; then printf '%s' "$GBB_TEST_IMDS_TYPE"; return 0; fi
   command -v curl >/dev/null 2>&1 || return 1
   local tok
@@ -106,6 +125,21 @@ IMDS_TYPE="$(imds_instance_type || true)"
 MIDR_RAW="$(cat /sys/devices/system/cpu/cpu0/regs/identification/midr_el1 2>/dev/null || true)"
 MIDR_PART=""
 [ -n "$MIDR_RAW" ] && MIDR_PART="$(printf '0x%x' $(( ( $((MIDR_RAW)) >> 4 ) & 0xFFF )))"
+# GBB_TEST_MIDR_PART lets the stub suite reach condition (3) on a host whose real
+# MIDR stops it at condition (2) -- otherwise leg 3 would only ever be exercised on
+# whichever runner happens to have a Neoverse part in the list, which is the shape of
+# host-dependence that put the hole there in the first place.
+#
+# IT CAN ONLY DEMOTE, and that is a property of the ordering rather than of care.
+# Promotion needs a campaign instance type from real IMDS, and this variable does not
+# touch that; combined with GBB_TEST_IMDS_TYPE it lands on (3) and refuses. On a real
+# campaign host the real part is already in the list, so setting this can only move
+# the answer from campaign to instrument. There is no value of it that produces
+# campaign role on a host that would not have had it anyway.
+if [ -n "${GBB_TEST_MIDR_PART:-}" ]; then
+  MIDR_PART="$GBB_TEST_MIDR_PART"
+  log "WARNING: cpu0 MIDR part overridden to '$MIDR_PART' by GBB_TEST_MIDR_PART (test hook)"
+fi
 
 ROLE=instrument
 ROLE_REASON=""
@@ -117,6 +151,12 @@ elif [ -z "$MIDR_PART" ]; then
   ROLE_REASON="cpu0 MIDR unreadable, so the silicon cannot be confirmed"
 elif ! printf '%s' " $GRAVITON_PARTS " | grep -qF " $MIDR_PART "; then
   ROLE_REASON="cpu0 MIDR part $MIDR_PART is not a known Graviton part ($GRAVITON_PARTS)"
+elif [ -n "${GBB_TEST_IMDS_TYPE:-}" ]; then
+  # Last, so the two evidence-based refusals above keep firing wherever they apply
+  # and keep being what the stub suite exercises. This one exists for the hosts
+  # where they cannot fire: a real Neoverse part in the list, which is every
+  # campaign host and also GitHub's arm64 runner.
+  ROLE_REASON="instance type '$IMDS_TYPE' came from GBB_TEST_IMDS_TYPE, which is a test hook and not evidence; campaign role requires an answer from IMDS itself, and cpu0 MIDR part $MIDR_PART cannot supply the other half on its own"
 else
   ROLE=campaign
 fi

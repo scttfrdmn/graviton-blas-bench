@@ -463,18 +463,66 @@ chk "no campaign-namespace records written" \
 chk "no instrument records under the asserted role either" \
   "$( [ -e "$RES/bench-instr-K.ndjson" ] && echo some || echo none )" "none"
 
-echo "== L. a forged instance type cannot promote a non-Graviton host =="
-# GBB_TEST_IMDS_TYPE exists so this code path is reachable without EC2. It must
-# not be sufficient on its own: cpu0's MIDR still has to be a Graviton part, and
-# on the machine running this test it is not.
+echo "== L. a forged instance type cannot promote ANY host =="
+# GBB_TEST_IMDS_TYPE exists so this code path is reachable without EC2. It must not
+# be sufficient on its own.
+#
+# THIS ASSERTION USED TO DEPEND ON THE TEST HOST AND WAS WRONG BECAUSE OF IT. It
+# read "cannot promote a non-Graviton host", and its comment asserted that cpu0's
+# MIDR "on the machine running this test" is not a Graviton part. CI falsified that:
+# gate p0 runs on `ubuntu-24.04-arm`, whose MIDR part is in run-matrix.sh's
+# GRAVITON_PARTS, so the forged type promoted the runner to campaign role and this
+# block failed -- while the same suite passed on the x86 runner and on darwin, where
+# the MIDR is unreadable. The hole was widest on the campaign hosts themselves.
+#
+# run-matrix.sh now refuses a forged type outright (condition 3), so the invariant
+# below holds on every platform and this block no longer has a silicon premise. The
+# MIDR leg is still checked first there, so on a laptop or on castor it is still the
+# leg that fires; which leg fired is printed rather than asserted, because it is a
+# property of the host and the role is not.
 rc=$(GBB_LADDER_OVERRIDE="1" run L GBB_TEST_IMDS_TYPE=c8g.metal-48xl)
 chk "exit 0" "$rc" "0"
 chk "still instrument" \
   "$(python3 -c 'import json,sys
 print(sorted({json.loads(l)["role"] for l in open(sys.argv[1])}))' "$RES/bench-instr-L.ndjson")" \
   "['instrument']"
-chk "reason names the MIDR, not the instance type" \
-  "$(grep -c 'is not a known Graviton part\|MIDR unreadable' "$W/results/L.stderr")" "1"
+chk "no campaign-namespace bench records exist at all" \
+  "$(nfiles "$W/results" bench-)" "0"
+# One of the three refusals must fire, and the reason must never be empty -- an
+# empty reason with role=instrument would mean the fall-through, which is campaign.
+chk "the refusal is stated, and names evidence rather than the forged type alone" \
+  "$(grep -c 'is not a known Graviton part\|MIDR unreadable\|came from GBB_TEST_IMDS_TYPE' \
+       "$W/results/L.stderr")" "1"
+# `sed -n 1p`, not `head -1`: this suite runs under pipefail, and an early-exiting
+# consumer would SIGPIPE its producer -- the defect that made sve_kernels() a
+# constant function. `sed -n 1p` reads its whole input and exits 0.
+printf '  note  refusal leg on this host: %s\n' \
+  "$(sed -n 's/.*role=INSTRUMENT -- //p' "$W/results/L.stderr" | sed -n 1p | cut -c1-100)"
+
+# L2/L3 pin each refusal leg deterministically, on every platform, using
+# GBB_TEST_MIDR_PART -- which can only demote (see run-matrix.sh). Without these the
+# forgery leg would be exercised only on a runner that happens to carry a Neoverse
+# part, which is exactly the host-dependence that hid the hole.
+rc=$(GBB_LADDER_OVERRIDE="1" run L2 GBB_TEST_IMDS_TYPE=c8g.metal-48xl GBB_TEST_MIDR_PART=0xd85)
+chk "L2 forged type + castor's part -> instrument, refused on the MIDR" "$rc" "0"
+chk "L2 the MIDR leg is the one that fired" \
+  "$(grep -c '0xd85 is not a known Graviton part' "$W/results/L2.stderr")" "1"
+chk "L2 role is instrument" \
+  "$(python3 -c 'import json,sys
+print(sorted({json.loads(l)["role"] for l in open(sys.argv[1])}))' "$RES/bench-instr-L2.ndjson")" \
+  "['instrument']"
+# The case CI found: a part that IS in GRAVITON_PARTS, so leg 2 passes and only the
+# forgery leg stands between a test hook and campaign-namespace data.
+rc=$(GBB_LADDER_OVERRIDE="1" run L3 GBB_TEST_IMDS_TYPE=c8g.metal-48xl GBB_TEST_MIDR_PART=0xd4f)
+chk "L3 forged type + a REAL Graviton part -> still instrument" "$rc" "0"
+chk "L3 the forgery leg is the one that fired" \
+  "$(grep -c 'came from GBB_TEST_IMDS_TYPE' "$W/results/L3.stderr")" "1"
+chk "L3 role is instrument" \
+  "$(python3 -c 'import json,sys
+print(sorted({json.loads(l)["role"] for l in open(sys.argv[1])}))' "$RES/bench-instr-L3.ndjson")" \
+  "['instrument']"
+chk "L3 wrote nothing into the campaign namespace" \
+  "$(nfiles "$W/results" bench-)" "0"
 
 echo "== M2. the manifest is stamped with a host, not merely copied =="
 # build-libs.sh runs before anything knows which host it is on, so its records
