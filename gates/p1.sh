@@ -609,6 +609,19 @@ elif "g_last_emit = now();" not in block.group(1):
         "src/bench.c does not start the wall-clock accounting in the !g_dry block, so the "
         "first case_seconds includes process startup and timer calibration"
     )
+# -- and the thread-pool priming call lives in the same block, for the same reason
+# and one more: in the dry pass there is no BLAS work to prime for, and a priming
+# DGEMM during --dry-run would spend a second of every arm's startup on nothing.
+# Scoped to the block rather than searched globally: a prime_threads() anywhere in
+# the file would satisfy a whole-file search while running in the wrong pass.
+if block and "prime_threads();" not in block.group(1):
+    bad.append(
+        "src/bench.c does not call prime_threads() in the !g_dry block, so either the dry "
+        "pass primes a pool it will not use or thread 2..N's buffer pool is allocated inside "
+        "the first timed region"
+    )
+if "prime_threads" in src and src.find("prime_threads();") < src.find("static void prime_threads"):
+    bad.append("prime_threads() is called before it is defined")
 
 # -- synth's two model constants agree with the producer's #defines. They are what
 # give the model its anti-correlation, so a drift makes the fixtures assert the
@@ -623,9 +636,20 @@ for name, have in (("MIN_SAMPLES", synth.MIN_SAMPLES), ("MAX_MEASURE_SECONDS", s
 # -- the model's shape, as three properties rather than as a formula. Floor-clamped
 # at the cheap end, MIN_SAMPLES-clamped at the expensive end, capped at the top.
 floor = synth.MIN_SECONDS
-cheap = synth.case_seconds_for(floor / synth.MIN_SAMPLES / 100, floor, 0.0)
-if abs(cheap - floor) > 1e-9:
-    bad.append(f"a fast case costs {cheap}, not the {floor} floor: the floor no longer binds")
+t_fast = floor / synth.MIN_SAMPLES / 100
+cheap = synth.case_seconds_for(t_fast, floor, 0.0)
+# The floor binds the MEASUREMENT; the warmup and calibration calls sit outside it
+# and are the point of the policy, so the expected cheap cost is the floor plus
+# exactly the calls the policy says this case makes. Written as the policy's own
+# arithmetic rather than as a tolerance: a tolerance would also pass a model that
+# had stopped charging for warmup at all, which is the thing being measured.
+w_fast, reuse_fast = synth.timing_path_for(t_fast, floor)
+want_cheap = round(floor + w_fast * t_fast + (0.0 if reuse_fast else t_fast), 6)
+if abs(cheap - want_cheap) > 1e-9:
+    bad.append(
+        f"a fast case costs {cheap}, not the {want_cheap} the floor plus {w_fast} warmup "
+        f"call(s) predicts: the floor no longer binds"
+    )
 slow = synth.case_seconds_for(floor, floor, 0.0)
 if slow <= cheap:
     bad.append(
@@ -641,8 +665,15 @@ if capped > synth.MAX_MEASURE_SECONDS + 1e-9:
 # monotone non-increasing in gflops, and must do so STRICTLY somewhere: all-equal
 # would satisfy monotonicity while carrying no signal at all.
 sc = synth.SCENARIOS["null"]()
-recs = synth.bench_records(sc, sc.hosts[0])
+stream = synth.bench_records(sc, sc.hosts[0])
+# The stream is not homogeneous any more -- thread_prime and case_skipped records
+# carry case_seconds but no gflops -- so the monotonicity check reads measurements
+# only. Filtered through synth.measurements() rather than by an inline predicate so
+# that this check and the producer cannot disagree about what a measurement is.
+recs = synth.measurements(stream)
 missing = [r for r in recs if "case_seconds" not in r]
+if any("case_seconds" not in r for r in stream):
+    bad.append("a non-measurement record carries no case_seconds, so the stream no longer sums")
 if missing:
     bad.append(f"{len(missing)} of {len(recs)} synth bench records carry no case_seconds")
 conds = defaultdict(list)
@@ -651,20 +682,39 @@ conds = defaultdict(list)
 # gate FAILs with nothing to read. Found by mutation.
 for r in recs if not missing else ():
     conds[(r["threads"], r["routine"], r["m"], r["n"], r["k"], r["lda_pad"], r["incx"])].append(
-        (r["gflops"], r["case_seconds"])
+        (r["gflops"], r["case_seconds"], r["t_min"], r["min_seconds"])
     )
-strict = inverted = 0
+strict = inverted = straddle = 0
 for arms in conds.values():
     ordered = sorted(arms)
     for lo, hi in zip(ordered, ordered[1:]):
         if hi[1] > lo[1] + 1e-9:
-            inverted += 1
+            # The faster arm costs more, which the anti-correlation forbids -- EXCEPT
+            # across the warmup boundary, where the faster arm still warms up and
+            # reruns its calibration call while the slower one has stopped doing
+            # both. That inversion is real in bench.c too, and it is bounded by the
+            # three calls the policy charges, whereas the anti-correlation at the
+            # expensive end is unbounded. So a straddling pair is allowed only if it
+            # stays inside its own overhead; anything else is the model losing the
+            # property the cost plan turns on.
+            # The bound is TIGHT where both arms sit on the floor: the measurement
+            # halves are then equal and the whole excess is the overhead, so excess
+            # == span to the last digit. 1e-6 rather than 1e-9 because case_seconds
+            # is rounded to bench.c's %.6f field on both sides of the subtraction,
+            # and the bound is computed from an unrounded t_min.
+            span = (synth.WARMUP_REPS + 1) * hi[2]
+            paths_differ = synth.timing_path_for(lo[2], lo[3]) != synth.timing_path_for(hi[2], hi[3])
+            if paths_differ and hi[1] - lo[1] <= span + 1e-6:
+                straddle += 1
+            else:
+                inverted += 1
         elif lo[1] > hi[1] + 1e-9:
             strict += 1
 if inverted:
     bad.append(
-        f"{inverted} arm pairs where the FASTER arm's case costs more wall clock: the fixtures "
-        f"model wall-clock as correlated with arm quality, not anti-correlated"
+        f"{inverted} arm pairs where the FASTER arm's case costs more wall clock and not by "
+        f"warmup: the fixtures model wall-clock as correlated with arm quality, not "
+        f"anti-correlated"
     )
 if not strict and not missing:
     bad.append(
@@ -694,11 +744,89 @@ else:
             f"case_seconds is keyed off the size's regime rather than off the floor it ran under"
         )
 
+# -- the conditional-warmup and calibration-reuse policy, against bench.c's own
+# constants. These two fields are discrete and are asserted for exact values by
+# gates/p2.sh, so a fixture whose boundary sits in a different place from the
+# producer's would certify a P2 gate that checks the fixture's opinion.
+for name, want in (
+    ("WARMUP_REPS", define("WARMUP_REPS")),
+    ("WARMUP_MAX_FRACTION", define("WARMUP_MAX_FRACTION")),
+    ("ABS_MIN_SAMPLES", define("ABS_MIN_SAMPLES")),
+    ("MIN_BATCH_SECONDS", define("MIN_BATCH_SECONDS")),
+):
+    have = getattr(synth, name, None)
+    if want is None:
+        bad.append(f"bench.c has no #define {name}")
+    elif have is None:
+        bad.append(f"synth has no {name}")
+    elif float(have) != float(want):
+        bad.append(f"synth.{name}={have} but bench.c {name}={want}")
+
+# The policy's two ends, as behaviour rather than as constants: a cheap case warms
+# up and cannot reuse its calibration call (it was batched); an expensive one does
+# neither. If both ends agreed, the fixtures would carry one path and every P2
+# assertion about the expensive end would be vacuous.
+w_cheap, r_cheap = synth.timing_path_for(1e-6, synth.MIN_SECONDS_SMALL)
+w_slow, r_slow = synth.timing_path_for(0.5, synth.MIN_SECONDS)
+if (w_cheap, r_cheap) != (synth.WARMUP_REPS, False):
+    bad.append(f"a 1 us case gives warmup={w_cheap} reuse={r_cheap}, want ({synth.WARMUP_REPS}, False)")
+if (w_slow, r_slow) != (0, True):
+    bad.append(f"a 0.5 s case gives warmup={w_slow} reuse={r_slow}, want (0, True)")
+# And the boundary is where the policy says it is: warmup stops when it would cost
+# more than WARMUP_MAX_FRACTION of the measurement it precedes. Checked as a
+# crossing rather than at a size, because the crossing moves with thread count and
+# any size written here would be a fourth place to keep in step.
+cross = [t for t in (1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0) if synth.timing_path_for(t, synth.MIN_SECONDS)[0] == 0]
+if not cross or cross != sorted(cross) or len(cross) == 6:
+    bad.append(f"warmup does not decay to zero exactly once across 1e-5..1 s: zero at {cross}")
+
+# -- the thread-dependent large cap, matched to bench.c's large_cap_for_threads()
+# arm by arm. bench.c's is a one-line function, so this reads its two constants.
+c_low = define("LARGE_CAP_LOW")
+c_thr = define("LARGE_CAP_MIN_THREADS")
+if c_low is None or c_thr is None:
+    bad.append("bench.c has no LARGE_CAP_LOW/LARGE_CAP_MIN_THREADS to check against")
+else:
+    for t in (1, 2, 4, 8, 16, 64, 192):
+        want = int(c_low) if t < int(c_thr) else max(synth.SIZES_LARGE)
+        if synth.large_cap_for_threads(t) != want:
+            bad.append(f"large_cap_for_threads({t})={synth.large_cap_for_threads(t)}, bench.c says {want}")
+
+# -- and the two properties that make the cap safe rather than merely cheap: every
+# omitted case carries a REASON, and the fold is not capped, so a truncated stream
+# and an untruncated one still stamp the same matrix. The second is the one that
+# would silently unpool P2 from P3.
+skipped = [r for r in stream if r.get("record") == "case_skipped"]
+primes = [r for r in stream if r.get("record") == "thread_prime"]
+low = [t for t in sc.hosts[0].threads if t < synth.LARGE_CAP_MIN_THREADS]
+if low and not skipped:
+    bad.append(f"threads={low} are below the cap but no case_skipped record was written")
+if any(not r.get("reason") for r in skipped):
+    bad.append("a case_skipped record carries no reason: standing order 11 at case granularity")
+if any(r["m"] <= synth.large_cap_for_threads(r["threads"]) for r in skipped):
+    bad.append("a case_skipped record is for a size at or below the cap")
+# bench.c's cap lives inside sweep(), and the level-1 cases are built in main()
+# without going through it. A fixture that capped them would delete the non-unit
+# stride axis at every low thread count and call it policy.
+if any(r["routine"] in ("daxpy", "ddot") for r in skipped):
+    bad.append("a level-1 case was capped, but bench.c's cap cannot reach level-1")
+if any(r["m"] not in synth.SIZES_LARGE for r in skipped):
+    bad.append("a case_skipped record is for a size that is not on the large ladder")
+if len(primes) != len({(r["library"], r["target"], r["coretype"], r["threads"]) for r in recs}):
+    bad.append(f"{len(primes)} thread_prime records for {len(sc.hosts[0].threads)} thread points per arm")
+if synth.matrix_fields(sc, sc.hosts[0]).get("matrix_cases") != len(
+    synth.conditions(sc.routines, sc.level1, sc.transposes)
+):
+    bad.append("the matrix stamp counts something other than the full uncapped design")
+
 print(
     "; ".join(bad)
     if bad
     else f"recorded in position, clock read pre-fflush, {strict} arm pairs ordered by speed, "
-         f"0 inverted, both probe floors priced apart"
+         f"0 inverted, {straddle} straddling the warmup boundary within their own overhead, "
+         f"both probe floors priced apart, warmup decays at "
+         f"{synth.WARMUP_MAX_FRACTION:g} of the measurement, {len(skipped)} capped cases all "
+         f"with reasons, {len(primes)} streams primed, stamp over the uncapped design"
 )
 sys.exit(1 if bad else 0)
 EOF

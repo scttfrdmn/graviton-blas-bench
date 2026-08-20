@@ -135,6 +135,11 @@ topology-gone|numactl -H was never recorded|topology|drop_files("topology-*.txt"
 two-instance-ids|two physical boxes in one pass|instance_id|second_instance_id()
 case-seconds-gone|no per-case wall clock, so no cost basis|case_seconds|strip_field("case_seconds")
 wrong-instance|the pass ran on the wrong host|c8g.metal-48xl|retype("c7g.metal")
+prime-gone|the thread pool was never primed, so an allocation lands in a timed region|thread_prime|drop_record("thread_prime")
+decline-gone|the truncated large cases vanished instead of being recorded|matrix_cases|drop_record("case_skipped")
+decline-unreasoned|a case was declined with nothing saying why|no reason|blank_reason()
+warmup-field-gone|the sweep predates the warmup policy, so its wall clock is not the campaign's|warmup_reps|strip_field("warmup_reps")
+cal-reused-batched|the calibration call was reused where it is not the coldest call|cal_reused|forge_reuse()
 MUTANTS
 )
   while IFS='|' read -r name why want op; do
@@ -293,6 +298,9 @@ spec.loader.exec_module(dc)
 bad = []
 ids, counts = defaultdict(int), defaultdict(int)
 cases = defaultdict(set)
+declined, unreasoned = defaultdict(set), defaultdict(set)
+primed = set()
+warmups, nofield, reuse_bad = [], 0, 0
 for p in sorted(res.glob("bench-*.ndjson")):
     for line in p.read_text(errors="replace").splitlines():
         if not line.strip():
@@ -301,20 +309,45 @@ for p in sorted(res.glob("bench-*.ndjson")):
             r = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(r, dict) or "routine" not in r:
+        if not isinstance(r, dict):
+            continue
+        stream_k = (r.get("run_id"), r.get("library"), r.get("target"), r.get("coretype"), r.get("threads"))
+        if r.get("record") == "thread_prime":
+            # Read BEFORE the routine filter, because a priming record carries no
+            # routine. It is the evidence that thread 2..N's buffer pool was
+            # allocated outside every timed region: without it the whole stream's
+            # timings are suspect in a way no individual record shows.
+            primed.add(stream_k)
+            continue
+        if "routine" not in r:
             continue
         ids[dc.canon_matrix_id(r.get("matrix_id"))] += 1
+        cell = (r.get("routine"), r.get("m"), r.get("n"), r.get("k"), r.get("lda_pad"),
+                r.get("incx"), r.get("transa"), r.get("transb"))
+        if r.get("record") == "case_skipped":
+            # A declined case carries a routine, so it reaches this point and must be
+            # accounted for separately. Counting it as measured would let a stream
+            # that declined EVERY case look complete; not counting it at all would
+            # make the thread-dependent large ladder read as a short sweep. The
+            # matrix is honoured when measured + declined covers it, and a decline
+            # only counts as accounted-for when it says why.
+            declined[stream_k].add(cell)
+            if not (r.get("reason") or "").strip():
+                unreasoned[stream_k].add(cell)
+            continue
         if (r.get("probe") or "none") != "none":
             # A probe record re-measures a matrix case under the other floor, so
             # counting it toward the sweep's case set would make a dataset with the
             # band look complete when the band is exactly what is extra.
             continue
         counts[r.get("matrix_cases")] += 1
-        stream = (r.get("run_id"), r.get("library"), r.get("target"), r.get("coretype"), r.get("threads"))
-        cases[stream].add(
-            (r.get("routine"), r.get("m"), r.get("n"), r.get("k"), r.get("lda_pad"),
-             r.get("incx"), r.get("transa"), r.get("transb"))
-        )
+        cases[stream_k].add(cell)
+        if "warmup_reps" not in r or "cal_reused" not in r:
+            nofield += 1
+        else:
+            warmups.append(r["warmup_reps"])
+            if r["cal_reused"] and (r.get("batch", 1) != 1 or r["warmup_reps"] != 0):
+                reuse_bad += 1
 
 if len(ids) != 1:
     bad.append(f"{len(ids)} matrix_ids: {sorted(ids)} — decompose.py refuses this outright (bit 64)")
@@ -338,22 +371,70 @@ if len(declared) != 1:
     bad.append(f"matrix_cases is not one number across the dataset: {sorted(map(str, counts))}")
 elif not bad:
     want = next(iter(declared))
-    short = {s: len(c) for s, c in cases.items() if len(c) != want}
+    # measured + declined, not measured alone. bench.c truncates the large ladder at
+    # low thread counts and writes a case_skipped record for each omission, so a
+    # 1-thread stream is SHORT ON MEASUREMENTS BY DESIGN and complete on accounting.
+    # Checking measurements alone would fail every 1-thread stream; checking the
+    # union without checking the reasons would accept a sweep that declined
+    # everything. Both halves are load-bearing.
+    short = {s: (len(c), len(declined.get(s, ()))) for s, c in cases.items()
+             if len(c | declined.get(s, set())) != want}
     if short:
-        worst = sorted(short.items(), key=lambda kv: kv[1])[:3]
+        worst = sorted(short.items(), key=lambda kv: sum(kv[1]))[:3]
         bad.append(
-            f"{len(short)} of {len(cases)} (arm, threads) streams measured a different number of "
-            f"distinct cases than matrix_cases={want} declares: "
-            + ", ".join(f"{'/'.join(str(x) for x in s[1:])}={n}" for s, n in worst)
+            f"{len(short)} of {len(cases)} (arm, threads) streams account for a different number "
+            f"of distinct cases than matrix_cases={want} declares: "
+            + ", ".join(f"{'/'.join(str(x) for x in s[1:])}={m}+{d} declined" for s, (m, d) in worst)
             + ". Every other coverage check in the repo is derived from the data and so cannot "
               "see a dataset that is uniformly short; the stamp is the only absolute expectation"
+        )
+    if unreasoned:
+        n = sum(len(c) for c in unreasoned.values())
+        bad.append(
+            f"{n} declined cases across {len(unreasoned)} streams carry no reason. Standing "
+            f"order 11 at case granularity: a case absent from EVERY arm at a thread point "
+            f"produces no cell at all, so a data-derived census cannot see it and the record's "
+            f"own reason is the only thing separating policy from a hole"
+        )
+    unprimed = sorted(set(cases) - primed)
+    if unprimed:
+        bad.append(
+            f"{len(unprimed)} of {len(cases)} streams have no thread_prime record, e.g. "
+            + ", ".join("/".join(str(x) for x in s[1:]) for s in unprimed[:3])
+            + ". Warmup is a per-process cost and the priming call is where it is paid; "
+              "without it thread 2..N's buffer pool is allocated inside a timed region"
+        )
+    # The timing policy, read off the records rather than recomputed. Three claims:
+    # the fields exist at all (a pre-change binary produces none of them, and that is
+    # a dataset whose cost basis does not describe the campaign that will run); the
+    # no-warmup path was actually reached somewhere (or the policy is present and
+    # inert); and reuse never happened outside its own preconditions. The last is the
+    # only one that could corrupt a number: reusing the calibration call when the
+    # case was batched, or when warmup ran after it, means samples[0] is not the
+    # coldest comparable call and the reading is flattered.
+    if nofield:
+        bad.append(
+            f"{nofield} measurements carry no warmup_reps/cal_reused. This is a pre-policy "
+            f"binary, so its per-case wall clock is not the cost basis the campaign will run on"
+        )
+    elif not any(w == 0 for w in warmups):
+        bad.append(
+            "no case in the dataset reached the no-warmup path, so the conditional warmup is "
+            "present and inert and the expensive end is still paying for it"
+        )
+    if reuse_bad:
+        bad.append(
+            f"{reuse_bad} measurements report cal_reused with batch>1 or warmup_reps>0: the "
+            f"calibration call was reused where it is not the coldest comparable call"
         )
 
 print(
     "; ".join(bad)
     if bad
     else f"matrix_id={next(iter(ids))} cases={next(iter(declared))}, honoured by all "
-         f"{len(cases)} (arm, threads) streams"
+         f"{len(cases)} (arm, threads) streams "
+         f"({sum(len(c) for c in declined.values())} declined with reasons, all primed, "
+         f"{sum(1 for w in warmups if w == 0)}/{len(warmups)} cases past the warmup boundary)"
 )
 sys.exit(1 if bad else 0)
 EOF
@@ -383,6 +464,13 @@ for p in sorted(res.glob("bench-*.ndjson")):
         except json.JSONDecodeError:
             continue
         if not isinstance(r, dict) or "routine" not in r:
+            continue
+        if r.get("record"):
+            # A `case_skipped` record carries a routine, and an arm that declined
+            # cases and measured nothing is NOT present. Counting bookkeeping as
+            # evidence of an arm having run would make the ARMV8-at-1-thread
+            # requirement satisfiable by a stream that produced no numbers, which is
+            # the arm most likely to be cut and the one the extrapolation rests on.
             continue
         if (r.get("probe") or "none") != "none":
             continue
@@ -671,6 +759,9 @@ missing = 0
 nonpositive = 0
 total = 0.0
 probe_total = 0.0
+prime_total = 0.0
+declined_total = 0.0
+declined_n = 0
 for p in sorted(res.glob("bench-*.ndjson")):
     for line in p.read_text(errors="replace").splitlines():
         if not line.strip():
@@ -679,7 +770,26 @@ for p in sorted(res.glob("bench-*.ndjson")):
             r = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(r, dict) or "routine" not in r:
+        if not isinstance(r, dict):
+            continue
+        kind = r.get("record")
+        if kind in ("thread_prime", "case_skipped"):
+            # Overhead, not measurement, and accounted for separately rather than
+            # dropped. bench.c closes the wall-clock interval on these records too, so
+            # the case_seconds column still sums to the process's wall clock -- and
+            # that additivity is the whole reason the cost basis can be read off the
+            # records at all. Folding them into `total` would inflate the per-case
+            # figures the expansion multiplies; dropping them would make the pass look
+            # cheaper than the instance-hours it bills.
+            cs = r.get("case_seconds")
+            if isinstance(cs, (int, float)) and cs >= 0:
+                if kind == "thread_prime":
+                    prime_total += cs
+                else:
+                    declined_total += cs
+                    declined_n += 1
+            continue
+        if "routine" not in r:
             continue
         if "case_seconds" not in r:
             missing += 1
@@ -717,6 +827,11 @@ if not bad:
     slowest, slowest_s = ranked[0]
     print(f"pass wall clock across all arms: {total / 3600:.2f} instance-hours of measurement")
     print(f"    (plus {probe_total:.1f} s in the floor-overlap band)")
+    print(
+        f"    (plus {prime_total:.1f} s priming thread pools and {declined_total:.1f} s "
+        f"declining {declined_n} capped large cases — the overhead the timing policy moved "
+        f"out of the measurements)"
+    )
     print("    most expensive arms:")
     for (arm, thr), s in ranked[:5]:
         print(f"      {arm:34s} t={thr!s:<4} {s / 60:8.1f} min over {arm_cases[(arm, thr)]:5d} cases")

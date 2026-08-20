@@ -89,6 +89,53 @@ def min_seconds_for(m):
 # TIMED_LOOP and these two constants are what give the model its shape.
 MIN_SAMPLES = 8
 MAX_MEASURE_SECONDS = 3.0
+MIN_BATCH_SECONDS = 1.0e-3
+ABS_MIN_SAMPLES = 3
+
+# bench.c's conditional-warmup policy, hand-copied on the same terms and asserted in
+# gates/p1.sh. The two fields the policy writes per record (warmup_reps, cal_reused)
+# are not decoration: they are the only way to tell from a dataset which timing path
+# a case took, and gate P2 checks that the expensive end actually stopped paying for
+# warmup on real data. A fixture that hard-coded warmup_reps=2 everywhere would make
+# that check pass on a dataset where the policy had been reverted.
+WARMUP_REPS = 2
+WARMUP_MAX_FRACTION = 0.02
+# bench.c's large_cap_for_threads(): below this many threads the large ladder stops
+# at LARGE_CAP_LOW and the omitted sizes emit case_skipped records instead.
+LARGE_CAP_MIN_THREADS = 8
+LARGE_CAP_LOW = 4096
+
+
+def large_cap_for_threads(t):
+    return LARGE_CAP_LOW if (t or 1) < LARGE_CAP_MIN_THREADS else max(SIZES_LARGE)
+
+
+def timing_path_for(t_min, min_seconds):
+    """(warmup_reps, cal_reused) as bench.c's TIMED_LOOP would decide them.
+
+    Reproduced rather than modelled, because unlike case_seconds these two fields are
+    DISCRETE and are checked for their exact values downstream -- a model that got the
+    boundary roughly right would put the boundary in a different place from the
+    producer and every assertion about "the expensive end stopped warming up" would be
+    asserting about the fixture's boundary instead of bench.c's.
+
+    The one thing not reproduced is the two-stage calibration, so batch is taken as 1
+    whenever a call already exceeds MIN_BATCH_SECONDS -- which is the only regime where
+    either field is interesting, and is where every expensive case lives."""
+    # t_min == 0 is the timer-outrun arm (Arm.zero_gflops), and it is the LIMIT of
+    # this function rather than an error case: a call too fast to time is batched
+    # (so the calibration call cannot be reused) and its warmup is free (so warmup
+    # runs). Returned explicitly because the arithmetic below would divide by it.
+    if t_min <= 0.0:
+        return WARMUP_REPS, False
+    batch = 1 if t_min >= MIN_BATCH_SECONDS else max(1, int(MIN_BATCH_SECONDS / t_min))
+    per = batch * t_min
+    ns = max(MIN_SAMPLES, int(min_seconds / per) + 1)
+    fit = int(MAX_MEASURE_SECONDS / per)
+    if ns > fit:
+        ns = fit if fit > ABS_MIN_SAMPLES else ABS_MIN_SAMPLES
+    warm = WARMUP_REPS if WARMUP_REPS * t_min <= WARMUP_MAX_FRACTION * ns * per else 0
+    return warm, (batch == 1 and warm == 0)
 
 
 def case_seconds_for(t_min, min_seconds, bytes_touched):
@@ -107,9 +154,16 @@ def case_seconds_for(t_min, min_seconds, bytes_touched):
     not tell a cost analysis that found the slowest arm from one that took the
     first. MAX_MEASURE_SECONDS is the cap that stops the largest cases running away.
     The allocate-and-fill term is a flat 20 GB/s, which is the right order for a
-    Graviton and is not asserted anywhere."""
+    Graviton and is not asserted anywhere.
+
+    The warmup and calibration terms are here because they are the whole point of the
+    policy change they model: at the expensive end they are the difference between six
+    calls and three, and a cost model that omitted them would report the saving as
+    zero and the fixtures would certify a cost analysis that could not see it."""
+    warm, reused = timing_path_for(t_min, min_seconds)
     measure = min(MAX_MEASURE_SECONDS, max(min_seconds, MIN_SAMPLES * t_min))
-    return round(measure + bytes_touched / 2.0e10, 6)
+    overhead = warm * t_min + (0.0 if reused else t_min)
+    return round(measure + overhead + bytes_touched / 2.0e10, 6)
 
 
 def case_bytes(r, m, n, k):
@@ -290,6 +344,17 @@ class Arm:
     # swapping min for max across a run left every scenario green.
     lucky_dup: float = 0.0
     verified_false_routines: tuple = ()
+    # This arm's streams emit no `thread_prime` record -- a build whose warmup fix
+    # never landed, or a runner that lost the priming call. It is not a data hole
+    # (every measurement is still present), which is exactly why it needs its own
+    # switch: the damage is that thread 2..N's buffer-pool allocation lands INSIDE a
+    # timed region, so the records are all there and some of them are quietly wrong.
+    no_thread_prime: bool = False
+    # This arm's declined large cases carry `"reason": ""`. Standing order 11 at case
+    # granularity: an absence with an empty reason is indistinguishable from a hole
+    # to anything that only checks the field's presence, so the guard has to check
+    # its content and a fixture has to be able to violate that.
+    skip_without_reason: bool = False
     sve_kernels: str = "yes"
     manifest_built: bool = True
     manifest_runnable: bool = True
@@ -613,7 +678,89 @@ def bench_records(sc: Scenario, host: HostSpec):
             if token in (arm.target, arm.coretype):
                 boost *= mult
         for threads in host.threads:
+            # The provenance prefix bench.c's emit_prefix() shares across all three
+            # record kinds. Built once here rather than spelled out per kind, for the
+            # reason emit_prefix() exists: a record kind carrying a SUBSET of these
+            # fields is worse than one carrying none, because decompose.py's role gate
+            # and instance dispatch both read them and a missing `role` silently files
+            # the record under whatever role the reader defaulted to.
+            prov = {
+                "run_id": host.run_id,
+                "host": f"ip-10-0-0-{abs(hash(host.instance_id)) % 200}",
+                "instance": host.instance_type,
+                "library": arm.library,
+                "target": arm.target,
+                "build": "synthetic",
+                "blas_sha": sha,
+                "coretype": arm.coretype,
+                "thread_backend": arm.thread_backend,
+                "pin_policy": "taskset -c 0" if threads == 1 else f"numactl -C 0-{threads - 1}",
+                "arch_selected": host.dynamic_selection,
+                "role": "campaign",
+                # Matrix records, so "none". Emitted rather than left absent even
+                # though decompose.py defaults absence to the same value: bench.c
+                # writes the field on every record, and a fixture that relies on the
+                # default is not testing the producer's output, it is testing the
+                # consumer's fallback. The floor-overlap records are written by
+                # floor_probe_records() below.
+                "probe": "none",
+                **mfields,
+                "threads": threads,
+            }
+            # The once-per-process priming call, one per (arm, threads) stream because
+            # that is one process. Emitted for every stream a real sweep would have
+            # produced one for, so that a fixture cannot make decompose.py's
+            # unprimed-stream warning quiet by simply never having primed anything.
+            if not arm.no_thread_prime:
+                recs.append(
+                    {
+                        "record": "thread_prime",
+                        **prov,
+                        "case_seconds": 0.02,
+                        "prime_n": 1024,
+                        "prime_seconds": 0.004,
+                        "note": "per-thread buffer pool allocated outside every measurement",
+                    }
+                )
+            cap = large_cap_for_threads(threads)
             for routine, m, n, k, pad, incx, ta, tb in conds:
+                # bench.c's thread-dependent large cap, and it comes BEFORE the
+                # scenario's own omissions on purpose. The cap is a structural
+                # property of the harness that every arm shares, so it produces an
+                # explained absence; omit_sizes models an arm that LOST cases, which
+                # is a hole. Collapsing the two would let a fixture plant a hole and
+                # have it read as policy.
+                #
+                # Restricted to cases drawn from SIZES_LARGE, because that is where
+                # bench.c's cap can reach: it lives inside sweep(), and the level-1
+                # cases do not go through sweep() -- they are built directly from
+                # `lens[]` in main(). A cap applied on m alone truncates ddot at
+                # n=4194304, which is a 32 MB vector rather than a 512 MB working set
+                # and answers a bandwidth question the report does read. Caught by the
+                # incx-axis fixture, which lost its whole non-unit-stride axis.
+                if m in SIZES_LARGE and m > cap:
+                    recs.append(
+                        {
+                            "record": "case_skipped",
+                            **prov,
+                            "case_seconds": 0.00002,
+                            "routine": routine,
+                            "m": m,
+                            "n": n,
+                            "k": k,
+                            "lda_pad": pad,
+                            "incx": incx,
+                            "min_seconds": min_seconds_for(m),
+                            "reason": (
+                                ""
+                                if arm.skip_without_reason
+                                else "large-regime size above the cap for this thread count: "
+                                "answers no question the report reads, and is the most "
+                                "expensive arithmetic in the campaign"
+                            ),
+                        }
+                    )
+                    continue
                 if m in arm.omit_sizes or routine in arm.omit_routines:
                     continue
                 if m in arm.omit_routine_sizes.get(routine, ()):
@@ -659,28 +806,7 @@ def bench_records(sc: Scenario, host: HostSpec):
                             verified, note = False, "corner_check_failed"
                     recs.append(
                         {
-                            "run_id": host.run_id,
-                            "host": f"ip-10-0-0-{abs(hash(host.instance_id)) % 200}",
-                            "instance": host.instance_type,
-                            "library": arm.library,
-                            "target": arm.target,
-                            "build": "synthetic",
-                            "blas_sha": sha,
-                            "coretype": arm.coretype,
-                            "thread_backend": arm.thread_backend,
-                            "pin_policy": "taskset -c 0" if threads == 1 else f"numactl -C 0-{threads - 1}",
-                            "arch_selected": host.dynamic_selection,
-                            "role": "campaign",
-                            # Matrix records, so "none". Emitted rather than left
-                            # absent even though decompose.py defaults absence to
-                            # the same value: bench.c writes the field on every
-                            # record, and a fixture that relies on the default is
-                            # not testing the producer's output, it is testing the
-                            # consumer's fallback. The floor-overlap records are
-                            # written by floor_probe_records() below.
-                            "probe": "none",
-                            **mfields,
-                            "threads": threads,
+                            **prov,
                             "routine": routine,
                             "m": m,
                             "n": n,
@@ -702,6 +828,11 @@ def bench_records(sc: Scenario, host: HostSpec):
                             "case_seconds": case_seconds_for(
                                 t_min, min_seconds_for(m), case_bytes(routine, m, n, k)
                             ),
+                            # Reproduced rather than modelled, and reproduced from
+                            # t_min so a slow arm lands on the no-warmup path exactly
+                            # where bench.c would put it. See timing_path_for().
+                            "warmup_reps": timing_path_for(t_min, min_seconds_for(m))[0],
+                            "cal_reused": timing_path_for(t_min, min_seconds_for(m))[1],
                             # Part of the comparison key, so it is emitted per
                             # regime the way bench.c does rather than left absent.
                             "min_seconds": min_seconds_for(m),
@@ -849,6 +980,19 @@ def floor_probe_records(sc: Scenario, host: HostSpec):
     return recs
 
 
+def measurements(bench):
+    """The measurement records out of a bench stream.
+
+    bench.c's bench-*.ndjson is not homogeneous: emit_prefix() also writes
+    `thread_prime` and `case_skipped` records, which carry the provenance prefix and
+    a `case_seconds` but no gflops and no timing. Anything deriving a NUMBER from
+    the stream has to drop them first, and the filter is a named function rather
+    than an inline `if` at each site because the failure mode is silent in one
+    direction: a `case_skipped` record read as a measurement is a case at zero
+    GFLOP/s, which is the shape of a real defect."""
+    return [r for r in bench if not r.get("record")]
+
+
 def honest_records(bench):
     """One record per (run_id, arm, condition) -- the slower one, where an Arm
     planted a lucky duplicate.
@@ -859,7 +1003,7 @@ def honest_records(bench):
     a scenario whose stated claim is 'the cross stays a null' must not also be
     quietly asserting an anomaly it never mentions."""
     best = {}
-    for r in bench:
+    for r in measurements(bench):
         key = (
             r["run_id"],
             r["library"],
@@ -1219,8 +1363,14 @@ def write_scenario(sc: Scenario, root: pathlib.Path):
                 q = dict(r)
                 q["role"] = host.foreign_role
                 q["run_id"] = f"instr-{host.foreign_role}-castor"
-                q["gflops"] = r["gflops"] * host.foreign_role_gain
-                q["gflops_p50"] = r["gflops_p50"] * host.foreign_role_gain
+                # The non-measurement records are copied across unscaled rather than
+                # dropped. An instrument-check stream that primed its thread pool and
+                # declined the same large cases is what the S3 path actually produces,
+                # and a leak fixture whose foreign stream is missing them would be
+                # testing a leak shape that cannot occur.
+                if not r.get("record"):
+                    q["gflops"] = r["gflops"] * host.foreign_role_gain
+                    q["gflops_p50"] = r["gflops_p50"] * host.foreign_role_gain
                 leaked.append(q)
             _w(res / f"bench-instr-{host.foreign_role}-castor.ndjson", leaked)
         if host.roofline_present:

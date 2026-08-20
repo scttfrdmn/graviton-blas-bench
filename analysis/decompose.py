@@ -655,6 +655,12 @@ class Inputs:
     missing_families: list = field(default_factory=list)
     escalation_acks: list = field(default_factory=list)
     foreign_roles: dict = field(default_factory=lambda: defaultdict(int))
+    # Non-measurement records bench.c writes about its own timing policy. Kept out
+    # of `bench` by construction -- the dispatch below matches on `record` before it
+    # matches on `routine`, so a case_skipped record carrying routine/m/n/k cannot
+    # reach a cell and be read as a measurement of zero.
+    primes: list = field(default_factory=list)
+    skipped: list = field(default_factory=list)
 
 
 def load(results_dir: pathlib.Path, role: str = DEFAULT_ROLE) -> Inputs:
@@ -714,6 +720,20 @@ def load(results_dir: pathlib.Path, role: str = DEFAULT_ROLE) -> Inputs:
             elif rec == "arm_outcome":
                 r["coretype"] = canon_coretype(r.get("coretype"))
                 d.outcomes.append(r)
+            elif rec == "thread_prime":
+                # The once-per-process untimed call that pays OpenBLAS's lazy
+                # per-thread buffer allocation outside every measurement. Its absence
+                # from a stream means the sweep's first measured case is carrying that
+                # allocation, so it is checked rather than merely stored.
+                d.primes.append(r)
+            elif rec == "case_skipped":
+                # A case the design contains and this thread count deliberately did
+                # not run, with its reason. Standing order 11 at case granularity:
+                # this is what makes the truncated large ladder an explained absence
+                # instead of a hole, and it is the only thing that can distinguish
+                # the two, because a cell absent from every arm at one thread point
+                # is invisible to a data-derived coverage census.
+                d.skipped.append(r)
             elif "metric" in r:
                 d.roof.append(r)
             elif "routine" in r:
@@ -2366,7 +2386,7 @@ def compute_scaling(cells, roof, args):
     for (cond, _arm), c in cells.items():
         inst, thr, routine, m = cond[0], cond[1], cond[2], cond[3]
         if routine == "dgemm" and regime(m or 0) == "large":
-            best[(inst, thr)].append(c.value)
+            best[(inst, thr)].append((c.value, m))
     peaks = defaultdict(list)
     for r in roof:
         if r.get("metric") in ("peak_fma", "peak_fma_allcore"):
@@ -2377,7 +2397,19 @@ def compute_scaling(cells, roof, args):
     rows = []
     for key in sorted(set(best) | set(peaks), key=skey):
         inst, thr = key
-        emp = max(best[key]) if best.get(key) else None
+        # WHICH SIZE the denominator came from, and how many sizes it was chosen
+        # over. bench.c truncates the large ladder at low thread counts
+        # (large_cap_for_threads), so at one thread this max() is taken over three
+        # sizes rather than five. Single-thread DGEMM GFLOP/s is flat to declining
+        # above n=2048, so the max is not expected to move -- but standing order 1
+        # is the one policy in this repo that is not allowed to rest on "not
+        # expected to". Printing the winning size makes a max sitting AT the top of
+        # a truncated ladder visible to a reader, which is the case where the
+        # truncation could be holding the denominator down.
+        top = max(best[key], key=lambda vm: vm[0]) if best.get(key) else None
+        emp = top[0] if top else None
+        emp_m = top[1] if top else None
+        n_sizes = len({m for _v, m in best[key]}) if best.get(key) else 0
         # An empty peak list must stay None. It used to collapse to 0, so the
         # cross-check printed `nan` and vanished instead of announcing itself.
         pk = max(peaks[key]) if peaks.get(key) else None
@@ -2387,6 +2419,8 @@ def compute_scaling(cells, roof, args):
                 "instance": inst,
                 "threads": thr,
                 "best_dgemm": emp,
+                "best_dgemm_m": emp_m,
+                "large_sizes_available": n_sizes,
                 "peak_fma": pk,
                 "headroom_ratio": ratio,
                 "peak_fma_status": (
@@ -2409,7 +2443,17 @@ def report_scaling(rows, out):
         pk = "absent (cross-check NOT performed)" if s["peak_fma"] is None else f"{s['peak_fma']:9.2f}"
         emp = "absent" if s["best_dgemm"] is None else f"{s['best_dgemm']:9.2f}"
         flag = "  <-- headroom, see section 5" if s["peak_fma_status"] == "headroom" else ""
-        out(f"  {s['instance']!s:14s} t={s['threads']!s:<4} best_large_dgemm={emp} peak_fma={pk}{flag}")
+        # Which size won, and out of how many. bench.c runs a shorter large ladder at
+        # low thread counts, so a denominator that came from the largest size STILL
+        # AVAILABLE is the one a reader should look at twice — that is where a longer
+        # ladder could have found a higher max and the truncation would be holding
+        # standing order 1's denominator down.
+        at = (
+            ""
+            if s["best_dgemm_m"] is None
+            else f" at n={s['best_dgemm_m']} of {s['large_sizes_available']} size(s)"
+        )
+        out(f"  {s['instance']!s:14s} t={s['threads']!s:<4} best_large_dgemm={emp}{at} peak_fma={pk}{flag}")
     if not rows:
         out("  no large dgemm and no peak_fma record")
 
@@ -2568,10 +2612,59 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
                 f"{explained_why[(inst, arm, status)] or 'no reason recorded'}"
             )
 
+    # CASES DECLINED BY THE HARNESS ITSELF, which no census above can see.
+    #
+    # Every classification above is derived from the data: a cell exists because some
+    # arm measured it. That is the right way round for arms, and it is blind in one
+    # specific place -- a case that NO arm at a thread point ran produces no cell at
+    # all, so it is neither measured nor missing, it is simply not in the table. The
+    # truncated large ladder is exactly that shape (bench.c large_cap_for_threads),
+    # and reporting it here is what keeps it an explained absence rather than an
+    # absence nobody has to explain. Printed unconditionally when present, because a
+    # reader comparing thread points needs to know the ladders were different lengths
+    # before they compare anything across them.
+    skipped_by = defaultdict(int)
+    skip_reason = {}
+    for r in inp.skipped:
+        key = (r.get("instance"), r.get("threads"), r.get("routine"), r.get("m"))
+        skipped_by[(r.get("instance"), r.get("threads"))] += 1
+        skip_reason[key] = r.get("reason") or ""
+    if skipped_by:
+        sizes = sorted({r.get("m") for r in inp.skipped if isinstance(r.get("m"), int)})
+        out(f"\n  cases declined by the harness ({len(inp.skipped)} records), by thread point:")
+        for (inst, thr), n in sorted(skipped_by.items(), key=lambda kv: skey(kv[0])):
+            out(f"    {inst!s:14s} t={thr!s:<4} {n:<5} cases not run")
+        out(f"    sizes involved: {', '.join(str(s) for s in sizes)}")
+        why = sorted({v for v in skip_reason.values() if v})
+        for w in why[:3]:
+            out(f"    reason: {w}")
+        no_reason = sum(1 for v in skip_reason.values() if not v)
+        if no_reason:
+            out(
+                f"    !! {no_reason} declined case(s) carry NO reason. Standing order 11: a gap "
+                f"without a reason is not an explained absence, it is a hole with a record in front of it."
+            )
+
+    # The once-per-process priming call. Its absence means the first measured case in
+    # that stream carried OpenBLAS's lazy per-thread buffer allocation inside a timed
+    # region, which inflates one case and is invisible in the record for that case.
+    if inp.bench:
+        streams = {(r.get("instance"), r.get("run_id"), arm_of(r), r.get("threads")) for r in inp.bench}
+        primed = {(r.get("instance"), r.get("run_id"), arm_of(r), r.get("threads")) for r in inp.primes}
+        unprimed = streams - primed
+        if unprimed:
+            out(
+                f"\n  {len(unprimed)} of {len(streams)} arm x thread stream(s) carry no thread_prime "
+                f"record: their first measured case absorbed the buffer-pool allocation."
+            )
+
     inadmissible = sorted(i for i, h in hosts.items() if not h.admissible)
     if inadmissible:
         out(f"\n  hosts whose cells cannot support a verdict: {', '.join(map(str, inadmissible))}")
     return {
+        "declined_cases": len(inp.skipped),
+        "declined_without_reason": sum(1 for r in inp.skipped if not (r.get("reason") or "")),
+        "thread_prime_records": len(inp.primes),
         "expected_cells": sum(tally.values()),
         "by_status": dict(tally),
         "missing_unexplained": tally.get("MISSING-UNEXPLAINED", 0),

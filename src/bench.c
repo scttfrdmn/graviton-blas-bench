@@ -120,7 +120,52 @@
 #define MIN_SAMPLES          8         /* fewest that admit p50 != p90       */
 #define MAX_SAMPLES          1000
 #define MAX_MEASURE_SECONDS  3.0       /* wall-clock cap for one case        */
-#define WARMUP_REPS          2
+#define WARMUP_REPS          2         /* ... where warmup is nearly free    */
+#define WARMUP_MAX_FRACTION  0.02      /* ... and that is what "nearly" means */
+#define PRIME_N              1024      /* thread-pool priming size; see below */
+#define LARGE_CAP_MIN_THREADS 8        /* below this, the large ladder stops... */
+#define LARGE_CAP_LOW        4096      /* ...here; see large_cap_for_threads() */
+
+/* WARMUP IS A PER-PROCESS COST THAT WAS BEING PAID PER CASE.
+ *
+ * WARMUP_REPS arrived with no comment. Its only defensible justification is that
+ * OpenBLAS allocates its per-thread buffer pool lazily, on the first call in each
+ * thread that needs one, and a measurement containing that allocation is timing
+ * malloc. But a pool is allocated once and lives for the process, so the second
+ * case in a sweep has nothing left to warm -- and by the time a stream reaches the
+ * top of the large ladder it has run five hundred cases and the pool has been warm
+ * for most of an hour. At one thread an n=8192 DGEMM call is tens of seconds, so
+ * two warmup calls there spend minutes of the campaign's most expensive arithmetic
+ * on a question that was settled before the first medium case.
+ *
+ * The naive fix -- warm only the first case -- is wrong, and wrong in the direction
+ * that corrupts data rather than the direction that wastes it. The pool is per
+ * THREAD, and OpenBLAS runs small problems single-threaded whatever
+ * OPENBLAS_NUM_THREADS says. The first case in the sweep is n=8 and recruits one
+ * thread; threads 2..N would allocate their pools on the first case large enough to
+ * recruit them, somewhere in the middle of the ladder, and a first-case-only warmup
+ * would move that allocation INTO a timed region instead of out of one.
+ *
+ * So the per-process cost is paid once, explicitly, by prime_threads(): a single
+ * untimed DGEMM at PRIME_N, large enough to be over any OpenBLAS multithreading
+ * threshold and therefore to recruit every thread this process will ever use. It
+ * runs after the dry pass and before the first case, it is not a measurement, and
+ * it emits a record saying it happened -- a silent priming call is indistinguishable
+ * from a missing one, and this file's whole history is defects that were invisible.
+ *
+ * With the pool primed and fill_*() having already written every byte of every
+ * operand (so first-touch faults are not a per-case timing hazard either), per-case
+ * warmup has no remaining justification at the expensive end. It is kept where it is
+ * free, as insurance against anything the two paragraphs above did not model, and
+ * dropped where it is not. WARMUP_MAX_FRACTION is the whole rule: warm up while
+ * WARMUP_REPS calls cost less than 2% of the measurement they precede. That is
+ * self-scaling -- no new size threshold to keep in step with the regimes -- and it
+ * decides the cases the cost model cares about the right way round. At n=8 the
+ * measurement is 0.05 s and two calls are nanoseconds, so warmup runs; at n=8192 on
+ * one thread a single call exceeds the entire measurement budget, so it does not.
+ *
+ * Both decisions are recorded per case (warmup_reps, cal_reused), because a timing
+ * policy that varies by case and does not say so per case is not auditable. */
 
 /* ---- Fortran BLAS ABI ------------------------------------------------- */
 extern void dgemm_(const char*, const char*, const int*, const int*, const int*,
@@ -519,6 +564,17 @@ static double g_min_seconds = MIN_SECONDS;
    g_batch. */
 static int g_incx = 1;
 
+/* Which timing path the case actually took. Set by TIMED_LOOP, emitted by emit().
+   Both are decisions the harness makes per case on the basis of how expensive the
+   case turned out to be, and neither is recoverable from reps/batch/calls: a case
+   with warmup_reps=0 and one with warmup_reps=2 produce identical timing fields and
+   differ by two calls of wall clock. Recorded so that "the expensive end stopped
+   paying for warmup" is a fact about the dataset rather than a claim about the
+   source, and so gates/p2.sh can check it on the artifact (see also standing order
+   10's rule about observed-versus-intended, which is the same principle). */
+static int g_warmup_reps = 0;
+static int g_cal_reused  = 0;
+
 /* WALL-CLOCK ACCOUNTING, and it is a cost instrument rather than a measurement.
  *
  * The spend policy's planning basis is $500-650 for three P3 passes and it says in
@@ -593,6 +649,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"incx\":%d,"
            "\"reps\":%d,\"batch\":%ld,\"calls\":%ld,"
            "\"case_seconds\":%.6f,"
+           "\"warmup_reps\":%d,\"cal_reused\":%s,"
            "\"min_seconds\":%.3f,"
            "\"timer_overhead_ns\":%.3f,\"timer_res_ns\":%.3f,"
            "\"t_min\":%.9g,\"t_p50\":%.9g,\"t_p90\":%.9g,"
@@ -605,11 +662,85 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            g_incx,
            reps, g_batch, (long)reps * g_batch,
            case_seconds,
+           g_warmup_reps, g_cal_reused ? "true" : "false",
            g_min_seconds,
            g_timer_overhead * 1e9, g_timer_res * 1e9,
            tmin, p50, p90,
            gf, gf_p50,
            vstr, note ? note : "");
+    fflush(stdout);
+}
+
+/* The provenance prefix, shared by every record this file writes.
+ *
+ * Factored out when the second and third record kinds arrived rather than copied,
+ * because a record kind that carries a SUBSET of the provenance is worse than one
+ * that carries none: decompose.py's role gate and instance dispatch both read these
+ * fields, and a record missing `role` silently belongs to whatever role the reader
+ * defaulted to. Every kind gets the same fourteen fields and the same `threads`, and
+ * they diverge only after that.
+ *
+ * Closes the wall-clock interval on the same terms emit() does, so that a stream
+ * containing skipped cases still has the additivity property the g_last_emit block
+ * claims: sum case_seconds over ALL of an arm's records and you get its sweep. A
+ * record kind that did not close the interval would silently fold its own duration
+ * into the next measurement, which is the one place this field must not lie. */
+static void emit_prefix(const char *record) {
+    double now_s = now();
+    double case_seconds = (g_last_emit > 0.0) ? now_s - g_last_emit : 0.0;
+    g_last_emit = now_s;
+    printf("{\"record\":\"%s\","
+           "\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\","
+           "\"library\":\"%s\",\"target\":\"%s\",\"build\":\"%s\","
+           "\"blas_sha\":\"%s\",\"coretype\":\"%s\","
+           "\"thread_backend\":\"%s\",\"pin_policy\":\"%s\","
+           "\"arch_selected\":\"%s\",\"role\":\"%s\",\"probe\":\"%s\","
+           "\"matrix_id\":\"%s\",\"matrix_cases\":%ld,"
+           "\"threads\":%d,\"case_seconds\":%.6f,",
+           record,
+           g_run_id, g_host, g_instance, g_library, g_target, g_build,
+           g_blas_sha, g_coretype, g_thread_backend, g_pin_policy,
+           g_arch_selected, g_role, g_probe,
+           g_matrix_id, g_matrix_cases,
+           g_threads, case_seconds);
+}
+
+/* One untimed DGEMM, once per process, to pay OpenBLAS's lazy per-thread buffer
+   allocation outside every measurement. See the WARMUP_MAX_FRACTION block.
+   PRIME_N is 1024, which is three orders of magnitude over any OpenBLAS
+   multithreading threshold, so every thread this process will use is recruited and
+   allocates its pool here. The elapsed time is reported because it is the size of
+   the cost that used to be smeared across the sweep, and because a priming call
+   that silently did not happen -- a library that ignores the thread count, a
+   TARGET= build that runs single-threaded -- looks exactly like one that did. */
+static void prime_threads(void) {
+    int n = PRIME_N, lda = n;
+    double alpha = 1.0, beta = 1.0;
+    double *A = xalloc((size_t)n*n*sizeof(double));
+    double *B = xalloc((size_t)n*n*sizeof(double));
+    double *C = xalloc((size_t)n*n*sizeof(double));
+    fill_d(A,(size_t)n*n); fill_d(B,(size_t)n*n); fill_d(C,(size_t)n*n);
+    double t0 = now();
+    dgemm_("N","N",&n,&n,&n,&alpha,A,&lda,B,&lda,&beta,C,&lda);
+    double el = now() - t0;
+    free(A); free(B); free(C);
+    emit_prefix("thread_prime");
+    printf("\"prime_n\":%d,\"prime_seconds\":%.6f,"
+           "\"note\":\"per-thread buffer pool allocated outside every measurement\"}\n", n, el);
+    fflush(stdout);
+}
+
+/* A case the design contains and this thread count deliberately does not run.
+   Standing order 11 at case granularity: absent and null are different claims, and
+   the analysis must be able to tell "no one measured n=8192 at one thread because
+   it answers nothing" from "the n=8192 record is missing and nobody knows why".
+   The reason travels with the record rather than living in a comment here. */
+static void emit_case_skipped(const char *routine, int m, int n, int k, int lda_pad,
+                              const char *reason) {
+    emit_prefix("case_skipped");
+    printf("\"routine\":\"%s\",\"m\":%d,\"n\":%d,\"k\":%d,\"lda_pad\":%d,\"incx\":%d,"
+           "\"min_seconds\":%.3f,\"reason\":\"%s\"}\n",
+           routine, m, n, k, lda_pad, g_incx, g_min_seconds, reason);
     fflush(stdout);
 }
 
@@ -619,13 +750,19 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
    passes provenance through file-scope globals, so it is consistent. */
 #define TIMED_LOOP(CALL)                                                      \
     do {                                                                      \
-        for (int w = 0; w < WARMUP_REPS; w++) { CALL; }                       \
         /* Stage 1: grow a batch until the interval is long enough that the    \
            clock's RESOLUTION is not what we are measuring. Timing ONE call to \
            size the batch does not work: at n=8 a dgemm call is ~58 ns, below  \
            the 41.7 ns tick on some hosts, so it reads as 0, gets clamped, and \
            the batch is sized from garbage. Measured, not hypothetical -- it   \
-           overshot by 58x and turned a 0.3 s measurement into 17.6 s. */      \
+           overshot by 58x and turned a 0.3 s measurement into 17.6 s.         \
+                                                                              \
+           This now runs BEFORE warmup rather than after it, because warmup is \
+           conditional on how expensive a call turns out to be and that is not \
+           known until something has been timed. Nothing about stage 1 needed  \
+           the warmup: its growth loop starts at one call and multiplies, so a \
+           cold first call makes it iterate one extra time at the cheap end    \
+           and is absorbed exactly where it costs nothing. */                  \
         long _b = 1; double _cal = 0.0;                                        \
         for (;;) {                                                             \
             double _c0 = now();                                                \
@@ -645,10 +782,38 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
         if (_ns > MAX_SAMPLES) _ns = MAX_SAMPLES;                               \
         int _fit = (int)(MAX_MEASURE_SECONDS / _per);                            \
         if (_ns > _fit) _ns = (_fit > ABS_MIN_SAMPLES) ? _fit : ABS_MIN_SAMPLES; \
+        /* Stage 3: warm up only where warmup is nearly free -- see the         \
+           WARMUP_MAX_FRACTION block at the top of this file. The budget is a   \
+           fraction of THIS measurement's own duration, so the rule needs no    \
+           size threshold and cannot drift out of step with the regimes. */     \
+        double _budget = WARMUP_MAX_FRACTION * (double)_ns * _per;               \
+        g_warmup_reps = (WARMUP_REPS * _one <= _budget) ? WARMUP_REPS : 0;       \
+        for (int w = 0; w < g_warmup_reps; w++) { CALL; }                        \
+        /* Stage 4: sample. The calibration interval IS a valid sample whenever  \
+           it timed exactly one call and the batch is also one call, and at the  \
+           expensive end that is always the case -- so reusing it removes one    \
+           full call of the campaign's slowest arithmetic per large case for     \
+           nothing. Three conditions, and all three are load-bearing:            \
+                                                                                \
+             _b == 1     the interval covers one call, not four or sixteen, so   \
+                         it is the same quantity a sample measures.              \
+             _bs == 1    a sample is also one call, so the two are commensurate. \
+             no warmup   if warmup ran between calibration and sampling then     \
+                         _cal is the colder measurement of a state that has      \
+                         since changed, and mixing it in would compare two       \
+                         different machine states inside one case.                \
+                                                                                \
+           Reuse is conservative in the direction that matters: _cal is the       \
+           COLDEST call of the case, so it can only raise t_min, t_p50 and t_p90. \
+           An arm can never be flattered by this, which is the property standing   \
+           order 1's denominator and every ratio in the report depend on. */      \
+        g_cal_reused = (_b == 1 && _bs == 1 && g_warmup_reps == 0) ? 1 : 0;       \
         double *_p = realloc(samples, (size_t)_ns * sizeof(double));            \
         if (!_p) { fprintf(stderr, "gbb: sample realloc failed\n"); exit(2); }  \
         samples = _p;                                                          \
-        for (int r = 0; r < _ns; r++) {                                          \
+        int _r0 = 0;                                                            \
+        if (g_cal_reused) { samples[0] = _cal; _r0 = 1; }                        \
+        for (int r = _r0; r < _ns; r++) {                                        \
             double _a = now();                                                 \
             for (long _i = 0; _i < _bs; _i++) { CALL; }                         \
             samples[r] = (now() - _a) / (double)_bs;                             \
@@ -837,6 +1002,58 @@ static const int LDA_PADS_EXTRA_LARGE[] = { 8 };            /* large only     */
    whoever edits this next. */
 static const char *PADDED_ROUTINES[] = { "dgemm", "dtrsm", "dsymm" };
 
+/* THE LARGE LADDER IS TRUNCATED AT LOW THREAD COUNTS, and this is a scope decision
+ * rather than an economy.
+ *
+ * What the large regime is for: does the blocking hold once the working set is far
+ * outside cache, and is the arm bandwidth-bound. At n=2048 a double operand is
+ * 33.5 MiB and the three of them are 100 MiB, already past the L3 of every host in
+ * the campaign, so 2048, 3072 and 4096 give three points outside cache and the
+ * regime's question is answered. n=6144 and n=8192 re-ask the same question at 3.4x
+ * and 8x the wall clock.
+ *
+ * At high thread counts that is affordable and they run. At one thread it is not: a
+ * single n=8192 DGEMM call is tens of seconds, the measurement floors at
+ * ABS_MIN_SAMPLES, and those two cases alone dominate the cost of the arm that
+ * anchors the campaign's whole cost extrapolation. And there is no hypothesis
+ * attached to them -- nobody will cite a single-threaded 8192-cube DGEMM, and no
+ * section of the report reads one. Spending the campaign's most expensive arithmetic
+ * on cells with no question behind them is not thoroughness.
+ *
+ * THREE PROPERTIES THAT MAKE THIS SAFE, and each of them is why the cap is a
+ * function of the thread count ALONE:
+ *
+ *   - The case set stays identical across arms at the same thread point, so every
+ *     comparison the report makes is still between arms that ran the same cases.
+ *     A cap that depended on how fast an arm was would make the fast arm's dataset
+ *     larger than the slow one's, which is the confound the campaign exists to
+ *     avoid (standing order 6).
+ *   - matrix_id is UNCHANGED. The dry pass folds the full design, so the stamp is a
+ *     claim about what the campaign measures and not about what one process ran. A
+ *     truncated stream and an untruncated one carry the same stamp and remain
+ *     poolable, which is exactly the property the stamp exists to protect.
+ *   - Every omitted case emits a record saying so (emit_case_skipped), so the
+ *     shortfall is an explained absence and not a gap. gates/p2.sh checks
+ *     measured + skipped == matrix_cases per stream, which is a stricter statement
+ *     than the count check it replaces.
+ *
+ * The one thing this does touch is standing order 1's denominator: section 6 takes
+ * max() over large dgemm at each thread point, and at one thread that max is now
+ * taken over three sizes rather than five. Single-thread DGEMM GFLOP/s is flat to
+ * declining above n=2048, so the max is not expected to move -- but "not expected
+ * to" is not the standard this repo holds denominators to, so decompose.py now
+ * reports WHICH size the max came from, and Scott has been asked about the policy
+ * rather than told about the change. */
+static int large_cap_for_threads(int t) {
+    /* Named constants rather than literals because tools/synth.py hand-copies this
+       policy and gates/p1.sh checks the copy by reading these two #defines out of
+       this file. A literal here would leave the fixture free to drift, and a drifted
+       fixture asserts the wrong boundary rather than nothing. */
+    return (t < LARGE_CAP_MIN_THREADS)
+               ? LARGE_CAP_LOW
+               : SIZES_LARGE[(int)(sizeof SIZES_LARGE / sizeof(int)) - 1];
+}
+
 static void sweep(const char *routine, const int *sizes, int nsizes, int lda_pad,
                   double min_seconds) {
     /* Resolved once, before the loop and before the dry-pass fold, because the two
@@ -865,14 +1082,25 @@ static void sweep(const char *routine, const int *sizes, int nsizes, int lda_pad
     }
 
     g_min_seconds = min_seconds;
+    int cap = large_cap_for_threads(g_threads);
     for (int i = 0; i < nsizes; i++) {
         Case c = { routine, sizes[i], sizes[i], sizes[i], lda_pad };
         /* The dry pass folds from the same loop that dispatches, on purpose: a
            separate enumeration of "what the matrix contains" is a second copy of the
            truth, and the copy is what drifts. incx is 1 for level 3 -- the field
            exists for the level-1 stride axis and every sweep() case is unit-stride
-           by construction. */
+           by construction.
+
+           The fold is deliberately NOT subject to the cap: the stamp describes the
+           design, not this process's share of it, so a one-thread stream and a
+           192-thread stream carry the same matrix_id and stay poolable. See
+           large_cap_for_threads(). */
         if (g_dry) fold_case(routine, c.m, c.n, c.k, lda_pad, 1, min_seconds);
+        else if (sizes[i] > cap)
+            emit_case_skipped(routine, c.m, c.n, c.k, lda_pad,
+                              "large-regime size above the cap for this thread count: "
+                              "answers no question the report reads, and is the most "
+                              "expensive arithmetic in the campaign");
         else driver(&c);
     }
 }
@@ -1025,6 +1253,11 @@ int main(int argc, char **argv) {
            nothing and takes microseconds, and charging it to the first case would put
            a fixed cost into a per-case number used to extrapolate. */
         g_last_emit = now();
+        /* After g_last_emit, so the priming call's own cost is charged to a record
+           of its own rather than to the first measured case -- it is a fixed per-arm
+           cost and this is where the accounting says fixed costs belong. Before the
+           first sweep, which is the entire point. */
+        prime_threads();
     }
 
     /* Level 3 across all three regimes, tight leading dimension. */

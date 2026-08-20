@@ -49,7 +49,14 @@ def _rewrite(path, fn):
 
 
 def _is_bench(r):
-    return "routine" in r
+    """A MEASUREMENT record, not merely a record carrying a routine.
+
+    bench.c's `case_skipped` records carry routine/m/n/k too, so the older
+    `"routine" in r` test would have let a mutation aimed at measurements land on the
+    declined-case bookkeeping instead — and a mutant that plants a different defect
+    from the one it is named after is worse than no mutant, because the self-test
+    still goes green."""
+    return "routine" in r and not r.get("record")
 
 
 def drop_arm(coretype=None, threads=None):
@@ -148,6 +155,68 @@ def truncate_arm(coretype, keep=0.8):
     return f"cut {len(cut)} of {len(cases)} cases ({n} records) from coretype={coretype}"
 
 
+def drop_record(kind):
+    """Remove one non-measurement record kind, leaving every measurement in place.
+
+    Two defects wear this shape and neither is visible in any measurement.
+    `thread_prime` gone is a sweep whose thread 2..N buffer pools were allocated
+    inside a timed region: every record is present and some of them are quietly
+    wrong. `case_skipped` gone is the thread-dependent large ladder truncating
+    silently — absent instead of explained, which is the exact distinction standing
+    order 11 exists for, one level down from the arm census."""
+    n = 0
+    for p in _bench_files():
+        n += _rewrite(p, lambda r: None if r.get("record") == kind else r)
+    return f"dropped {n} {kind!r} records"
+
+
+def blank_reason():
+    """Empty the reason on every declined case, keeping the records themselves.
+
+    The failure a presence check cannot see. A `case_skipped` record with no reason
+    is bit-for-bit an absence that has been given a name and nothing else, and a
+    cell absent from EVERY arm at a thread point produces no cell at all — so the
+    data-derived census is blind to it and the reason string is the only evidence
+    that the omission was a decision."""
+    n = 0
+
+    def f(r):
+        nonlocal n
+        if r.get("record") == "case_skipped" and r.get("reason"):
+            r = dict(r)
+            r["reason"] = ""
+            n += 1
+        return r
+
+    for p in _bench_files():
+        _rewrite(p, f)
+    return f"emptied the reason on {n} declined cases"
+
+
+def forge_reuse():
+    """Set cal_reused on measurements that were batched or that warmed up.
+
+    Reuse is only sound where the calibration call is the coldest comparable call in
+    the case: one unbatched call, with no warmup after it. Outside those conditions
+    samples[0] is either a different amount of work or a call made warmer than the
+    rest, and the reading is flattered rather than merely noisy. Nothing about the
+    record's own timings looks wrong, which is why the preconditions are checked
+    rather than the result."""
+    n = 0
+
+    def f(r):
+        nonlocal n
+        if _is_bench(r) and (r.get("batch", 1) != 1 or r.get("warmup_reps", 0) != 0):
+            r = dict(r)
+            r["cal_reused"] = True
+            n += 1
+        return r
+
+    for p in _bench_files():
+        _rewrite(p, f)
+    return f"forged cal_reused on {n} measurements outside its preconditions"
+
+
 def drop_files(pattern):
     """Delete a whole file family."""
     gone = [p.name for p in sorted(RES.glob(pattern))]
@@ -201,6 +270,9 @@ def retype(instance_type):
 OPS = {
     "drop_arm": drop_arm,
     "drop_probe": drop_probe,
+    "drop_record": drop_record,
+    "blank_reason": blank_reason,
+    "forge_reuse": forge_reuse,
     "strip_field": strip_field,
     "truncate_arm": truncate_arm,
     "drop_files": drop_files,
@@ -244,7 +316,7 @@ def main(argv=None):
         print("GBB_P2_MUTATE is unset; nothing to do", file=sys.stderr)
         return 2
     # eval against OPS only, with no builtins: the expressions come from gates/p2.sh's
-    # own table, and keeping the namespace to the seven ops means a typo is a NameError
+    # own table, and keeping the namespace to the ops in OPS means a typo is a NameError
     # naming the op rather than something that half-runs.
     try:
         print(eval(expr, {"__builtins__": {}}, dict(OPS)))

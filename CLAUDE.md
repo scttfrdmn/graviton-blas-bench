@@ -82,8 +82,10 @@ until it finds something.
     and the analysis must be able to tell them apart: "V1 and V2 are at parity"
     and "the V1 arm never ran" support opposite conclusions.
 12. **Ship results as they are produced.** Per-arm to S3, not at end of sweep.
-    Instances terminate on completion and a spot reclaim comes sooner; results
-    that exist only on the instance are instance-hours spent for nothing.
+    Instances terminate on completion and an instance can die before that —
+    hardware fault, AZ event, a mistyped `terminate-instances`. On-demand removes
+    reclaim, not loss. Results that exist only on the instance are instance-hours
+    spent for nothing.
 13. **Session-end status comment** on the active umbrella issue: what ran, what
     the gate said, what is blocked, what is needed from Scott.
 14. **Long jobs run in the background.** `build-libs.sh` is ~40 minutes and the
@@ -92,23 +94,38 @@ until it finds something.
 
 ## Spend policy
 
-Decided 2026-08-19, after costing the design as built, and revised the same day
-once the matrix expansion on #2 was costed. **The ~$96/pass figure is retired, not
-adjusted**: it described the pre-expansion routine table, and reconciling the two
-numbers would only invite someone to compare them. One expanded pass across all
-five hosts is **30–37 instance-hours**, and three of them land at **$500–650**.
+Decided 2026-08-19, after costing the design as built, and revised twice the same
+day: once when the matrix expansion on #2 was costed, and again when the P3 total
+derived from that costing was withdrawn.
 
-**$500–650 is the planning basis, and it is to be replaced by a measured number,
-not defended.** The paragraph that used to stand here said the expansion was ~4×
-the cases and only ~1.6–2× the wall clock, because `MAX_REPS` capped the small end
-and `MIN_REPS` floored the large end — and `bench.c` has neither of those any more
-(`6a8089f` removed them). `MIN_SECONDS` targets a fixed amount of *work* per
-measurement, so it buys as many calls as it takes and an `n=8` case cost the same
-wall clock as an `n=1024` one. "Densify below 2048 freely" rested entirely on the
-cap and does not survive its absence; the per-regime floor
-(`MIN_SECONDS_SMALL = 0.05` below n=256) restores most of the small-end economy but
-does not restore the premise. So the extra small and medium cases add close to
-linearly, and the real multiplier is unknown until it is measured.
+**There is no per-pass or whole-campaign figure in this file, and that is
+deliberate.** Three have been struck, each for the same reason rather than for
+three different ones:
+
+- **~$96/pass** described the pre-expansion routine table.
+- **30–37 instance-hours per pass** was `18.6 h × ~1.8`, and the 18.6 h was built
+  on the `MAX_REPS`/156-measurements model that the timing audit (`6a8089f`)
+  deleted. Scaling a dead number does not revive it.
+- **$500–650 for three passes** was derived from the 30–37 h, so it went with it.
+
+Do not reconcile a struck figure with a live one, and do not carry one forward
+because it is the only number available: a stale cost estimate in the file that
+authorises spend is followed later by someone who was not in this conversation.
+The reason none of the three survives is that `MIN_SECONDS` targets a fixed amount
+of *work* per measurement, so it buys as many calls as it takes; there is no
+`MAX_REPS` capping the small end and no `MIN_REPS` flooring the large end.
+"Densify below 2048 freely" rested entirely on that cap. The per-regime floor
+(`MIN_SECONDS_SMALL = 0.05` below n=256), the conditional warmup and the
+calibration reuse together take most of the small-end and large-end waste back,
+but none of them restores the premise — the extra small and medium cases still add
+close to linearly, and the multiplier is unknown until it is measured.
+
+**The live basis is arithmetic over the current constants, and it covers one host
+only.** The authorised P2 launch — one on-demand `c8g.metal-48xl`, 96 streams
+across eight thread points — is **8–14 instance-hours, $61–107** at $7.65696/hr.
+That is not a per-pass figure and must not be multiplied into one: P3 adds four
+more hosts whose per-case cost this run has not measured. The whole point of the
+run is to replace the arithmetic with a measurement.
 
 Measure it on the **slowest** arm of the first P2 iteration, not a representative
 one — see §Wall-clock is anti-correlated with arm quality for why a representative
@@ -128,10 +145,11 @@ arm extrapolates low.
   P3 passes are exactly where a hand-driven or newly-written procedure drifts
   between launches. A drift between passes is indistinguishable from the effect the
   passes exist to test.
-- **P3 runs three times.** Per-arm S3 shipping makes a reclaimed pass's data
-  survivable, not comparable. `us-east-1a` single-AZ bare metal on a new instance
-  type is also the thinnest spot pool obtainable, and `c9g.metal-48xl` capacity is
-  already the campaign's gating risk.
+- **P3 runs three times.** Per-arm S3 shipping makes a lost pass's data survivable,
+  not comparable. `us-east-1a` single-AZ bare metal on a new instance type is the
+  thinnest capacity pool the campaign touches — on-demand does not change that, it
+  only changes the failure from a mid-sweep reclaim to a launch that does not get
+  the instance — and `c9g.metal-48xl` capacity is already the gating risk.
 - **Three, because two passes have no breakdown point.** The median of two *is*
   the mean: one bad pass moves it, and there is no way to tell which pass was
   bad. Three passes reject one bad pass by majority. The campaign's whole output
@@ -171,8 +189,11 @@ arm extrapolates low.
   is no record of them having said nothing. (c) Every number prints its own pass
   count (`passes=2of3`), so a partial comparison is never visually equal to a
   complete one.
-- Budget: **$500–650** for three expanded passes across five hosts, all
-  on-demand, ~$975 at 1.5× contingency. `hpc7g` is on-demand-only and has no metal
+- Budget: **not stated, on purpose** — see above for the three struck figures. The
+  P3 number comes from the P2 pass's measured per-case cost on its slowest arm,
+  extrapolated across the other four hosts, and it goes in the umbrella issue
+  before P3 launches (standing order 7). Ask Scott with the arithmetic shown; do
+  not carry a figure from this file. `hpc7g` is on-demand-only and has no metal
   size, so its tenancy stays inside the measurement; it gets the repeat runs and
   the p50/p90 spread is read accordingly.
 
@@ -215,8 +236,18 @@ pad-carrying transposes is the smallest set covering both packing routines.
 
 `zgemm` at NN only would be the same error as `dgemm` at NN only, one level down:
 conjugate-transpose is a distinct code path and it is what most complex research
-code actually issues. That is **1005 cases per arm** against 156 today (6.4×), of
-which 544 are small, 350 medium, 95 large and 16 level-1.
+code actually issues.
+
+**The "1005 cases per arm against 156 today (6.4×)" figure is struck**, and no
+replacement projection is written here. It was computed against the 156-case table
+that predates item 1 and item 2; the ladders and pads have since landed, so the
+baseline it was a multiple *of* no longer exists, and its own breakdown (544 small)
+now collides numerically with today's total. **Read the count off the producer, not
+off this file**: every `gbb-bench` invocation folds the full design in its dry pass
+and prints `gbb: matrix_id=… over N cases` to stderr before the first record —
+**544 today** (288 small, 190 medium, 50 large, 16 level-1). It is the same number
+the records carry as `matrix_cases`, so it cannot drift from what was measured, and
+the fold is deliberately not subject to the thread-dependent large cap.
 
 ### Wall-clock is anti-correlated with arm quality
 
@@ -256,12 +287,77 @@ So the small regime takes **0.05 s** and medium/large keep 0.30 s. That is ~136 
 back per (arm × thread point) at 544 small cases, and it stops spending three
 million calls at `n=8` measuring harness dispatch.
 
+### The expensive end: three of seven calls were overhead
+
+Decided 2026-08-19, and it is the change P2 was held for — measuring the cost basis
+against a configuration known to be wasteful would mean measuring it twice. A large
+case used to cost seven calls: verify 1 + warmup 2 + calibration 1 + samples 3. The
+floor at that end is `ABS_MIN_SAMPLES = 3`, not `MAX_MEASURE_SECONDS`, so **the cap
+does not cap** and the three overhead calls are 43% of the case.
+
+- **Warmup is per-process, not per-case, and now decays to zero.** Its stated
+  justification is OpenBLAS's lazy buffer-pool allocation, which happens once.
+  `WARMUP_MAX_FRACTION = 0.02` runs warmup only while it costs under 2% of the
+  measurement it precedes — self-scaling, so it adds no size threshold to keep in
+  step with the regimes.
+- **"Warm only the first case" would corrupt data, and must not be reintroduced.**
+  The buffer pool is per *thread*, and OpenBLAS runs small problems
+  single-threaded whatever `OPENBLAS_NUM_THREADS` says. The first case (n=8)
+  recruits one thread; threads 2..N would then allocate mid-ladder, inside a timed
+  region. That is why there is an explicit once-per-process `prime_threads()` at
+  `PRIME_N = 1024`, emitting a `thread_prime` record, and why `gates/p2.sh`
+  requires one per stream.
+- **Calibration is reused, not predicted.** Scott's suggestion was to predict the
+  next rung's call time from the previous rung's rate. Implemented as reuse
+  instead — `_cal` becomes `samples[0]` when `batch == 1 && batch_size == 1 &&
+  warmup_reps == 0` — for the same saving without a cross-case history dependence
+  (prediction makes case N's configuration depend on case N−1 and breaks wherever
+  a rung is skipped, which the large cap now does), and because `_cal` is the
+  *coldest* call of the case: reuse can only raise `t_min`/p50/p90, never flatter
+  an arm. All three conditions are load-bearing; the gate checks them per record.
+- **Measured effect** (Apple M-series, Accelerate, dgemm ladder ×2 runs): 58% of
+  sweep wall clock removed, of which the cap is most; on the 136 cases common to
+  both binaries, 7.9% saved and the GFLOP/s median moved −0.05% overall and −0.12%
+  on the reuse path, against a same-binary run-to-run spread of [−5.2%, +1.6%] on
+  those same cases. Inside the noise, and in the conservative direction.
+
+### The large ladder is thread-dependent
+
+An `n=8192` single-threaded DGEMM is not a number anyone will cite: the large
+regime answers bandwidth and blocking questions, and at 1 thread `n=4096` answers
+them. `LARGE_CAP_LOW = 4096` below `LARGE_CAP_MIN_THREADS = 8`. Three properties
+make this principled rather than economising, and all three are asserted:
+
+- Every omission emits a `case_skipped` record carrying a reason — standing order 11
+  at case granularity. A cell absent from *every* arm at a thread point produces no
+  cell at all, so a data-derived census cannot see it; the record is the only thing
+  separating policy from a hole. `gates/p2.sh` checks `measured + declined ==
+  matrix_cases` and rejects an empty reason.
+- The **dry pass is not capped**, so `matrix_id` is unchanged (`7c371fee324b7304`
+  over 544 cases, verified before and after). A 1-thread stream and a 192-thread
+  stream carry the same stamp and stay poolable.
+- The cap lives inside `sweep()`, so it cannot reach the level-1 cases, which are
+  built directly in `main()`. Applying it on `m` alone would truncate `ddot` at
+  `n=4194304` — a 32 MB vector, not a 512 MB working set — and did, until the
+  `incx-axis` fixture lost its non-unit-stride axis and said so.
+
+**This touches standing order 1's denominator input set at low thread counts**, and
+that is Scott's call, not the harness's: the measured peak at 1 thread is now taken
+over a 3-rung large ladder rather than 5. DGEMM is flat-to-declining above n=2048 so
+the max is not expected to move, but "not expected to" is not the standard this repo
+holds denominators to. `decompose.py` therefore reports **which** size the max came
+from and out of how many (`best_large_dgemm=… at n=4096 of 3 size(s)`), and a max
+sitting at the top of a truncated ladder is the case to read twice.
+
 ## Ask before
 
 - Launching **any** EC2 instance.
 - Changing the size regimes or the routine set (the #2 expansion above is already
   approved; anything beyond it is not).
-- Altering the denominator policy in standing order 1.
+- Altering the denominator policy in standing order 1. **Open, awaiting Scott:**
+  whether the thread-dependent large cap's effect on the 1-thread denominator is
+  acceptable, or whether `n=6144`/`8192` should run at low thread counts purely to
+  keep the peak's input set uniform across thread points.
 - Relaxing a verification tolerance.
 
 ## Phase gates
@@ -273,7 +369,7 @@ under `gates/` that exits 0/1 and prints its evidence.
 |---|---|
 | `gates/p0.sh` | CI green on a clean clone; `make roofline` builds; `bash -n` clean |
 | `gates/p1.sh` | expected-arm census present and read from `manifest-*.ndjson` + `census-*.ndjson`; every planted effect recovered; the planted **null** reported as a null, not a weak hit, and distinguishable from a missing arm |
-| `gates/p2.sh` | complete NDJSON set from one `c8g.metal-48xl` spot host; `decompose.py` clean bar genuine findings; `topology-*.txt` recorded; every arm in `census-*.ndjson` either `measured` or carrying a stated reason — zero `MISSING-UNEXPLAINED` |
+| `gates/p2.sh` | complete NDJSON set from one **on-demand** `c8g.metal-48xl` host (spot was reversed; the gate itself asserts nothing about tenancy, and that is correct — tenancy is a spend decision, not an admissibility one); `decompose.py` clean bar genuine findings; `topology-*.txt` recorded; every arm in `census-*.ndjson` either `measured` or carrying a stated reason — zero `MISSING-UNEXPLAINED` |
 | `gates/p3.sh` | five hosts collected **three times**, each pass on a different `instance_id` from a separately launched instance; every `env-*.json` present; `blas_sha` identical across hosts and passes; the headline reproduces across passes (`REPRODUCES` or `REPRODUCES-MAJORITY`, never `DIVERGES-*`); no unresolved section-5 anomalies |
 | `gates/p4.sh` | report answers "is the N2 gap worth closing", supported by section 2, stated as a null if that is what the data says |
 

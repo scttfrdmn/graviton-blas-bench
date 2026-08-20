@@ -13,6 +13,71 @@ change can be compared.
 
 ## [Unreleased]
 
+### Changed — affects how a number is produced
+
+- **Warmup decays to zero at the expensive end, and the calibration call is reused
+  as the first sample.** A large case cost seven calls — verify 1, warmup 2,
+  calibration 1, samples 3 — and `ABS_MIN_SAMPLES = 3` rather than
+  `MAX_MEASURE_SECONDS` is what floors that end, so the cap did not cap and three
+  of the seven were overhead. Warmup's justification is OpenBLAS's *once-per-process*
+  lazy buffer-pool allocation, which by `n=8192` has been warm for several hundred
+  cases; it now runs only while it costs under `WARMUP_MAX_FRACTION = 0.02` of the
+  measurement it precedes, which is self-scaling and adds no size threshold to keep
+  in step with the regimes. **The naive form of this fix corrupts data**: the pool
+  is per *thread*, OpenBLAS runs small problems single-threaded regardless of
+  `OPENBLAS_NUM_THREADS`, and the ladder's first case recruits one thread, so
+  "warm only the first case" moves threads 2..N's allocation into a timed region
+  mid-ladder. An explicit `prime_threads()` at `PRIME_N = 1024` pays it outside
+  every measurement and writes a `thread_prime` record. Calibration is **reused**
+  (`_cal` becomes `samples[0]` when the case was unbatched and no warmup followed)
+  rather than predicted from the previous ladder rung as suggested: same saving, no
+  cross-case history dependence — prediction breaks wherever a rung is skipped,
+  which the large cap now does — and `_cal` is the coldest call of the case, so
+  reuse can only raise `t_min`/p50/p90 and never flatter an arm. Records carry
+  `warmup_reps` and `cal_reused`; `gates/p2.sh` checks reuse's three preconditions
+  per record, because reuse outside them is a flattered reading nothing else in the
+  record looks wrong about. Measured against the pre-change binary on an Apple
+  M-series host (dgemm ladder, two runs each): 58% of sweep wall clock removed,
+  7.9% on the 136 cases common to both, GFLOP/s median −0.05% overall and −0.12% on
+  the reuse path against a same-binary run-to-run spread of [−5.2%, +1.6%].
+- **The large ladder is thread-dependent: `LARGE_CAP_LOW = 4096` below
+  `LARGE_CAP_MIN_THREADS = 8`.** An `n=8192` single-threaded DGEMM answers no
+  question the report reads — the large regime answers bandwidth and blocking
+  questions and at 1 thread `n=4096` answers them — and it was the most expensive
+  arithmetic in the campaign. The omitted cells have no hypothesis attached, and
+  each writes a `case_skipped` record with a reason: standing order 11 at case
+  granularity, because a cell absent from *every* arm at a thread point produces no
+  cell at all and a census derived from the data cannot see it. The dry pass is
+  deliberately **not** capped, so `matrix_id` still describes the design
+  (`7c371fee324b7304` over 544 cases, unchanged) and a 1-thread stream pools with a
+  192-thread one. The cap lives inside `sweep()`, which keeps it off the level-1
+  cases built in `main()` — applied on `m` alone it truncated `ddot` at
+  `n=4194304`, a 32 MB vector rather than a 512 MB working set, and the `incx-axis`
+  fixture caught it by losing its whole non-unit-stride axis. **It touches standing
+  order 1's denominator at low thread counts**, so `decompose.py` now reports which
+  size the peak came from and out of how many (`at n=4096 of 3 size(s)`) and the
+  policy question has been put to Scott rather than assumed.
+- **`gates/p2.sh` section 3 now checks `measured + declined == matrix_cases`**, not
+  `measured == matrix_cases`, and requires every declined case to carry a reason, a
+  `thread_prime` record per stream, and `cal_reused` to appear only inside its
+  preconditions. Five new mutants in `tools/p2-mutate.py` are the negative controls
+  (`drop_record`, `blank_reason`, `forge_reuse`), and one of them found a real
+  defect in the gate: `case_skipped` records carry a routine, so the arm census
+  counted a stream that declined cases and measured nothing as *present* — which
+  would have let the mandatory generic-`ARMV8`-at-1-thread requirement be satisfied
+  by an arm that produced no numbers.
+- **The spend policy's figures are struck rather than adjusted, all three of them.**
+  `~$96/pass` described the pre-expansion table; **30–37 instance-hours per pass**
+  was `18.6 h × ~1.8` where the 18.6 h rested on the `MAX_REPS`/156-measurements
+  model that `6a8089f` deleted, and scaling a dead number does not revive it; and
+  **$500–650 for three passes** was derived from the 30–37 h, so it went with it.
+  The same edit strikes the **1005 cases / 6.4×** projection, which was computed
+  against the 156-case table and whose own breakdown had begun to collide with
+  today's total — the count is now read off the producer's dry pass (544 cases)
+  rather than off `CLAUDE.md`. The only live figure is arithmetic over the current
+  constants for the authorised one-host P2 launch, $61–107, and it is to be replaced
+  by a measurement rather than multiplied into a campaign total.
+
 ### Changed
 
 - **Every threshold in `analysis/decompose.py` that was a fraction of raw cells

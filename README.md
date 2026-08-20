@@ -137,8 +137,18 @@ support opposite conclusions.
 
 ## Measurement discipline
 
-- **First call discarded.** OpenBLAS allocates its buffer pool lazily; ArmPL
-  and BLIS have first-touch costs. Two warmup reps precede every timing loop.
+- **First call discarded, while it is nearly free.** OpenBLAS allocates its buffer
+  pool lazily; ArmPL and BLIS have first-touch costs. Two warmup reps precede a
+  timing loop *while they cost under 2% of it* (`WARMUP_MAX_FRACTION`); above that
+  they stop, and the record says so (`warmup_reps`). The pool is per **thread**, and
+  OpenBLAS runs small problems single-threaded whatever the thread count says, so
+  warming only the first case would move threads 2..N's allocation into a timed
+  region mid-ladder. An explicit once-per-process `prime_threads()` at n=1024 pays
+  that cost instead, outside every measurement, and writes a `thread_prime` record.
+- **The calibration call is reused as the first sample** where it is the coldest
+  comparable call in the case — unbatched, with no warmup after it (`cal_reused`).
+  At the expensive end, where `ABS_MIN_SAMPLES = 3` is the real floor, warmup plus
+  calibration were three of a case's seven calls.
 - **Minimum, with p50 and p90 recorded.** Min is the statistic; the others are
   kept so the analysis can flag arms where min is unrepresentative. On a
   no-turbo, no-SMT host a wide min/p50 spread means a noisy neighbour.
@@ -488,6 +498,49 @@ support opposite conclusions.
   and not this process's launch. And the field is per *record*, not per *arm*,
   which is what makes it answer the question the spend policy actually asks —
   which sizes cost the multiplier, not just what the total was.
+- **Three of a large case's seven calls were overhead, and the cap that was
+  supposed to bound them does not.** Verify 1 + warmup 2 + calibration 1 + samples
+  3, and at that end it is `ABS_MIN_SAMPLES = 3` that floors the case, not
+  `MAX_MEASURE_SECONDS = 3.0` — so the overhead is 43% of the case and the cap
+  never sees it. Warmup's stated justification is a lazy buffer-pool allocation
+  that happens *once per process*, and it was being paid per case for several
+  hundred cases after the pool went warm. It now decays to zero above
+  `WARMUP_MAX_FRACTION = 0.02` of the measurement it precedes, which is
+  self-scaling and so adds no size threshold to drift out of step with the regimes.
+  The naive version of this fix corrupts data and must not be reintroduced: the
+  pool is per **thread**, OpenBLAS runs small problems single-threaded regardless
+  of `OPENBLAS_NUM_THREADS`, and the first case (n=8) recruits one thread — so
+  "warm only the first case" moves threads 2..N's allocation *into* a timed region
+  in the middle of the ladder. Hence an explicit `prime_threads()` at `PRIME_N =
+  1024` with its own `thread_prime` record, which `gates/p2.sh` requires per
+  stream. The calibration call is **reused** as `samples[0]` rather than predicted
+  from the previous ladder rung: same saving, no cross-case history dependence
+  (prediction breaks wherever a rung is skipped, which the large cap now does), and
+  because `_cal` is the coldest call of the case, reuse can only raise `t_min` —
+  never flatter an arm. Its three preconditions (`batch == 1`, unit batch size, no
+  warmup) are checked per record, because reuse outside them is a flattered reading
+  that nothing else in the record looks wrong about. Measured on an Apple M-series
+  host against the pre-change binary: 58% of sweep wall clock removed, and on the
+  136 cases common to both, GFLOP/s moved −0.05% median against a same-binary
+  run-to-run spread of [−5.2%, +1.6%].
+- **`n=8192` single-threaded is arithmetic nobody will cite, and it was the most
+  expensive arithmetic in the campaign.** The large regime answers bandwidth and
+  blocking questions; at 1 thread `n=4096` answers them. The ladder therefore stops
+  at `LARGE_CAP_LOW = 4096` below `LARGE_CAP_MIN_THREADS = 8`. What makes that
+  principled rather than economising is that the omitted cells carry no hypothesis
+  *and* say so: each writes a `case_skipped` record with a reason, because a cell
+  absent from every arm at a thread point produces no cell at all and is therefore
+  invisible to a census derived from the data — the record is the only thing
+  separating a decision from a hole, and `gates/p2.sh` checks `measured + declined
+  == matrix_cases` and rejects an empty reason. The dry pass is **not** capped, so
+  `matrix_id` describes the design rather than one process's share of it and a
+  1-thread stream still pools with a 192-thread one. The cap lives inside `sweep()`,
+  which is what keeps it off the level-1 cases: applied on `m` alone it truncates
+  `ddot` at `n=4194304`, a 32 MB vector rather than a 512 MB working set, and the
+  `incx-axis` fixture caught exactly that by losing its non-unit-stride axis. It
+  does touch standing order 1's denominator at low thread counts, so `decompose.py`
+  reports which size the peak came from and out of how many — `at n=4096 of 3
+  size(s)` — and the policy question is Scott's, asked rather than assumed.
 - **The per-regime floor put a change of instrument at n=256, which is where the
   effect is expected to be.** `GEMM_SMALL_*`'s crossover is hypothesised to sit at
   about the same size as the 0.05/0.30 transition, so a step in the section 4
