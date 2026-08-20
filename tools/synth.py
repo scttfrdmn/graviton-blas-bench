@@ -3863,6 +3863,92 @@ def sc_matrix_mixed_unstamped():
     )
 
 
+def sc_p2_host():
+    """A clean single-host P2 dataset, shaped like the run gate P2 will judge.
+
+    This scenario exists for `gates/p2.sh --self-test`, which is the only way that
+    gate gets exercised before money is spent on the data it judges. Writing a gate
+    against a dataset that does not exist yet and running it for the first time on
+    the dataset that cost $150 puts unexercised code between the spend and the
+    verdict -- the same objection the spend policy raises against writing new launch
+    tooling. It is a legitimate P1 scenario too, so it runs in gates/p1.sh like any
+    other and its expectations are its own.
+
+    Faithful to `scripts/run-matrix.sh` on `c8g.metal-48xl` in the dimensions gate
+    P2 actually reads, and not in the others:
+
+      - the instance type and a single instance_id, because a P2 pass is ONE host
+        and one physical box, and two instance_ids in one directory is the shape
+        that P3's replicate rule reads as two passes;
+      - all six coretypes an SVE2 host can force (`ARMV8 NEOVERSEN1 ARMV8SVE
+        NEOVERSEV1 NEOVERSEV2 NEOVERSEN2`), plus the unforced arm the wheels ship
+        and ArmPL and netlib as named references;
+      - the generic ARMV8 arm at 1 thread, which is the arm the re-sequencing
+        decision named as mandatory: it is the campaign's most expensive single arm
+        and the one the P3 cost extrapolation is anchored on. It is planted SLOW,
+        at 0.45x, because that is both the expected result on SVE2 hardware and
+        what makes the wall-clock accounting have a genuine slowest arm to find;
+      - the thread ladder truncated to 1/64/192. The real ladder is
+        `1 8 16 32 64 96 128 192`; the rungs between change the case count and
+        nothing gate P2 asserts, and eight rungs times 1005 cases times nine arms
+        is a fixture nobody will wait for.
+
+    The cross is a NULL on purpose. The fixture must not plant a hardware claim: a
+    gate that went green partly because the fixture agreed with the campaign's
+    hypothesis would be calibrated on the answer rather than on the shape."""
+    slow = Arm("openblas", "DYNAMIC", "ARMV8", gain=flat(0.45), in_manifest=False)
+    return Scenario(
+        name="p2-host",
+        description=(
+            "One clean c8g.metal-48xl pass: nine arms, three thread points, the generic ARMV8 "
+            "arm at 1 thread, a confirming floor-overlap band, and a null cross. The shape "
+            "gates/p2.sh judges, so that gate can be exercised before the spend."
+        ),
+        hosts=[
+            _host(
+                instance_type="c8g.metal-48xl",
+                instance_id="i-0c8g000000000001",
+                run_id="synth-c8g-p2",
+                threads=(1, 64, 192),
+                cores=192,
+                cpus_online=192,
+                cpus_affinity=192,
+                has_sve=True,
+                has_sve2=True,
+                midr="0x413fd4f0",
+                midr_part="0xd4f",
+                core_name="NEOVERSEV2",
+                dynamic_selection="neoversev2",
+                sve_vl=16,
+                reference_arm=True,
+            )
+        ],
+        arms=[
+            *_arms(v1_gain=flat(0.88), v2_gain=flat(0.88)),
+            slow,
+            Arm("openblas", "DYNAMIC", "NEOVERSEN1", gain=flat(0.71), in_manifest=False),
+            Arm("openblas", "DYNAMIC", "ARMV8SVE", gain=flat(0.87), in_manifest=False),
+            Arm("openblas", "DYNAMIC", "NEOVERSEN2", gain=flat(0.88), in_manifest=False),
+        ],
+        floor_probe={"mode": "agree"},
+        expect=[
+            # The dataset gate P2 will accept has to be clean on every bit, not
+            # just on the coverage one: P2's own gate row says "decompose.py clean
+            # bar genuine findings", and a genuine finding is a verdict, not a bit.
+            {"kind": "exit_bits_clear", "bits": [1, 2, 4, 8, 16, 32, 64]},
+            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "coverage.partial", "op": "==", "value": 0},
+            {"kind": "matrix_ids", "count": 1, "none_unstamped": True},
+            {"kind": "json_string", "path": "floor_overlap.status", "expect": "AGREES"},
+            {"kind": "verdict_code", "one_of": ["NULL"]},
+            # The mandatory arm, asserted here as well as in gates/p2.sh. A fixture
+            # that quietly lost it would make the P2 gate's own self-test vacuous,
+            # and the self-test is what stands in for the missing dataset.
+            {"kind": "stdout_contains", "text": "ARMV8"},
+        ],
+    )
+
+
 SCENARIOS = {
     f.__name__[3:].replace("_", "-"): f
     for f in (
@@ -3926,6 +4012,7 @@ SCENARIOS = {
         sc_matrix_mixed,
         sc_matrix_unstamped,
         sc_matrix_mixed_unstamped,
+        sc_p2_host,
     )
 }
 

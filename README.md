@@ -115,6 +115,7 @@ scripts/capture-env.sh MIDR per core, HWCAP, NUMA, cgroups, governor, dispatch
 scripts/run-matrix.sh  orchestrates arm x coretype x threads on one host
 analysis/decompose.py  the reports, the coverage census, and an anomaly section
 tools/synth.py         planted-effect datasets whose right answer is known: gate P1
+tools/p2-mutate.py     plants one defect in a P2 fixture: gate P2's negative controls
 tests/                 stub-based regression suite for the runner's decisions
 gates/                 one script per phase gate; each exits 0/1 with evidence
 ```
@@ -237,6 +238,21 @@ support opposite conclusions.
   exact wording of `capture-env.sh`'s no-topology warning is now pinned in a
   fixture: `decompose.py` matches it by substring, so a reword would not error — it
   would quietly stop flagging a defaulted field as a default.
+- **A gate written before its data exists runs for the first time on the data that
+  cost money.** `gates/p2.sh` checks a dataset nobody has collected yet, so it also
+  runs `--self-test`: `tools/synth.py`'s `p2-host` scenario builds a clean P2 pass,
+  the gate must pass it, and then `tools/p2-mutate.py` plants one defect at a time —
+  the `ARMV8` arm gone, that arm present but not at one thread, the floor-overlap
+  band gone, the matrix stamp gone, one arm's ladder truncated, `env-*.json` gone,
+  `topology-*.txt` gone, a second `instance_id`, `case_seconds` gone, the wrong
+  instance type — and the gate must go red on each **and name the field it went red
+  about**. The second half is not decoration: three mutants went red with an empty
+  message, which is a gate that has stopped saying what is wrong, and one went red
+  for the wrong reason. Both fixture and mutator are quarantined by construction
+  rather than by care — the gate refuses a `synth-` matrix_id in real mode and
+  requires one in self-test mode, and `p2-mutate.py` refuses any directory whose
+  stamps are not `synth-`, because every mutation it performs writes a dataset that
+  looks measured and is a lie.
 
 ## Hazards, learned the hard way
 

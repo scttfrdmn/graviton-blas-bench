@@ -249,6 +249,43 @@ change can be compared.
 
 ### Added
 
+- **`gates/p2.sh`, and a self-test that makes it a gate rather than a wish.** P2 is
+  the first phase whose gate is written before its data exists, so the ordinary
+  failure mode is a gate that runs for the first time on the dataset that cost
+  money and passes it by not checking anything. So the gate ships with
+  `--self-test`: `tools/synth.py`'s new `p2-host` scenario writes a clean
+  `c8g.metal-48xl` pass (one `instance_id`, 30 arm × thread streams, 311 cases
+  each, floor band agreeing), the gate must pass it, and then
+  `tools/p2-mutate.py` plants one defect at a time and the gate must go red **and
+  name the field**. Ten mutants: the `ARMV8` arm gone; that arm present but not at
+  1 thread; the floor-overlap band gone; `matrix_id` gone; one arm's ladder
+  truncated; `env-*.json` gone; `topology-*.txt` gone; a second `instance_id`;
+  `case_seconds` gone; the whole pass restamped as `c7g.metal`. The naming half is
+  what earned its keep — three mutants went red with an *empty* message (a
+  `KeyError` in the wall-clock section, and a report printed only on the success
+  path), and one went red citing a count without saying which field declared it.
+  A gate that has stopped saying what is wrong is the one thing a gate is for.
+
+  Four requirements the CLAUDE.md gate row does not name are also enforced,
+  because they came from the re-sequencing decision rather than from the original
+  table: exactly one stamped `matrix_id` with every stream's distinct case count
+  equal to `matrix_cases`; an OpenBLAS arm *reporting* `coretype ARMV8` with
+  records at `threads == 1` (standing order 10 — reported, not requested — and the
+  campaign's most expensive single arm, so it anchors the P3 extrapolation); the
+  floor-overlap band present and `AGREES`, since `ABSENT` deliberately does not set
+  exit bit 32 and so requiring the probe is the gate's job; and the wall-clock
+  accounting printed, naming the slowest arm with its per-regime ms/case split.
+  Section 9 fails only if that accounting is unavailable, never on the numbers
+  themselves — the numbers are the measurement it exists to take.
+
+  Both sides are quarantined by construction rather than by discipline: the gate
+  refuses a `synth-` `matrix_id` in real mode and requires one in self-test mode,
+  and `p2-mutate.py` exits 3 on any directory whose stamps are not `synth-`,
+  because every mutation it performs writes a dataset that looks measured and is a
+  lie. The gate's header also flags, rather than silently resolves, that the
+  CLAUDE.md P2 row still says "spot host" while the spend policy in the same file
+  reverses spot to on-demand; the gate asserts nothing about tenancy either way.
+
 - Three P1 fixtures, each mutation-validated in both directions:
   `nodata-group-hole` (one dark `(family, regime)` group at 25% non-comparable
   balanced weight — under the 34% threshold — of which only 8% is the actual
