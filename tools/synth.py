@@ -754,6 +754,10 @@ def bench_records(sc: Scenario, host: HostSpec):
                 # consumer's fallback. The floor-overlap records are written by
                 # floor_probe_records() below.
                 "probe": "none",
+                # Likewise 0 rather than absent. bench.c prints probe_rep from both
+                # emit() and emit_prefix(), so a matrix record, a thread_prime and a
+                # case_skipped all carry it; only the band ever sets it non-zero.
+                "probe_rep": 0,
                 **mfields,
                 "threads": threads,
             }
@@ -917,6 +921,14 @@ def bench_records(sc: Scenario, host: HostSpec):
 # rigorous test of the wrong band.
 OVERLAP_SIZES = (192, 224, 256, 320, 384)
 
+# src/bench.c's OVERLAP_REPS, asserted against the producer for the same reason as
+# the sizes -- and for one more. The rep count is not decoration: decompose.py keys
+# a pair on `probe_rep`, so if the fixture emitted one rep while bench.c emitted
+# four, every replication assertion here would pass against an analysis that had
+# quietly lost the field, and the underpowered state the replication was bought to
+# fix would look fixed.
+OVERLAP_REPS = 4
+
 
 def floor_probe_records(sc: Scenario, host: HostSpec):
     """src/bench.c run_floor_overlap(), field for field.
@@ -942,12 +954,21 @@ def floor_probe_records(sc: Scenario, host: HostSpec):
     first every time: with a fixed order, "first reads high" and "short reads high"
     are the same dataset and no analysis could separate them. The fixture and the
     producer have to agree about the alternation, so the parity of the index is
-    computed the same way here as there."""
+    computed the same way here as there -- on `i + r`, so a size's reps carry both
+    orders (see bench.c's ORDER-ALTERNATES note).
+
+    `spec["legacy"]` writes ONE rep and omits `probe_rep` entirely, which is the
+    shape of every dataset produced before 2026-08-20 -- including the P2 pass that
+    raised the underpowered question. It is a state a real dataset is in, so it has
+    to stay analysable, and it is the only way to reach the analysis's
+    no-replication branch."""
     spec = sc.floor_probe
     if not spec:
         return []
     mode = spec.get("mode", "agree")
     amount = spec.get("amount", 0.0)
+    legacy = bool(spec.get("legacy"))
+    reps = 1 if legacy else OVERLAP_REPS
     mfields = matrix_fields(sc, host)
     recs = []
     for arm in sc.arms:
@@ -960,28 +981,34 @@ def floor_probe_records(sc: Scenario, host: HostSpec):
                     * arm.multiplier("dgemm", m, 1, 0, None)
                     * host.host_scale
                 )
-                # Same parity rule as bench.c: even index -> short floor first.
-                short_first = i % 2 == 0
-                floors = (MIN_SECONDS_SMALL, MIN_SECONDS) if short_first else (MIN_SECONDS, MIN_SECONDS_SMALL)
-                for pos, floor in enumerate(floors):
-                    is_short = floor == MIN_SECONDS_SMALL
-                    if mode == "half" and not is_short:
-                        continue
-                    mult = 1.0
-                    if mode in ("bias", "disagree") and is_short:
-                        mult = 1.0 - amount
-                    elif mode == "order" and pos == 0:
-                        mult = 1.0 + amount
-                    # Keyed on the floor as well, so `agree` gets two independent
-                    # draws and the sign of the difference scatters. Without the
-                    # floor in the key both records would draw the same jitter,
-                    # every delta would be exactly 0, and the sign test would be
-                    # vacuous rather than passed.
-                    gf = base * mult * jitter(host.run_id, arm.key, threads, m, floor, amp=arm.noise)
-                    flops = case_flops("dgemm", m, m, m)
-                    t_min = flops / (gf * 1e9)
-                    recs.append(
-                        {
+                for rep in range(reps):
+                    # Same parity rule as bench.c, on the same two indices.
+                    short_first = (i + rep) % 2 == 0
+                    floors = (
+                        (MIN_SECONDS_SMALL, MIN_SECONDS) if short_first else (MIN_SECONDS, MIN_SECONDS_SMALL)
+                    )
+                    for pos, floor in enumerate(floors):
+                        is_short = floor == MIN_SECONDS_SMALL
+                        if mode == "half" and not is_short:
+                            continue
+                        mult = 1.0
+                        if mode in ("bias", "disagree") and is_short:
+                            mult = 1.0 - amount
+                        elif mode == "order" and pos == 0:
+                            mult = 1.0 + amount
+                        # Keyed on the floor as well, so `agree` gets two independent
+                        # draws and the sign of the difference scatters. Without the
+                        # floor in the key both records would draw the same jitter,
+                        # every delta would be exactly 0, and the sign test would be
+                        # vacuous rather than passed. Keyed on the rep for the same
+                        # reason one level up: reps that drew identical noise would
+                        # make every out-of-band pair reproduce by construction, which
+                        # is the answer the replication is supposed to be able to
+                        # withhold.
+                        gf = base * mult * jitter(host.run_id, arm.key, threads, m, floor, rep, amp=arm.noise)
+                        flops = case_flops("dgemm", m, m, m)
+                        t_min = flops / (gf * 1e9)
+                        rec = {
                             "run_id": host.run_id,
                             "host": f"ip-10-0-0-{abs(hash(host.instance_id)) % 200}",
                             "instance": host.instance_type,
@@ -1033,7 +1060,15 @@ def floor_probe_records(sc: Scenario, host: HostSpec):
                             # analysis reads it to tell a floor effect from a drift.
                             "note": "floor_probe_first" if pos == 0 else "floor_probe_second",
                         }
-                    )
+                        # After `probe`, where bench.c prints it. Spliced rather than
+                        # written inline above so `legacy` can leave it out without a
+                        # second copy of the record -- two copies is how the fixture
+                        # and the producer drift.
+                        if not legacy:
+                            items = list(rec.items())
+                            at = [k for k, _ in items].index("probe") + 1
+                            rec = dict([*items[:at], ("probe_rep", rep), *items[at:]])
+                        recs.append(rec)
     return recs
 
 
@@ -4157,9 +4192,16 @@ def sc_floor_band_agrees():
         [
             {"kind": "json_string", "path": "floor_overlap.status", "expect": "AGREES"},
             {"kind": "json_bool", "path": "floor_overlap.confirmed", "value": True},
-            # 6 arms x 2 thread points x 5 sizes. Asserted as a number because a
-            # probe that silently emitted half its pairs would still say AGREES.
-            {"kind": "json_number", "path": "floor_overlap.n_pairs", "op": "==", "value": 60},
+            # 6 arms x 2 thread points x 5 sizes = 60 cells, x OVERLAP_REPS pairs each.
+            # Asserted as a number because a probe that silently emitted half its pairs
+            # would still say AGREES. Written against the constant rather than as a
+            # literal so it tracks bench.c, which gate section 2 pins it to.
+            {"kind": "json_number", "path": "floor_overlap.n_pairs", "op": "==", "value": 60 * OVERLAP_REPS},
+            {"kind": "json_number", "path": "floor_overlap.cells", "op": "==", "value": 60},
+            # The replication itself. Without this, dropping probe_rep from either
+            # producer would collapse four pairs per cell into one and every other
+            # assertion in this scenario would still pass.
+            {"kind": "json_number", "path": "floor_overlap.reps_per_cell", "op": "==", "value": OVERLAP_REPS},
             {"kind": "json_number", "path": "floor_overlap.outside_band", "op": "==", "value": 0},
             {"kind": "json_number", "path": "floor_overlap.incomplete_cases", "op": "==", "value": 0},
             # The probe records are held out of the cross, not analysed inside it.
@@ -4236,7 +4278,19 @@ def sc_floor_band_disagrees():
         [
             {"kind": "json_string", "path": "floor_overlap.status", "expect": "DISAGREES"},
             {"kind": "json_bool", "path": "floor_overlap.confirmed", "value": False},
-            {"kind": "json_number", "path": "floor_overlap.outside_band", "op": "==", "value": 60},
+            {
+                "kind": "json_number",
+                "path": "floor_overlap.outside_band",
+                "op": "==",
+                "value": 60 * OVERLAP_REPS,
+            },
+            # A real effect reproduces, and the analysis has to say so: every one of
+            # the 60 cells is out of band in all its reps with one sign. This is the
+            # assertion that separates a planted effect from jitter meeting a band, and
+            # it is the state the P2 pass's 2-of-390 was NOT in.
+            {"kind": "json_number", "path": "floor_overlap.n_persistent_cells", "op": "==", "value": 60},
+            {"kind": "json_number", "path": "floor_overlap.n_unreproduced_cells", "op": "==", "value": 0},
+            {"kind": "stdout_contains", "text": "PERSISTENT"},
             {"kind": "exit_bits_set", "bits": [32]},
             # Section 5 is where a reader is told to look before trusting section 4,
             # so the finding has to reach it and not only section 9.
@@ -4265,7 +4319,16 @@ def sc_floor_band_order_confounded():
     ORDER-CONFOUNDED is neither a pass nor a floor problem. The probe did not
     measure what it set out to measure, so it sets bit 32 -- the band is unconfirmed
     -- but the text says drift, because sending someone to change MIN_SECONDS over a
-    drift would be the wrong fix applied confidently."""
+    drift would be the wrong fix applied confidently.
+
+    IT ALSO PINS THE STATUS PRECEDENCE, which replication is what made necessary. A 3%
+    order effect plus per-rep jitter puts a handful of the 240 individual pairs outside
+    their parity bands -- 5, at these seeds -- while no cell reproduces. Before the
+    precedence was fixed, `outside -> DISAGREES` came first and this dataset was
+    reported as a floor disagreement, so ORDER-CONFOUNDED became unreachable the moment
+    the band was replicated. That is why `outside_band` is asserted NON-zero here: this
+    scenario is now the only place the ordering of the two branches is tested, and a
+    fixture asserting 0 would have been asserting the pre-replication world."""
     return _floor_band(
         "floor-band-order-confounded",
         (
@@ -4282,10 +4345,17 @@ def sc_floor_band_order_confounded():
             # minority. If these two were equal the alternation would have bought
             # nothing and the status would be unreachable.
             {"kind": "json_number", "path": "floor_overlap.floor_sign_consistency", "op": "<", "value": 0.5},
-            {"kind": "json_number", "path": "floor_overlap.outside_band", "op": "==", "value": 0},
+            # Pairs DO stray -- see the docstring. Both halves matter: strays exist, so
+            # the DISAGREES branch was reachable and was passed over; and no cell
+            # reproduces, which is the condition under which passing it over is right.
+            {"kind": "json_number", "path": "floor_overlap.outside_band", "op": ">", "value": 0},
+            {"kind": "json_number", "path": "floor_overlap.n_persistent_cells", "op": "==", "value": 0},
             {"kind": "exit_bits_set", "bits": [32]},
             {"kind": "anomaly_kind_present", "kind_name": "floor_overlap_unconfirmed"},
             {"kind": "stdout_contains", "text": "measured drift"},
+            # The strays are named in the status line rather than dropped, so a reader
+            # is not told the band was clean when five pairs were not.
+            {"kind": "stdout_contains", "text": "none of them reproducing within a cell"},
         ],
     )
 
@@ -4366,10 +4436,76 @@ def sc_floor_band_half():
         [
             {"kind": "json_string", "path": "floor_overlap.status", "expect": "INCOMPLETE"},
             {"kind": "json_number", "path": "floor_overlap.n_pairs", "op": "==", "value": 0},
-            {"kind": "json_number", "path": "floor_overlap.incomplete_cases", "op": "==", "value": 60},
+            # Per (cell, rep), because a rep is its own case: the short-floor-only
+            # records still arrive OVERLAP_REPS times and each one is an unpaired case.
+            {
+                "kind": "json_number",
+                "path": "floor_overlap.incomplete_cases",
+                "op": "==",
+                "value": 60 * OVERLAP_REPS,
+            },
             {"kind": "exit_bits_set", "bits": [32]},
             {"kind": "anomaly_kind_present", "kind_name": "floor_overlap_unconfirmed"},
             {"kind": "stdout_absent", "text": "no floor-overlap probe records"},
+        ],
+    )
+
+
+def sc_floor_band_unreplicated():
+    """The band ran once per cell and carries no `probe_rep` field at all — the shape
+    of every dataset produced before 2026-08-20, including the P2 pass.
+
+    Kept as a scenario rather than deleted along with the single-rep producer, for two
+    reasons that pull the same way. (1) The P2 dataset is still the campaign's only
+    measured cost basis and the errata read against it, so `decompose.py` has to keep
+    analysing a fieldless probe exactly as it did — a missing `probe_rep` defaults to
+    0, which is one rep per cell and not one cell holding every rep. (2) It is the only
+    way to reach the analysis's no-replication branch, and that branch is the one that
+    says out loud what Scott's ruling said: at one pair per cell the band is
+    underpowered in both directions, so an out-of-band pair can be neither reproduced
+    nor dismissed.
+
+    `disagree` rather than `agree`, because the branch under test is in the DISAGREES
+    why-string. An agreeing single-rep dataset would exercise the NO REPLICATION line
+    in section 9 and nothing else, and the status line is what the anomaly table and
+    the verdict quote."""
+    return _floor_band(
+        "floor-band-unreplicated",
+        (
+            "A pre-replication dataset: one pair per cell and no probe_rep field. Still "
+            "analysable, still DISAGREES on a 12% short floor, and the status says the "
+            "pairs can be neither reproduced nor dismissed rather than implying they were "
+            "checked."
+        ),
+        {"mode": "disagree", "amount": 0.12, "legacy": True},
+        [
+            {"kind": "json_string", "path": "floor_overlap.status", "expect": "DISAGREES"},
+            {"kind": "json_bool", "path": "floor_overlap.confirmed", "value": False},
+            # One pair per cell, not four collapsed into one: 60 cells, 60 pairs. If a
+            # fieldless record were keyed apart from itself these would diverge, and if
+            # four reps were collapsed n_pairs would be 60 with cells at 60 too — so
+            # reps_per_cell is the assertion that tells the two apart.
+            {"kind": "json_number", "path": "floor_overlap.n_pairs", "op": "==", "value": 60},
+            {"kind": "json_number", "path": "floor_overlap.cells", "op": "==", "value": 60},
+            {"kind": "json_number", "path": "floor_overlap.reps_per_cell", "op": "==", "value": 1},
+            # Nothing is persistent and nothing is dismissed. A single-rep cell must not
+            # be counted either way: calling it persistent would manufacture the
+            # reproduction, calling it unreproduced would dismiss it on no evidence.
+            {"kind": "json_number", "path": "floor_overlap.n_persistent_cells", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "floor_overlap.n_unreproduced_cells", "op": "==", "value": 0},
+            {
+                "kind": "json_number",
+                "path": "floor_overlap.n_unreplicated_cells",
+                "op": "==",
+                "value": 60,
+            },
+            {"kind": "stdout_contains", "text": "NO REPLICATION"},
+            {"kind": "stdout_contains", "text": "reproduced nor dismissed"},
+            {"kind": "exit_bits_set", "bits": [32]},
+            {"kind": "anomaly_kind_present", "kind_name": "floor_overlap_unconfirmed"},
+            # And it is not mistaken for a coverage or provenance fault: the field's
+            # absence is a producer vintage, not a missing measurement.
+            {"kind": "exit_bits_clear", "bits": [4, 8, 16]},
         ],
     )
 
@@ -4866,6 +5002,7 @@ SCENARIOS = {
         sc_floor_band_order_confounded,
         sc_floor_band_bias_past_floor,
         sc_floor_band_half,
+        sc_floor_band_unreplicated,
         sc_matrix_stamped,
         sc_matrix_mixed,
         sc_matrix_unstamped,

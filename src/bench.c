@@ -648,6 +648,28 @@ static int g_threads;
  * before this field existed read as matrix records, which they are. */
 static const char *g_probe = "none";
 
+/* Which repetition of the probe produced this record. 0 for every matrix record and
+ * for datasets written before the field existed, which is what they were.
+ *
+ * IT HAS TO BE A KEYED FIELD, and the note field could not have carried it. The band
+ * used to measure each size once at each floor, which gave one pair per (arm, thread
+ * point, size) -- and on the first P2 pass that came out as 2 pairs of 390 outside
+ * their parity band at 56% sign consistency against a 3% order control. Scott's
+ * reading, 2026-08-20: that is not evidence FOR a floor effect and not evidence
+ * against one either, because n=2 is underpowered in both directions. So the band is
+ * replicated rather than adjudicated, and section 4's block stays until it is
+ * answerable.
+ *
+ * Replication only buys power if the reps stay separable. decompose.py aggregates
+ * records that share a comparison key into ONE cell, so four reps of the same (size,
+ * floor) with nothing to tell them apart would collapse into a single cell and the
+ * pair count would not move -- more samples per cell, same n. Worse, the order
+ * alternates per rep, so one collapsed cell would carry both `floor_probe_first` and
+ * `floor_probe_second` and the order control would read as both at once. The note
+ * field is the wrong home for the same reason it was the wrong home for `probe`:
+ * emit() overwrites it when the timer is outrun. */
+static int g_probe_rep = 0;
+
 /* Which MATRIX these records came from, so that a dataset measured before the #2
  * expansion can never be pooled with one measured after it.
  *
@@ -846,6 +868,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"blas_sha\":\"%s\",\"coretype\":\"%s\","
            "\"thread_backend\":\"%s\",\"pin_policy\":\"%s\","
            "\"arch_selected\":\"%s\",\"role\":\"%s\",\"probe\":\"%s\","
+           "\"probe_rep\":%d,"
            "\"matrix_id\":\"%s\",\"matrix_cases\":%ld,"
            "\"threads\":%d,"
            "\"routine\":\"%s\",\"m\":%d,\"n\":%d,\"k\":%d,\"lda_pad\":%d,"
@@ -859,7 +882,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"gflops\":%.6f,\"gflops_p50\":%.6f,\"verified\":%s,\"note\":\"%s\"}\n",
            g_run_id, g_host, g_instance, g_library, g_target, g_build,
            g_blas_sha, g_coretype, g_thread_backend, g_pin_policy,
-           g_arch_selected, g_role, g_probe,
+           g_arch_selected, g_role, g_probe, g_probe_rep,
            g_matrix_id, g_matrix_cases, g_threads,
            routine, m, n, k, lda_pad,
            g_incx,
@@ -880,8 +903,10 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
  * because a record kind that carries a SUBSET of the provenance is worse than one
  * that carries none: decompose.py's role gate and instance dispatch both read these
  * fields, and a record missing `role` silently belongs to whatever role the reader
- * defaulted to. Every kind gets the same fourteen fields and the same `threads`, and
- * they diverge only after that.
+ * defaulted to. Every kind gets the same fifteen fields and the same `threads`, and
+ * they diverge only after that. `probe_rep` joined that set when the overlap band
+ * gained replication: a skip or prime record written during the band would otherwise
+ * be the one kind that could not say which rep it sat in.
  *
  * Closes the wall-clock interval on the same terms emit() does, so that a stream
  * containing skipped cases still has the additivity property the g_last_emit block
@@ -898,12 +923,13 @@ static void emit_prefix(const char *record) {
            "\"blas_sha\":\"%s\",\"coretype\":\"%s\","
            "\"thread_backend\":\"%s\",\"pin_policy\":\"%s\","
            "\"arch_selected\":\"%s\",\"role\":\"%s\",\"probe\":\"%s\","
+           "\"probe_rep\":%d,"
            "\"matrix_id\":\"%s\",\"matrix_cases\":%ld,"
            "\"threads\":%d,\"case_seconds\":%.6f,",
            record,
            g_run_id, g_host, g_instance, g_library, g_target, g_build,
            g_blas_sha, g_coretype, g_thread_backend, g_pin_policy,
-           g_arch_selected, g_role, g_probe,
+           g_arch_selected, g_role, g_probe, g_probe_rep,
            g_matrix_id, g_matrix_cases,
            g_threads, case_seconds);
 }
@@ -1380,6 +1406,28 @@ static void sweep(const char *routine, const int *sizes, int nsizes, int lda_pad
    is one the matrix already measures. See the header comment for why it exists. */
 static const int OVERLAP_SIZES[] = { 192, 224, 256, 320, 384 };
 
+/* How many times each size's pair is measured. Raised from 1 to 4 on 2026-08-20,
+ * after the first P2 pass returned 2 of 390 pairs outside their parity band at 56%
+ * floor sign consistency against a 3% order control -- which Scott read as
+ * underpowered in both directions rather than as a null: at one pair per (arm, thread
+ * point, size) there is no way to ask whether an outside-band pair reproduces.
+ *
+ * The replication goes here rather than being left to P3's fifteen passes because the
+ * per-cell question needs repeats WITHIN a pass. Passes differ in instance_id and are
+ * deliberately not pooled (see CLAUDE.md), so three passes give three separated
+ * observations of a cell and no within-pass answer at all; 4 reps per pass makes the
+ * pooled statistics 4x and the per-cell question askable on the pass that raised it.
+ *
+ * IT IS NEARLY FREE, which is why 4 rather than 2. A pair costs
+ * MIN_SECONDS_SMALL + MIN_SECONDS = 0.35 s of timed work plus one untimed verify call
+ * at n<=384, so five sizes is under 2 s and three extra reps add ~6 s to a stream
+ * whose cheapest rung is 2.27 min. Across P3 that is minutes per host per pass.
+ *
+ * It does NOT move matrix_id: run_floor_overlap() is skipped in the dry pass, so the
+ * band has never been part of the fold, and this pass's 7c371fee324b7304 still pools
+ * with P3's. That is the one property to re-check before changing anything here. */
+#define OVERLAP_REPS 4
+
 /* Measure each band size at both floors, back to back on one set of operands.
  *
  * Three things are controlled here that calling run_dgemm() twice would not
@@ -1395,13 +1443,18 @@ static const int OVERLAP_SIZES[] = { 192, 224, 256, 320, 384 };
  *     loop makes; without the restore the second measurement would start from
  *     whatever magnitudes the first one left, and if those reach inf the second
  *     measurement is timing a different arithmetic problem than the first.
- *   - THE ORDER ALTERNATES with the size index. If the short floor always ran
- *     first it would always run against the colder cache, and a systematic
- *     first-vs-second drift would be indistinguishable from a systematic
- *     short-vs-long floor difference -- which is the one distinction this probe
- *     exists to make. Alternating separates them, and the note field records
- *     which position each record held so the analysis can test the two
- *     explanations against each other rather than assume one.
+ *   - THE ORDER ALTERNATES with the size index AND with the rep index. If the
+ *     short floor always ran first it would always run against the colder cache,
+ *     and a systematic first-vs-second drift would be indistinguishable from a
+ *     systematic short-vs-long floor difference -- which is the one distinction
+ *     this probe exists to make. Alternating separates them, and the note field
+ *     records which position each record held so the analysis can test the two
+ *     explanations against each other rather than assume one. Alternating on
+ *     `i + r` rather than on `i` alone means every size now gets BOTH orders
+ *     across its four reps, so the order control is balanced within a size
+ *     instead of only across the band: with OVERLAP_REPS even, an order effect
+ *     can no longer hide in whichever sizes happened to draw the position it
+ *     favours.
  *
  * pad=0 and NN only. The question is whether a shorter averaging window changes
  * the answer, and that is not a question about alignment or about which packing
@@ -1423,18 +1476,29 @@ static void run_floor_overlap(void) {
         dgemm_("N","N",&m,&n,&k,&alpha,A,&lda,B,&ldb,&beta,C,&ldc);
         int ok = verify_gemm_corner(A,lda,B,ldb,C,ldc,m,n,k,alpha,beta,C0);
 
-        double first  = (i % 2 == 0) ? MIN_SECONDS_SMALL : MIN_SECONDS;
-        double second = (i % 2 == 0) ? MIN_SECONDS : MIN_SECONDS_SMALL;
-        double floors[2] = { first, second };
-        for (int f = 0; f < 2; f++) {
-            memcpy(C, C0, (size_t)ldc*n*sizeof(double));
-            g_min_seconds = floors[f];
-            double *samples = NULL; int nreps = 0;
-            TIMED_LOOP(dgemm_("N","N",&m,&n,&k,&alpha,A,&lda,B,&ldb,&beta,C,&ldc));
-            emit("dgemm", m,n,k, 0, samples, nreps, case_flops("dgemm",m,n,k), ok,
-                 f == 0 ? "floor_probe_first" : "floor_probe_second");
-            free(samples);
+        /* All OVERLAP_REPS reps share the one allocation, for the reason the pair
+           does: two allocations could differ in page colouring, and a rep-to-rep
+           difference from that source would read as scatter and widen the parity
+           band, which is the direction that hides an effect rather than inventing
+           one. The reps are repeat measurements of one cell on purpose -- what
+           they replicate is the timing, not the memory layout, because the timing
+           is the thing under test. */
+        for (int r = 0; r < OVERLAP_REPS; r++) {
+            g_probe_rep = r;
+            double first  = ((i + r) % 2 == 0) ? MIN_SECONDS_SMALL : MIN_SECONDS;
+            double second = ((i + r) % 2 == 0) ? MIN_SECONDS : MIN_SECONDS_SMALL;
+            double floors[2] = { first, second };
+            for (int f = 0; f < 2; f++) {
+                memcpy(C, C0, (size_t)ldc*n*sizeof(double));
+                g_min_seconds = floors[f];
+                double *samples = NULL; int nreps = 0;
+                TIMED_LOOP(dgemm_("N","N",&m,&n,&k,&alpha,A,&lda,B,&ldb,&beta,C,&ldc));
+                emit("dgemm", m,n,k, 0, samples, nreps, case_flops("dgemm",m,n,k), ok,
+                     f == 0 ? "floor_probe_first" : "floor_probe_second");
+                free(samples);
+            }
         }
+        g_probe_rep = 0;
         free(A); free(B); free(C); free(C0);
     }
     g_probe = "none";

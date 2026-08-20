@@ -323,18 +323,45 @@ if len({synth.min_seconds_for(m) for m in band}) != 2:
     bad.append(f"every band size maps to one floor: {sorted({synth.min_seconds_for(m) for m in band})}")
 
 # The alternation, in both producers. Read out of the function bodies rather than
-# the whole file so an unrelated `i % 2` elsewhere cannot satisfy it.
+# the whole file so an unrelated `% 2` elsewhere cannot satisfy it. It alternates on
+# the size index AND the rep index -- on `i` alone, every size would draw one fixed
+# position for all its reps and the order control would be balanced only across the
+# band, so an order effect could hide in whichever sizes drew the position it favours.
+ALT = "(i + r) % 2 == 0"
 cbody = re.search(r"static void run_floor_overlap\(void\)\s*\{(.*?)\n\}", src, re.S)
 if not cbody:
     bad.append("run_floor_overlap() not found in src/bench.c")
-elif "i % 2 == 0" not in cbody.group(1):
-    bad.append("src/bench.c's run_floor_overlap() no longer alternates which floor runs first")
+elif ALT not in cbody.group(1):
+    bad.append(f"src/bench.c's run_floor_overlap() no longer alternates on `{ALT}`")
 pysrc = pathlib.Path("tools/synth.py").read_text()
 pbody = re.search(r"\ndef floor_probe_records\(.*?\n(?=def )", pysrc, re.S)
 if not pbody:
     bad.append("floor_probe_records() not found in tools/synth.py")
-elif "i % 2 == 0" not in pbody.group(0):
+elif "(i + rep) % 2 == 0" not in pbody.group(0):
     bad.append("tools/synth.py's floor_probe_records() no longer mirrors bench.c's alternation")
+
+# The rep count, and the field that makes it count for anything. OVERLAP_REPS is a
+# fourth hand-copied bench.c constant, and it is the one that decides how many pairs
+# exist: if the fixture and the producer disagree, every replication assertion in
+# gates/p1.sh passes against a dataset shaped unlike anything a real pass produces.
+c_reps = re.search(r"^\s*#define\s+OVERLAP_REPS\s+(\d+)", src, re.M)
+if not c_reps:
+    bad.append("no OVERLAP_REPS in src/bench.c")
+elif int(c_reps.group(1)) != int(synth.OVERLAP_REPS):
+    bad.append(
+        f"OVERLAP_REPS drifted -- bench.c has {c_reps.group(1)}, synth.py has {synth.OVERLAP_REPS}"
+    )
+elif int(c_reps.group(1)) % 2:
+    # Odd counts unbalance the within-size order control: with (i + r) % 2 and an odd
+    # number of reps, each size gets one position once more often than the other, which
+    # is the asymmetry alternating on `i + r` was introduced to remove.
+    bad.append(f"OVERLAP_REPS={c_reps.group(1)} is odd, so the order control is unbalanced per size")
+# The pair key must carry the rep, or four reps collapse into one dict slot keyed by
+# floor and three of them vanish -- the band would cost 4x and report the same n.
+if r'\"probe_rep\":%d' not in src:
+    bad.append("src/bench.c no longer prints probe_rep")
+if "probe_rep" not in pathlib.Path("analysis/decompose.py").read_text():
+    bad.append("analysis/decompose.py does not read probe_rep, so reps are pooled into one pair")
 
 # The tag, across all three files. bench.c is the producer, so its literal wins.
 # The format string is C source, so the quotes around the JSON key are escaped in
@@ -355,6 +382,15 @@ else:
         text = fmt if where == "format string" else argv
         if not (0 <= text.find(a) < text.find(b) < text.find(c)):
             bad.append(f"src/bench.c's emit() {where} no longer has probe between role and threads")
+    # probe_rep is the newest field and so the likeliest to be added to one list and
+    # not the other. Checked in the same way and for the same reason: %d reading an
+    # argument that is not g_probe_rep relabels every field after it, and a record
+    # whose rep index is wrong is not a broken record, it is a plausible wrong pair.
+    for a, b, where in ((r'\"probe\":\"%s\"', r'\"probe_rep\":%d', "format string"),
+                        ("g_probe,", "g_probe_rep", "argument list")):
+        text = fmt if where == "format string" else argv
+        if not (0 <= text.find(a) < text.find(b)):
+            bad.append(f"src/bench.c's emit() {where} no longer has probe_rep right after probe")
 if 'g_probe = "floor-overlap"' not in src:
     bad.append('src/bench.c no longer tags the band records "floor-overlap"')
 if dc.FLOOR_PROBE != "floor-overlap":

@@ -128,6 +128,7 @@ if [ "${1:-}" = "--self-test" ]; then
 armv8-arm-gone|the mandatory generic ARMV8 arm produced nothing|ARMV8|drop_arm(coretype="ARMV8")
 armv8-1thread-gone|the ARMV8 arm ran, but never at 1 thread|1 thread|drop_arm(coretype="ARMV8", threads=1)
 probe-gone|the floor-overlap band was not measured|floor-overlap|drop_probe()
+probe-unreplicated|the band ran but every cell holds one pair, so nothing in it reproduces|reps_per_cell|strip_field("probe_rep")
 unstamped|the records carry no matrix_id|matrix_id|strip_field("matrix_id")
 short-ladder|one arm swept fewer cases than the matrix claims|matrix_cases|truncate_arm(coretype="NEOVERSEN1")
 env-gone|no env-*.json, so nothing has provenance|env|drop_files("env-*.json")
@@ -655,10 +656,23 @@ elif st == "INCOMPLETE":
     bad.append(f"the band ran but did not pair up: {o.get('why')}")
 elif st not in ("AGREES", "AGREES-WITH-BIAS"):
     bad.append(f"the band came out {st}: {o.get('why')}")
+# The band being confirmed is not the same as the band being able to confirm anything.
+# At one pair per cell an out-of-band pair can be neither reproduced nor dismissed --
+# which is what the first P2 pass's 2-of-390 at 56% floor sign consistency was, and it
+# is why bench.c gained OVERLAP_REPS. A pass built from a pre-replication binary would
+# otherwise report AGREES here and read as stronger evidence than it is, so the rep
+# count is a gate requirement and not a footnote.
+if (o.get("reps_per_cell") or 0) < 2 and st not in (None, "ABSENT"):
+    bad.append(
+        f"the band ran with reps_per_cell={o.get('reps_per_cell')}: one pair per cell, so "
+        "nothing in it can be reproduced or dismissed. Either the binary predates "
+        "bench.c's OVERLAP_REPS or probe_rep is not reaching the records"
+    )
 print(
     "; ".join(bad)
     if bad
-    else f"{st} over {o.get('n_pairs')} pairs, median bias {o.get('median_bias')}, "
+    else f"{st} over {o.get('n_pairs')} pairs = {o.get('cells')} cell(s) x "
+         f"{o.get('reps_per_cell')} rep(s), median bias {o.get('median_bias')}, "
          f"worst delta {o.get('worst_delta')}"
 )
 sys.exit(1 if bad else 0)

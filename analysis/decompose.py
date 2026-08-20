@@ -1265,6 +1265,20 @@ def build_cells(bench, hosts, exc: Excluded):
             canon_trans(r.get("transa")),
             canon_trans(r.get("transb")),
             canon_floor(r.get("min_seconds")),
+            # probe_rep is LAST, and it is in the key for the same reason incx and
+            # the transposes are: without it, records that differ collapse into one
+            # cell. The overlap band measures each size's pair OVERLAP_REPS times,
+            # and four reps of one (size, floor) with nothing to separate them would
+            # aggregate into a single cell -- more samples, same pair count, no gain
+            # in the n the band was replicated to raise. The order also alternates
+            # per rep, so a collapsed cell would carry both floor_probe_first and
+            # floor_probe_second and the order control would read as both at once.
+            #
+            # It is 0 for every matrix record and for every record written before
+            # bench.c had the field, so adding it to the key is a constant on those
+            # and changes no existing grouping. Appended rather than inserted
+            # because compute_floor_overlap() slices this tuple by position.
+            r.get("probe_rep", 0),
         )
         if not isinstance(gf, (int, float)) or isinstance(gf, bool):
             exc.no_gflops += 1
@@ -2028,11 +2042,15 @@ def report_lda_penalty(cells, hosts, args, out):
     tight = {}
     padded = {}
     for (cond, arm), c in cells.items():
-        inst, thr, routine, m, n, k, pad, incx, ta, tb, floor = cond
+        inst, thr, routine, m, n, k, pad, incx, ta, tb, floor, rep = cond
         # `floor` stays in the pairing key. A tight-vs-padded penalty read across
         # two timing floors would be part stride and part instrument, which is the
-        # same objection as pairing across passes two lines down.
-        base = (inst, arm, thr, routine, m, n, k, incx, ta, tb, floor)
+        # same objection as pairing across passes two lines down. `rep` is 0 on every
+        # matrix cell -- only the overlap band sets it, and the band is split out
+        # before this function is reached -- but it is carried anyway: this is a
+        # positional unpack, and the day a probe record does reach here, pooling it
+        # with pad=0 silently is worse than the KeyError that carrying it produces.
+        base = (inst, arm, thr, routine, m, n, k, incx, ta, tb, floor, rep)
         if pad == 0:
             tight[base] = c
         elif pad:
@@ -2045,7 +2063,7 @@ def report_lda_penalty(cells, hosts, args, out):
             cp = padded[pad][base]
             if ct is None:
                 continue
-            inst, arm, thr, routine, m, _n, _k, incx, ta, tb, floor = base
+            inst, arm, thr, routine, m, _n, _k, incx, ta, tb, floor, _rep = base
             # Same paired rule as per_size(): a tight-vs-padded penalty measured
             # over different passes on each side would be part stride and part
             # box. Both sides are the same arm here, so a pass that has one and
@@ -3117,8 +3135,8 @@ def compute_floor_overlap(probe_cells, args):
 
     (2) Pooled, is the sign consistent? Scatter within the band is noise; five
         sizes all leaning the same way is a bias, and pooling across arms is where
-        the power is (one arm's five pairs is 6% under a fair-coin null, twenty
-        arms' hundred pairs is not a coincidence anyone need weigh). A consistent
+        the power is (one arm's five cells is 6% under a fair-coin null, twenty
+        arms' hundred cells is not a coincidence anyone need weigh). A consistent
         bias smaller than --min-effect cannot manufacture a finding, because
         nothing below that floor is reportable -- so it is recorded as a quantity
         to discount a regime step against, not as a failure.
@@ -3138,6 +3156,15 @@ def compute_floor_overlap(probe_cells, args):
         ORDER-CONFOUNDED, which is neither a pass nor a floor problem, and it is
         reported as its own status rather than being rounded to either.
 
+    THE UNIT DIFFERS BETWEEN (1) AND (2)/(3), on purpose. The band test is per PAIR,
+    because a pair is what a band compares. The two sign tests are per CELL -- each
+    (instance, arm, thread count, size) reduced to the median of its OVERLAP_REPS
+    pairs -- because reps are repeat measurements of one condition and are not
+    independent evidence about whether the floor biases the answer ACROSS conditions.
+    Pooling them as though they were would make unanimity anti-monotone in sample
+    size: more reps, harder to declare a real bias. At OVERLAP_REPS=1 a cell is a
+    pair, so pre-replication datasets are unaffected.
+
     ABSENT is not a failure. Datasets written before bench.c grew the probe have no
     such records and must keep analysing exactly as they did; requiring the probe is
     gates/p2.sh's job, not the exit code's. INCOMPLETE -- probe records present but
@@ -3146,8 +3173,12 @@ def compute_floor_overlap(probe_cells, args):
     pairs = []
     by_case = defaultdict(dict)
     for (cond, arm), cell in probe_cells.items():
-        # Everything except the floor, which is what the pair varies.
-        by_case[(cond[:10], arm)][cond[10]] = cell
+        # Everything except the floor, which is what the pair varies -- and that
+        # includes probe_rep at cond[11], because each rep is its own pair. Dropping
+        # it here would put four reps into one dict slot keyed by floor, where the
+        # last one written wins and the other three vanish silently: the band would
+        # cost 4x and report the same n it did before.
+        by_case[((*cond[:10], cond[11]), arm)][cond[10]] = cell
 
     incomplete = 0
     for (case, arm), by_floor in by_case.items():
@@ -3175,6 +3206,7 @@ def compute_floor_overlap(probe_cells, args):
                 "threads": case[1],
                 "routine": case[2],
                 "m": case[3],
+                "rep": case[10],
                 "arm": arm_label(arm),
                 "floor_short": f_short,
                 "floor_long": f_long,
@@ -3191,17 +3223,88 @@ def compute_floor_overlap(probe_cells, args):
     pairs.sort(key=lambda p: skey((p["instance"], p["arm"], p["threads"], p["m"])))
     outside = [p for p in pairs if abs(p["delta"]) > p["band"]]
 
-    signs = [_sign(p["delta"]) for p in pairs if p["delta"]]
-    order_signs = [_sign(p["delta_order"]) for p in pairs if p["delta_order"]]
-    floor_consistency = abs(sum(signs)) / len(signs) if signs else 0.0
-    order_consistency = abs(sum(order_signs)) / len(order_signs) if order_signs else 0.0
-    median_bias = statistics.median([p["delta"] for p in pairs]) if pairs else None
     worst = max(pairs, key=lambda p: abs(p["delta"])) if pairs else None
 
-    # 5 is one full band on one arm: the smallest set in which all-same-sign is
-    # better than one-in-ten under a fair coin. Below it, sign consistency is not
-    # evidence of anything and claiming a bias from it would be the tuning this
-    # campaign is not allowed to do.
+    # Reproducibility per cell, which is what bench.c's OVERLAP_REPS bought.
+    #
+    # WHAT REPLICATION SETTLES AND WHAT IT DOES NOT. The first P2 pass gave 2 of 390
+    # pairs outside their band at 56% floor sign consistency against a 3% order
+    # control -- underpowered in both directions at n=2, which is why the band is now
+    # replicated 4x per (arm, thread point, size). Replication makes the per-cell
+    # question askable: an out-of-band pair that recurs in a majority of its cell's
+    # reps, with the same sign, is a floor effect at that cell, and one that does not
+    # is jitter meeting a band. Both counts are reported.
+    #
+    # WHAT IS DELIBERATELY NOT DONE HERE: persistence is NOT a precondition for
+    # DISAGREES. A stray pair still blocks section 4, exactly as it did before the
+    # band was replicated. Requiring reproduction would be answering the question the
+    # replication was bought to ask, in the direction of finding nothing, on a
+    # threshold nobody has argued for -- the tuning CLAUDE.md forbids. Failing toward
+    # the block is the safe direction: the numbers are printed next to the status and
+    # the decision stays with a human. Whether persistence should gate the status is a
+    # policy question for Scott once a replicated pass exists; do not answer it here.
+    by_cell = defaultdict(list)
+    for p in pairs:
+        by_cell[(p["instance"], p["arm"], p["threads"], p["m"])].append(p)
+    reps_per_cell = max((len(v) for v in by_cell.values()), default=0)
+    persistent, unreproduced, unreplicated = [], [], []
+    for cell_key, ps in sorted(by_cell.items(), key=lambda kv: skey(kv[0])):
+        out = [p for p in ps if abs(p["delta"]) > p["band"]]
+        if not out:
+            continue
+        # Majority of the cell's reps out of band AND agreeing in sign. Sign
+        # agreement matters: two out-of-band pairs pointing opposite ways are
+        # dispersion, not a floor that reads one way.
+        same_sign = len({_sign(p["delta"]) for p in out}) == 1
+        rec = {
+            "cell": cell_key,
+            "out_of": (len(out), len(ps)),
+            "same_sign": same_sign,
+            "worst": max(out, key=lambda p: abs(p["delta"])),
+        }
+        # THREE buckets, not two, and the third is the whole point of the split. A
+        # cell with one rep is neither reproduced nor unreproduced: calling it
+        # persistent manufactures a reproduction that was never measured, and calling
+        # it unreproduced dismisses it on no evidence. Either would answer the question
+        # the replication was bought to ask, from a dataset that cannot answer it.
+        if len(ps) < 2:
+            unreplicated.append(rec)
+        elif len(out) * 2 > len(ps) and same_sign:
+            persistent.append(rec)
+        else:
+            unreproduced.append(rec)
+
+    # THE SIGN TESTS ARE PER CELL, NOT PER PAIR, and that is what keeps them meaning
+    # the same thing before and after replication. A cell's four reps are repeat
+    # measurements of ONE condition; they are not four independent observations about
+    # whether the floor biases the answer across conditions. Pooling them as if they
+    # were makes unanimity -- which is what `biased` requires -- an anti-monotone test:
+    # more data makes a real bias HARDER to declare, because one rep of one cell need
+    # only draw the wrong way to break it. Replicating the band 4x did exactly that to
+    # a planted 2% bias (240 pairs, 92.5% consistent, reported as scattered), which is
+    # the opposite of powering the question. Reducing each cell to the median of its
+    # reps first restores the intended statistic, makes it robust to per-rep jitter,
+    # and is a no-op at OVERLAP_REPS=1, where a cell IS a pair -- so no pre-replication
+    # dataset changes its answer.
+    cell_delta, cell_order = [], []
+    for _cell_key, ps in sorted(by_cell.items(), key=lambda kv: skey(kv[0])):
+        cell_delta.append(statistics.median([p["delta"] for p in ps]))
+        ords = [p["delta_order"] for p in ps if p["delta_order"] is not None]
+        if ords:
+            cell_order.append(statistics.median(ords))
+    signs = [_sign(d) for d in cell_delta if d]
+    order_signs = [_sign(d) for d in cell_order if d]
+    floor_consistency = abs(sum(signs)) / len(signs) if signs else 0.0
+    order_consistency = abs(sum(order_signs)) / len(order_signs) if order_signs else 0.0
+    median_bias = statistics.median(cell_delta) if cell_delta else None
+
+    # 5 is one full band on one arm: the smallest set in which all-same-sign is better
+    # than one-in-ten under a fair coin. Below it, sign consistency is not evidence of
+    # anything and claiming a bias from it would be the tuning this campaign is not
+    # allowed to do. It counts CELLS, so it is unaffected by the rep count in either
+    # direction -- which is the point of making the sign tests per cell: the threshold
+    # keeps meaning what it meant when it was argued for, on replicated and
+    # pre-replication datasets alike.
     MIN_FOR_SIGN = 5
     biased = len(signs) >= MIN_FOR_SIGN and floor_consistency == 1.0
     order_explains = (
@@ -3217,33 +3320,65 @@ def compute_floor_overlap(probe_cells, args):
             if incomplete
             else "no floor-overlap probe records in this dataset"
         )
+    # ORDER FIRST, and only where nothing reproduces. If every cell's difference tracks
+    # measurement order and none tracks the floor, the probe measured drift, and saying
+    # DISAGREES because a handful of individual pairs strayed outside their bands would
+    # name the wrong cause -- it sends someone to change MIN_SECONDS over a thermal or
+    # cache drift, which is the wrong fix applied confidently. Replication made this
+    # reachable rather than hypothetical: a planted 3% order effect put 5 of 240 pairs
+    # outside band by jitter alone, and under the old precedence ORDER-CONFOUNDED
+    # became unreachable the moment the band was replicated.
+    #
+    # This unblocks NOTHING. `confirmed` is false either way, bit 32 fires either way,
+    # and section 4 stays blocked either way -- the only thing that changes is which
+    # cause the reader is sent after. And it cannot mask a floor effect: a reproducing
+    # one puts `persistent` cells on the board, which this branch excludes, and its
+    # deltas would track the floor rather than the order, which `order_explains`
+    # already requires.
+    elif order_explains and not persistent:
+        status = "ORDER-CONFOUNDED"
+        why = (
+            f"all {len(order_signs)} cell differences follow measurement order and only "
+            f"{100 * floor_consistency:.0f}% follow the floor, so the probe measured drift "
+            f"rather than the floor and cannot settle the n=256 ambiguity"
+        )
+        if outside:
+            why += (
+                f" ({len(outside)} of {len(pairs)} individual pairs are outside their band, "
+                f"none of them reproducing within a cell)"
+            )
     elif outside:
         status = "DISAGREES"
-        w = outside[0]
+        w = max(outside, key=lambda p: abs(p["delta"]))
         why = (
             f"{len(outside)} of {len(pairs)} pairs differ by more than their parity band, "
             f"worst {w['instance']} {w['arm']} n={w['m']} at {100 * w['delta']:+.1f}% "
             f"against a band of {100 * w['band']:.1f}%"
         )
+        # The reproducibility split, in the status line rather than only in the
+        # section, because this string is what the anomaly table and the verdict
+        # print. At reps=1 it says so, which is the honest description of every dataset
+        # collected before bench.c grew OVERLAP_REPS and is exactly the state Scott
+        # called underpowered in both directions.
+        if reps_per_cell > 1:
+            why += (
+                f"; {len(persistent)} cell(s) out of band in a majority of their "
+                f"{reps_per_cell} reps with one sign, {len(unreproduced)} not reproduced"
+            )
+        else:
+            why += "; one pair per cell, so an out-of-band pair here can be neither reproduced nor dismissed"
     elif biased and abs(median_bias) > args.min_effect:
         status = "DISAGREES"
         why = (
-            f"every pair is inside its own band, but all {len(signs)} lean the same way and the "
-            f"median bias is {100 * median_bias:+.1f}%, past the {100 * args.min_effect:.0f}% "
-            f"reporting floor. The bands were widened by dispersion; a bias this size can "
-            f"produce a section-4 step on its own"
-        )
-    elif order_explains:
-        status = "ORDER-CONFOUNDED"
-        why = (
-            f"all {len(order_signs)} differences follow measurement order and only "
-            f"{100 * floor_consistency:.0f}% follow the floor, so the probe measured drift "
-            f"rather than the floor and cannot settle the n=256 ambiguity"
+            f"every pair is inside its own band, but all {len(signs)} cells lean the same way "
+            f"and the median bias is {100 * median_bias:+.1f}%, past the "
+            f"{100 * args.min_effect:.0f}% reporting floor. The bands were widened by "
+            f"dispersion; a bias this size can produce a section-4 step on its own"
         )
     elif biased:
         status = "AGREES-WITH-BIAS"
         why = (
-            f"all {len(signs)} pairs agree within band, but consistently signed: the "
+            f"all {len(signs)} cells agree within band, but consistently signed: the "
             f"{float(pairs[0]['floor_short']):g} s floor reads {100 * median_bias:+.1f}% against "
             f"the {float(pairs[0]['floor_long']):g} s floor. Below the "
             f"{100 * args.min_effect:.0f}% reporting floor, so it cannot create a finding — "
@@ -3252,7 +3387,7 @@ def compute_floor_overlap(probe_cells, args):
     else:
         status = "AGREES"
         why = (
-            f"all {len(pairs)} pairs agree within band, signs scattered "
+            f"all {len(pairs)} pairs agree within band, cell signs scattered "
             f"({100 * floor_consistency:.0f}% consistent), median "
             f"{100 * median_bias:+.1f}%. The step at n=256 in section 4 is the hardware"
         )
@@ -3270,6 +3405,41 @@ def compute_floor_overlap(probe_cells, args):
         "median_bias": median_bias,
         "worst_delta": worst["delta"] if worst else None,
         "min_pairs_for_sign_test": MIN_FOR_SIGN,
+        "reps_per_cell": reps_per_cell,
+        "cells": len(by_cell),
+        # Counts alongside the lists, not derivable from them by a consumer that
+        # truncates: report_floor_overlap() prints at most --max-listed of each, so a
+        # reader counting printed lines would undercount. The gate asserts on these.
+        "n_persistent_cells": len(persistent),
+        "n_unreproduced_cells": len(unreproduced),
+        "n_unreplicated_cells": len(unreplicated),
+        "persistent_cells": [
+            {
+                "instance": r["cell"][0],
+                "arm": r["cell"][1],
+                "threads": r["cell"][2],
+                "m": r["cell"][3],
+                "out_of_band_reps": r["out_of"][0],
+                "reps": r["out_of"][1],
+                "worst_delta": r["worst"]["delta"],
+                "band": r["worst"]["band"],
+            }
+            for r in persistent
+        ],
+        "unreproduced_cells": [
+            {
+                "instance": r["cell"][0],
+                "arm": r["cell"][1],
+                "threads": r["cell"][2],
+                "m": r["cell"][3],
+                "out_of_band_reps": r["out_of"][0],
+                "reps": r["out_of"][1],
+                "same_sign": r["same_sign"],
+                "worst_delta": r["worst"]["delta"],
+                "band": r["worst"]["band"],
+            }
+            for r in unreproduced
+        ],
     }
 
 
@@ -3285,7 +3455,7 @@ def report_floor_overlap(ov, args, out):
         return ov
     out("")
     out(
-        f"  {'instance':<18} {'arm':<26} {'thr':>4} {'n':>5} "
+        f"  {'instance':<18} {'arm':<26} {'thr':>4} {'n':>5} {'rep':>3} "
         f"{'short':>9} {'long':>9} {'delta':>8} {'band':>7} first"
     )
     for p in ov["pairs"][: args.max_listed]:
@@ -3293,6 +3463,7 @@ def report_floor_overlap(ov, args, out):
         flag = " !!" if abs(p["delta"]) > p["band"] else ""
         out(
             f"  {p['instance']!s:<18} {p['arm']:<26} {p['threads']!s:>4} {p['m']!s:>5} "
+            f"{p['rep']!s:>3} "
             f"{p['gflops_short']:9.2f} {p['gflops_long']:9.2f} "
             f"{100 * p['delta']:+7.1f}% {100 * p['band']:6.1f}% {first}{flag}"
         )
@@ -3300,12 +3471,42 @@ def report_floor_overlap(ov, args, out):
         out(f"  ... {len(ov['pairs']) - args.max_listed} more pairs, see --json")
     out("")
     out(
-        f"  sign consistency: floor {100 * ov['floor_sign_consistency']:.0f}%, "
+        f"  sign consistency over {ov['cells']} cell(s): "
+        f"floor {100 * ov['floor_sign_consistency']:.0f}%, "
         f"order {100 * ov['order_sign_consistency']:.0f}% "
         f"(order is the control; bench.c alternates which floor runs first so that a "
         f"first-vs-second"
     )
     out("  drift cannot masquerade as a short-vs-long floor effect)")
+    # Replication, and what it does and does not settle. Printed whether or not
+    # anything is out of band, because "4 reps and nothing out of band" is a
+    # materially stronger statement than "1 rep and nothing out of band" and the
+    # reader cannot tell them apart from the status line.
+    out(f"  replication: {ov['cells']} cell(s) x {ov['reps_per_cell']} rep(s) = {ov['n_pairs']} pairs")
+    if ov["reps_per_cell"] < 2:
+        out("  NO REPLICATION. One pair per cell cannot distinguish an out-of-band pair from")
+        out("  jitter meeting a band, in either direction — see bench.c's OVERLAP_REPS.")
+        if ov["n_unreplicated_cells"]:
+            out(
+                f"  {ov['n_unreplicated_cells']} cell(s) are out of band and are neither "
+                f"counted as reproduced nor dismissed."
+            )
+    else:
+        for c in ov["persistent_cells"][: args.max_listed]:
+            out(
+                f"  PERSISTENT  {c['instance']} {c['arm']} thr={c['threads']} n={c['m']}: "
+                f"out of band in {c['out_of_band_reps']} of {c['reps']} reps, one sign, "
+                f"worst {100 * c['worst_delta']:+.1f}% against {100 * c['band']:.1f}%"
+            )
+        for c in ov["unreproduced_cells"][: args.max_listed]:
+            out(
+                f"  not reproduced  {c['instance']} {c['arm']} thr={c['threads']} n={c['m']}: "
+                f"out of band in {c['out_of_band_reps']} of {c['reps']} reps"
+                f"{'' if c['same_sign'] else ', signs disagree'}"
+            )
+        if ov["persistent_cells"] or ov["unreproduced_cells"]:
+            out("  The status above does NOT discount an unreproduced cell — see")
+            out("  compute_floor_overlap() for why that rule was left to a human.")
     if ov["incomplete_cases"]:
         out(f"  {ov['incomplete_cases']} probe case(s) carried only one floor and were not paired")
     return ov

@@ -13,6 +13,86 @@ change can be compared.
 
 ## [Unreleased]
 
+### Changed — affects how the timing-floor band is measured and read; no matrix number changes
+
+- **The overlap band is replicated four times per size, because at two pairs a cell it
+  could not answer the question it was bought to ask.** On the first P2 pass the band
+  came back `2 of 390` pairs outside their own band, with **56% floor sign consistency
+  against a 3% order control**. Read as adjudication that is a null; read honestly it
+  is *n=2 per cell*, which is not evidence for a floor effect and equally not evidence
+  against one. Scott's ruling, 2026-08-20: **don't adjudicate it, power it** — raise the
+  replication so the question is answerable on P3, and leave section 4's small-regime
+  block in place until it is.
+
+  `src/bench.c` gains `#define OVERLAP_REPS 4`; `run_floor_overlap()` loops it and
+  alternates the floor order on `(i + r) % 2`, so position is balanced *within* a cell
+  rather than only across the five sizes. Every bench record gains **`probe_rep`**,
+  printed from both `emit()` and `emit_prefix()` immediately after `probe`; matrix
+  records carry `0`. Cost is ~6 s per stream against a 2.27 min cheapest rung, and
+  `matrix_id` does not move — the band was already excluded from the dry pass, so
+  `7c371fee324b7304` over 544 cases still stamps a replicated stream.
+
+  **`OVERLAP_REPS` must be even**, and `gates/p1.sh` asserts it: with alternation on
+  `(i + r) % 2` an odd count hands each size one position once more often than the
+  other, reintroducing exactly the order asymmetry the alternation exists to remove.
+
+  Four decisions in the analysis, each mutation-validated:
+
+  - **`probe_rep` is in the comparison key, not merely in the record.** It is
+    `cond[11]`, and the pair key deliberately drops only `cond[10]` (the floor) into
+    the inner dict. Without the rep in the key all four reps of a cell land in one
+    slot and the last write wins — three quarters of the replication silently
+    discarded, reported as one pair. Dropping it fails all four band fixtures.
+  - **The sign tests changed unit from pair to cell**, over each cell's median delta,
+    where a cell is `(instance, arm, threads, size)`. This is a fix, not a
+    recalibration: **unanimity is anti-monotone in sample size**, so replicating the
+    band made a planted bias *harder* to report — the 2% `floor-band-biased` fixture
+    went from 5 unanimous pairs to 240 pairs at 92.5% consistency and came back
+    `AGREES`. A binomial test at α = 1/16 was considered and rejected: it reproduces
+    unanimity exactly at n=5, but the 240 pairs are correlated within cells and
+    assuming independence would overstate the significance of whatever it found. The
+    median-per-cell unit is a **no-op at `OVERLAP_REPS = 1`**, so no pre-replication
+    dataset changes its answer. `MIN_FOR_SIGN = 5` now counts cells, which is why it
+    is unaffected in either direction by the rep count.
+  - **`ORDER-CONFOUNDED` is checked before `outside`, guarded by `not persistent`.**
+    A 3% order effect plus jitter puts a handful of 240 pairs outside band, and with
+    the band test first the status became unreachable: the report would have said
+    `DISAGREES` and sent someone to change `MIN_SECONDS` over a drift. This unblocks
+    **nothing** — `confirmed` is false and bit 32 fires under either status, and
+    section 4 stays blocked under either — the only thing that changes is which cause
+    the reader is sent after. The fixture now asserts `outside_band > 0` *and*
+    `n_persistent_cells == 0`, so the precedence itself is under test rather than the
+    arithmetic that happens to reach it.
+  - **Three reproducibility buckets, not two.** An out-of-band cell is `persistent`
+    (majority of its reps out, all one sign), `unreproduced` (reps disagree), or
+    `unreplicated` (one pair, so neither). Calling a single-rep cell `persistent`
+    manufactures a reproduction; calling it `unreproduced` dismisses it on no
+    evidence. **Persistence is still not a precondition for `DISAGREES`** — gating on
+    it would answer the question the replication was bought to ask, in the direction
+    of finding nothing, on a threshold nobody argued for. Failing toward the block is
+    the safe direction.
+
+  `report_floor_overlap()` grows a `rep` column, a `replication: N cell(s) x M rep(s)
+  = P pairs` line, a `NO REPLICATION` branch, per-cell PERSISTENT and not-reproduced
+  listings capped by `--max-listed`, and a closing note that the status does not
+  discount an unreproduced cell. The reported worst pair is now the largest by
+  magnitude rather than the first one enumerated.
+
+  **`gates/p2.sh` section 7 now requires `reps_per_cell >= 2` whenever the band ran at
+  all**, so a pass built from a pre-replication binary cannot report `AGREES` and read
+  as stronger evidence than it is; new `probe-unreplicated` mutant holds it. New
+  fixture **`floor-band-unreplicated`** carries the legacy single-rep shape — which is
+  the shape the first P2 pass has — and asserts `DISAGREES` with
+  `n_unreplicated_cells == 60`, bit 32 set, bits 4/8/16 clear. `gates/p1.sh` section 2b
+  additionally pins the alternation expression, the `probe_rep` printf position in both
+  emit paths, and `OVERLAP_REPS` against `synth.py`'s copy of it.
+
+  **One behavioural consequence to state plainly: `DISAGREES` now fires more readily on
+  noise**, because four reps give a dispersed cell four chances to stray outside its
+  band. That is deliberate and it is the safe direction — it fails toward section 4's
+  block, never away from it — but it means a band status on P3 must be read with the
+  `persistent` / `unreproduced` split, not off the headline alone.
+
 ### Added — affects what the record can certify; no measured number changes
 
 - **Every routine now carries a correctness check. Eight of nine had none.** Before
