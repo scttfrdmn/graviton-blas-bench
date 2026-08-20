@@ -83,6 +83,38 @@ change can be compared.
 
 ### Fixed — gate coverage; affects no measured number
 
+- **The instrument-host quarantine could be defeated by a test hook on any Neoverse
+  host, including the campaign hosts themselves.** Campaign role requires two
+  conditions — a campaign instance type from IMDS, and a cpu0 MIDR part in
+  `GRAVITON_PARTS` — and `GBB_TEST_IMDS_TYPE` forges the first so the stub suite can
+  reach the code path without EC2. Its comment claimed the second condition still had
+  to hold and that "on any machine a test runs on it does not". **That was an
+  assumption about the test host, not a construction, and it is false.** CI found it:
+  gate p0 runs on `ubuntu-24.04-arm`, whose cpu0 MIDR part *is* in the list, so the
+  forged type promoted the runner to campaign role, `bench-instr-L.ndjson` was never
+  written, and the suite's own anti-forgery assertion failed — while the same suite
+  passed on the x86 runner and on darwin, where the MIDR is unreadable. The sharpest
+  case is the one nobody would have run into by accident and which would have mattered
+  most: running the stub suite on the `c8g` itself would have written
+  campaign-namespace records from a test. CLAUDE.md's rule for these boxes is
+  quarantine *by construction, not by discipline*, and this was discipline wearing
+  construction's clothes.
+  - A forged instance type now refuses campaign role outright, whatever the silicon
+    says. The check is placed **last**, so the two evidence-based refusals still fire
+    wherever they apply — a laptop, castor, an x86 runner — and are still what the
+    suite exercises there.
+  - `GBB_TEST_MIDR_PART` was added so both legs can be pinned deterministically on
+    every platform instead of only on whichever runner happens to carry a Neoverse
+    part — the same host-dependence that hid the hole. **It can only demote:**
+    promotion needs a campaign instance type from real IMDS, which it does not touch,
+    and on a real campaign host the true part is already in the list.
+  - Section L of `tests/run-matrix-stubs.sh` lost its silicon premise and gained L2
+    (forged type + castor's `0xd85` → refused on the MIDR) and L3 (forged type + a
+    *real* Graviton part `0xd4f` → still instrument, refused on the forgery).
+    Mutation-validated: with the new condition removed, L3's three assertions fail and
+    campaign-namespace records appear — reproducing the CI failure on darwin, where
+    the old assertion could not see it.
+
 - **A whitespace failure had been silently skipping the P1 calibration gate.**
   `ruff format --check` failed from `b59ae7b` onwards over three sites in
   `analysis/decompose.py`, `tools/p2-mutate.py` and `tools/synth.py`. Because
@@ -374,6 +406,41 @@ change can be compared.
     `DYNAMIC_OMP` alone does not satisfy it.
 
 ### Removed — affects what the report claims
+
+- **BLIS is dropped from P3.** One config attempt was authorised and it is spent.
+  On the first P2 pass (`c8g.metal-48xl`, Neoverse V2) BLIS from `configure auto` ran
+  large single-threaded DGEMM at **6.1 GFLOP/s against OpenBLAS's 17.7 — 0.35×, at one
+  thread**, then scaled perfectly linearly at a flat 1.33 GFLOP/s per core to t=96.
+  Perfect scaling at a 4.6×-bad constant is a kernel deficit, not oversubscription, so
+  the hypothesis was that `auto` had landed on a generic arm64 sub-config with no
+  Neoverse kernels — and nothing in the record said which, because the config was
+  never read back.
+
+  The attempt: choose the config from the host and read it back at runtime
+  (`blis_config_choose()` plus `bli_arch_query_id()`, both kept). The result, measured
+  on an **instrument-check host and labelled as one** — `castor.local`, Cortex-X925
+  SVE2 at VL=128, not Neoverse and not campaign data, quoted only because it is what
+  tested the hypothesis: with `BLIS_CONFIG=armsve` and the read-back confirming
+  `armsve`, so the request demonstrably landed, BLIS still came in at **0.228×
+  OpenBLAS median over 136 paired t=1 dgemm cases** (0.230× large, range 0.197–0.257;
+  best large dgemm 16.70 against 65.34 GFLOP/s). *Worse* than `auto` on c8g, not
+  better. The misconfiguration hypothesis is tested and rejected as the explanation.
+
+  Why removal rather than a second iteration. Section 1 measures every deficit
+  against the reference arm, so **a misconfigured reference manufactures a deficit in
+  every row** — worse than an absent one, and every one of those rows also read
+  `UNVERIFIED`, since BLIS records carried `verified: null` before this release's
+  verification work. With ArmPL present as the ceiling reference (mandatory for P3,
+  enforced by `workload.sh`) BLIS's marginal analytical value is low, and it is also
+  the cost lever: it ran **5–25× every other arm**, and the $2,942-versus-$591 P3
+  spread *is* BLIS.
+
+  Mechanically it is a declined arm, not a deleted one: `GBB_PHASE=p3` skips the
+  clone and build and writes a manifest arm record with `built=false`, `runnable=true`
+  and a stated reason (standing order 11 — absent and null are different claims). The
+  P2 dataset still needs the config-read-back tooling to be read, so none of it is
+  removed, and `GBB_BLIS=on` builds it anyway with the override logged. `gates/p3.sh`
+  never referenced BLIS, so no gate changes.
 
 - **Standing order 1's `peak_fma` headroom cross-check is retired.** Not weakened,
   not rethresholded: removed, and the report now says the empirical ceiling stands

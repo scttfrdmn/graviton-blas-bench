@@ -46,8 +46,12 @@
 #   GBB_ARMPL_MIRROR=s3://gbb-results-942542972736-us-east-1/gbb/vendor \
 #     bash scripts/workload.sh
 #
-# GBB_PHASE governs one thing only: whether a missing ArmPL is fatal. p2 -> no
-# (recorded as an explained absence, which is what P2 pass 1 did), p3 -> yes.
+# GBB_PHASE governs two things, both about reference arms. (1) Whether a missing ArmPL
+# is fatal: p2 -> no (recorded as an explained absence, which is what P2 pass 1 did),
+# p3 -> yes. (2) Whether BLIS is built at all: p3 -> no, dropped 2026-08-20 after its
+# one authorised config attempt, and recorded as a declined arm with a reason rather
+# than deleted. build-libs.sh reads GBB_PHASE itself, so it is exported below rather
+# than left to be inherited by luck.
 
 set -uo pipefail
 
@@ -59,6 +63,7 @@ export GBB_S3_URI="${GBB_S3_URI:-s3://gbb-results-942542972736-us-east-1/gbb}"
 export GBB_AWS_REGION="${GBB_AWS_REGION:-us-east-1}"
 export JOBS="${JOBS:-$(nproc)}"
 PHASE="${GBB_PHASE:-p2}"
+export GBB_PHASE="$PHASE"
 # The marker spawn's on-complete hook watches. Overridable for ONE reason: so
 # tests/workload-preflight.sh can assert that completion is signalled without
 # signalling it -- a test that touched the real path while a sweep was running on

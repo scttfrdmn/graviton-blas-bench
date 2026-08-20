@@ -447,6 +447,58 @@ else
 fi
 
 # ---- BLIS -----------------------------------------------------------------
+# DROPPED FROM P3 -- decided 2026-08-20, and it is a decision with a reason rather
+# than a build that failed, so it writes a census record like any other declined arm
+# (standing order 11: absent and null are different claims).
+#
+# Scott's ruling was one attempt at fixing the config and no second iteration. The
+# attempt was made and it did not work:
+#
+#   - Campaign data, first P2 pass on c8g.metal-48xl (Neoverse V2): BLIS from
+#     `configure auto` ran large single-threaded DGEMM at 0.35x OpenBLAS, then scaled
+#     linearly at a flat 1.33 GFLOP/s per core to t=96. Perfect scaling at a 4.6x-bad
+#     constant is a kernel deficit, not oversubscription, so the hypothesis was that
+#     `auto` had landed on a generic arm64 sub-config.
+#   - The attempt: choose the config from the host (`blis_config_choose()` below) and
+#     read it back at runtime, so the request stops being unverifiable.
+#   - The result, on `castor.local` -- an INSTRUMENT CHECK, Cortex-X925/SVE2 at
+#     VL=128, NOT Graviton and NOT campaign data, quoted here only because it is what
+#     tested the hypothesis: with `BLIS_CONFIG=armsve` and `bli_arch_query_id()`
+#     reading back `armsve`, so the request demonstrably landed, BLIS still ran at
+#     **0.23x OpenBLAS median over 136 paired t=1 dgemm cases** (0.20-0.26x in the
+#     large regime, 65.34 vs 16.70 GFLOP/s at n=4096). Worse than `auto` on c8g, not
+#     better. The misconfiguration hypothesis is tested and rejected as the
+#     explanation.
+#
+# Why dropping is right rather than a loss: section 1 measures every deficit against
+# the reference arm, so a bad reference manufactures a deficit in every row -- a
+# misconfigured reference is worse than an absent one. With ArmPL present as the
+# ceiling reference (mandatory for P3, enforced by workload.sh), BLIS's marginal
+# analytical value is low, and it is also the cost lever: it ran 5-25x every other
+# arm, and the $2,942-versus-$591 P3 gap *is* BLIS.
+#
+# What is deliberately NOT done: the `blis_config_choose()` machinery and the
+# `target_effective` read-back stay, because they are what makes the drop defensible
+# rather than a guess, and because P2's dataset needs the same tooling to be read.
+# Set GBB_BLIS=on to build it anyway; the override is logged, not silently honoured.
+PHASE="${GBB_PHASE:-p2}"
+BLIS_WANTED="${GBB_BLIS:-}"
+if [ -z "$BLIS_WANTED" ]; then
+  if [ "$PHASE" = p3 ]; then BLIS_WANTED=off; else BLIS_WANTED=on; fi
+else
+  log "BLIS build forced '$BLIS_WANTED' by GBB_BLIS (phase=$PHASE)"
+fi
+if [ "$BLIS_WANTED" = off ]; then
+  log "BLIS declined for phase=$PHASE (dropped from P3 2026-08-20; see build-libs.sh)"
+  arm_record blis "" "" false true "dropped from P3 by decision 2026-08-20: one config
+attempt was authorised and spent. BLIS_CONFIG=armsve read back as armsve, so the
+request landed, and it still ran 0.23x OpenBLAS median at t=1 (0.20-0.26x large) on
+an SVE instrument host, against 0.35x from configure auto on the c8g P2 pass. A
+misconfigured reference manufactures a deficit in every section-1 row, ArmPL is the
+ceiling reference for P3, and BLIS cost 5-25x every other arm" \
+    pthreads gbb-blis "" n/a >> "$MANIFEST"
+else
+
 # BLIS is a third-party reference arm, not the subject, so an *explicitly
 # overridden* mutable ref is a recorded warning here rather than the hard error it
 # is for OpenBLAS. The default is a SHA (see BLIS_REF above), so reaching this
@@ -587,6 +639,7 @@ PROBE
 fi
 arm_record blis "$BLIS_CONF" "$BLIS_SHA" "$OK" true "$BLIS_REASON" pthreads \
   gbb-blis "$PREFIX/blis" n/a "$BLIS_ARCH" >> "$MANIFEST"
+fi   # end BLIS_WANTED
 
 # ---- reference netlib (correctness control) -------------------------------
 # Not a performance arm. It is here so that "fast" and "correct" can be

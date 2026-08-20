@@ -577,6 +577,29 @@ was changed to do, and the price is now known rather than assumed.
   subject, so an override is a recorded fact rather than a refusal. What is covered
   after the fact is `blas_sha_conflict`, which keys on `(library, target)` and so
   flags `blis/auto` carrying two SHAs without needing a new check.
+- **BLIS is out of P3 — decided by Scott 2026-08-20, one attempt, and the attempt is
+  spent.** The ruling was: set the config explicitly, check that t=1 `n=4096` DGEMM
+  comes back near OpenBLAS, and if that does not fix it remove BLIS entirely rather
+  than spending a second iteration. Done, and it did not fix it. With
+  `BLIS_CONFIG=armsve` and `bli_arch_query_id()` reading back `armsve` — so the
+  request demonstrably landed, which is the thing `configure auto` had never let
+  anyone check — BLIS ran **0.228× OpenBLAS median over 136 paired t=1 dgemm cases**,
+  0.230× large, against **0.35× from `auto` on the c8g P2 pass**. Worse, not better,
+  so "auto fell back to a generic sub-config" is rejected as the explanation. That
+  measurement is from `castor.local` and is therefore an **instrument check, not
+  campaign data** — non-Neoverse, quarantined by construction — which is exactly why
+  it is admissible for the purpose it was used for: it tests a *hypothesis about
+  BLIS's configuration*, not a claim about Graviton, and standing order 3 is about the
+  latter. The c8g figure is the campaign-data basis.
+  Three reasons removal beats one more iteration, and only the first is about cost:
+  section 1 measures every deficit against the reference, so a bad reference
+  manufactures a deficit in **every row**; ArmPL is now the ceiling reference and is
+  mandatory for P3, so nothing is left without one; and BLIS ran 5–25× every other arm
+  — the $2,942-versus-$591 P3 spread *is* BLIS. Mechanically it is a **declined arm,
+  not a deleted one**: `GBB_PHASE=p3` skips the build and writes a manifest record with
+  a stated reason (standing order 11), the config-read-back tooling stays because the
+  P2 dataset needs it to be read, and `GBB_BLIS=on` overrides with the override logged.
+  Re-adding BLIS to P3 is a spend and framing decision: ask.
 
 ## Ask before
 
@@ -634,6 +657,16 @@ over each and checks the report. Two rules about it:
   pipeline including the S3 path, but they are not Neoverse and not Graviton.
   Quarantine them **by construction, not by discipline**: a distinct `run_id`
   namespace and a separate output directory, so nothing from them can reach the
-  published dataset even by accident.
+  published dataset even by accident. **A test hook is part of the construction, and
+  one of them was not** (fixed 2026-08-20). `run-matrix.sh` grants campaign role only
+  on IMDS *and* MIDR evidence, and `GBB_TEST_IMDS_TYPE` forges the IMDS half; its
+  safety rested on the comment "on any machine a test runs on, [the MIDR condition]
+  does not hold", which is an assumption about the test host rather than a property of
+  the code, and CI falsified it — GitHub's `ubuntu-24.04-arm` runner carries a MIDR
+  part that is in `GRAVITON_PARTS`, so the forged type promoted it, and the same hole
+  was open on every campaign host. A forged type now refuses campaign role outright,
+  checked last so the evidence-based refusals still fire where they apply. When adding
+  a hook that reaches a role, tenancy or namespace decision, make it incapable of the
+  unsafe direction rather than unlikely to be used in it.
 - `results/` and `bin/` are gitignored. Collected campaign results are published
   as release artifacts, not committed.
