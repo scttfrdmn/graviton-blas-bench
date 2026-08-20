@@ -281,16 +281,38 @@ and prints `gbb: matrix_id=… over N cases` to stderr before the first record �
 the records carry as `matrix_cases`, so it cannot drift from what was measured, and
 the fold is deliberately not subject to the thread-dependent large cap.
 
-### Wall-clock is anti-correlated with arm quality
+### Wall-clock is anti-correlated with arm quality — but weakly, and measured now
 
 The cheap/expensive boundary is not a size. It is wherever ~6 calls exceed the
 `MIN_SECONDS` floor — `t_call ≈ 0.1 s` — and that size moves with thread count and
 with how fast the arm is: single-threaded around n≈800 for DGEMM, at 192 threads
-closer to n≈2000. So the **slowest** arm is the most expensive one, and the generic
-`ARMV8` arm at one thread on `c9g` is likely the single most expensive arm in the
-campaign — and it is one the campaign specifically wants. Instrument per-case
-wall-clock on the slowest arm of the first P2 iteration, never on a representative
-one, or the extrapolation to P3 lands low.
+closer to n≈2000. So the **slowest** arm is the most expensive one, and the
+extrapolation to P3 must be instrumented on the slowest arm of the first P2
+iteration, never on a representative one, or it lands low. That much holds.
+
+**The rest of what this section used to say was a prediction, and the first P2 pass
+contradicted it.** It named the generic `ARMV8` arm at one thread on `c9g` as
+"likely the single most expensive arm in the campaign". Measured on
+`c8g.metal-48xl` at t=1 (run `20260820T031023Z-ip-172-31-36-19`, `case_seconds`
+summed per stream), the six DYNAMIC coretype arms come out:
+
+| arm at t=1 | minutes | | arm at t=1 | minutes |
+|---|---|---|---|---|
+| `ARMV8SVE` | **7.59** | | `ARMV8` | 7.09 |
+| `NEOVERSEV1` | 7.44 | | `NEOVERSEV2` | 7.09 |
+| `unforced` | 7.09 | | `NEOVERSEN1` | 7.00 |
+
+`ARMV8SVE` is the slowest, generic `ARMV8` is tied for third, and the whole spread
+is **8.4%**. So instrument the slowest arm because it is the slowest, not because
+picking it changes the answer much — and do not assume which arm that is. On this
+host the two SVE-kernel arms are the expensive ones, because at 1 thread they are
+the *slower* arms in the large regime (see §The expensive end): that is where
+`ABS_MIN_SAMPLES = 3` binds, so per-call time passes straight through to wall clock.
+Large is 63–65% of a t=1 stream and 79% of a t=8 one; small is 3–4% and level-1 is
+1%. Everywhere else `MIN_SECONDS` targets fixed *work*, so a slower arm buys fewer
+calls rather than more seconds, which is why the anti-correlation is weak rather
+than strong. Re-read this on `c9g`: the same argument predicts nothing about which
+arm is slowest there either.
 
 ### `MIN_SECONDS` is per regime, and 0.30 was never argued for
 
