@@ -58,9 +58,120 @@ change can be compared.
   at t=128 land at half rate under *both* policies, the same placement mechanism now
   visible in campaign numbers.
 
-- **Two decisions left open for Scott**, both because they change a measured number:
-  whether to bind the roofline probe, and whether section 6 should print the caveat
-  rather than leaving it in `CLAUDE.md`.
+- **Both decisions that were left open are now taken (Scott, 2026-08-20)**, and both are
+  implemented in the two entries below: the roofline probe runs bound *and* unbound with
+  both records kept, and section 6 prints the placement caveat rather than leaving it in
+  `CLAUDE.md`. The per-case half-rate finding above was raised in priority at the same
+  time and is what the bimodality detector answers.
+
+### Added — the roofline probe runs bound and unbound, and the delta between them is the measurement
+
+- **`roofline_once()` is invoked twice at every thread count above one** — `OMP_PROC_BIND=false`,
+  which is the environment the arms actually run in, and `OMP_PROC_BIND=close OMP_PLACES=cores`,
+  where `peak_fma_allcore` means what its name says. Neither is discarded. Comparability with the
+  P2 pass was the argument for leaving it unbound and it is worth little (P2 is a dry run feeding
+  the cost model), but the choice was not necessary: two records with the policy in a field cost
+  seconds of instance time and make the ratio between them a measurement rather than a caveat.
+- **The policy is read from the runtime, not from the environment.** `roofline.c` emits
+  `omp_proc_bind` from `omp_get_proc_bind()`, because `OMP_PROC_BIND` is a request and a `proc_bind`
+  clause or an affinity-less runtime can make the answer differ — standing order 10's rule, one
+  instrument over. `OMP_PLACES=cores` is set only on the bound invocation: an empty `OMP_PLACES`
+  is not the same claim as an absent one.
+- **Binding is applied from outside the process, and it has to be.** OpenMP specifies that a
+  `proc_bind` clause is *ignored* when `OMP_PROC_BIND` is `false`, so a self-bound region would
+  silently do nothing under the sweep's own environment — and external pinning is standing order 9
+  anyway.
+- **Section 6 prints the placement caveat**, and prints the bound/unbound ratio per rung where
+  both invocations ran and the gap clears `PLACEMENT_NOTE_MIN`. A rung with an unbound figure and
+  no bound one says so rather than going quiet. `peak_fma` itself is unchanged — still `max()` over
+  the single-core and all-core figures, still provenance only, still carrying no threshold — which
+  is exactly why the note is safe to print: with the headroom cross-check retired there is no way
+  to mistake it for a verdict. A figure sitting 1.8× under the silicon with nothing beside it
+  saying why is the same "reads like protection, provides none" failure that retired the check.
+- **A one-thread record is never bucketed.** `peak_fma` at t=1 is a different metric from
+  `peak_fma_allcore`, and an `omp_proc_bind` that is absent (an older binary, a hand run) is
+  neither `bound` nor `unbound` — reading absence as `false` would manufacture a placement ratio
+  out of a record that never claimed one.
+
+### Added — per-case placement bimodality is detected, not left to the median
+
+- **"Large GEMM is immune at t≥128" was load-bearing and is true only of the median.** Every
+  summary statistic said the rung was fine — arm medians scaling 1.30–1.32×, a 0.995 median
+  policy ratio — while 6–8 of 35 large gemm-family cases ran at half rate (~1030 against ~2030
+  GFLOP/s) under *both* memory policies. Standing order 1's denominator is a `max` over large
+  DGEMM and so is robust to cells running slow, but any *per-cell* efficiency figure landing on
+  one of those cases is wrong by 2× and the median hides it. Bimodality within a cell population
+  is the signature, so it is now detected rather than trusted to stay hidden consistently.
+- **`bimodal_populations()` groups per `(instance, threads, routine, regime, arm)`** — the finest
+  grouping that still has a population in it. Pooling routines would be self-defeating: sgemm is
+  ~2× dgemm in GFLOP/s, so a pooled population is bimodal by construction. Gaps are **ratios, not
+  differences**, because GFLOP/s spans an order of magnitude across the routine set and a fixed
+  absolute gap would mean something different in every group.
+- **A mode is separated from a size ramp by a symmetric ordering test.** A low mode whose members
+  are the largest sizes *or* the smallest is a size effect, not placement — `dsyrk` climbs 20.6%
+  between ≤4096 and >4096 at t=96, and the bandwidth-bound routines decline. Monotone in either
+  direction is classified as a ramp. Accepted cost, stated rather than discovered: a genuinely
+  scattered split that happens to align with size order is called a ramp.
+- **Detect then classify, never silently filter.** Both classes land in the payload under
+  `bimodal.populations` with `size_ordered` telling them apart, so a consumer that wants only the
+  flagged ones filters. Section 5 raises `placement_bimodal` at `!` for the scattered ones and
+  counts the ordered ones in a `.` note, so "absent" is distinguishable from "unexamined".
+- **The detector publishes its own coverage**, because its reach is uneven by construction:
+  `BIMODAL_MIN_CASES = 5` means a 5-rung large population is examined and the same routine at t=1,
+  truncated to 3 rungs by the large cap, is not. `examined` and `too_small` are in section 5 and in
+  the payload — a detector that examined 40 populations and skipped 200 has told the reader much
+  less than "no bimodal populations" sounds like. Standing order 11 applied to a detector rather
+  than to an arm.
+- **`BIMODAL_MIN_CASES` is justified on the statistic and not on the ladder.** It equals
+  `len(SIZES_LARGE)` today and the comment says in as many words that the coincidence is not the
+  reason and must not become it: if the large ladder gains a rung, this constant does not move.
+- **No new exit bit, on purpose.** Gate P2 wants "clean bar genuine findings", and a bit on a
+  known, explained hardware property is a bit whose threshold gets raised — the retuning failure
+  this file has already recorded twice.
+- **Three fixtures, all mutation-validated.** `placement-cliff` plants a scattered half-rate mode
+  at t=128 and asserts the flag, the coverage counts, the section-6 placement line and the ratio;
+  `placement-size-ramp` plants a descending monotone mode and asserts it is classified as a ramp
+  and raises nothing; `placement-fast-outlier` plants 6 low of 10 so the minority rule is the only
+  guard that catches it. `synth.py` gains `gain_routine_sizes`, which is deliberately narrower than
+  a `gain_sizes`-plus-`gain_routines` combination — a plant that fired in every routine at once
+  could not distinguish a detector that found the planted population from one that fires on
+  everything. Eight mutations, all caught: one-directional ordering test, forced `size_ordered`,
+  forced `bind`, a widened gap, the routine dropped from the grouping key, the minority check
+  removed, the `too_small` counter stubbed, and the minimum raised past the ladder.
+- **`bimodal_where` treats `size_ordered` as a filter rather than a property assertion**, which is
+  the one design move that lets a single check kind express both "the plant is scattered" and
+  "nothing scattered here" inside a group that legitimately holds ordered populations. Every
+  scenario emits ordered populations, because the synthetic surface `m/(m+64)` spans 7.2× across
+  the small ladder.
+
+### Changed — `SIGN_MAJORITY` is decoupled from `--verdict-majority`, structurally
+
+- **Two thresholds that answer different questions must not share a definition.** The band sign
+  test reused `--verdict-majority`'s default, which couples them: a later change to the verdict
+  majority would silently move the band test. That is the density-coupling defect this file has
+  recorded three times, in its threshold form. `SIGN_MAJORITY` is now its own literal,
+  `sign_majority()` takes no threshold argument (a parameter there is a place for the CLI value to
+  be threaded in), and the payload publishes it under its own name. Both are 0.60 today.
+- **0.60 for the band test is a stated convention, not a derivation.** The band data cannot argue
+  it cleanly, for the same reason the binomial was rejected: the pairs are correlated within a cell,
+  so the effective N is not the pair count. A threshold that is admittedly conventional is fine; one
+  that looks derived and is not is the failure mode. The comment above the constant says which it is.
+- **The decoupling is asserted in `gates/p1.sh` and cannot be asserted anywhere else.** Both
+  constants hold the same value today, so no dataset can distinguish a decoupled implementation
+  from a coupled one — the check is therefore structural: an `ast` pass requiring one numeric
+  literal each, `sign_majority(signs)` with no threshold parameter, a body that reads neither the
+  CLI value nor the other constant, and a behavioural check that moving
+  `DEFAULT_VERDICT_MAJORITY` to 0.99 does not change `sign_majority()`'s answer.
+
+### Added — `gates/p1.sh` checks the roofline record copy against `src/roofline.c`
+
+- **`synth.py` hand-copies the roofline record shape, and the copy just gained a field.** Section 2
+  already asserted the size ladders against `bench.c` for the reason that a drifted fixture is a
+  rigorous test of the wrong experiment; the same argument applies to the record. Both directions
+  of the 18-field set are asserted, plus that the all-core records at t=128 carry exactly
+  `['close', 'false']`, that t=1 emits no all-core record, and that `run-matrix.sh` still calls
+  `roofline_once` more than once. Without it, `synth.py` dropping `omp_proc_bind` would take
+  section 6's placement columns quietly absent with every scenario still green.
 
 ### Fixed — section 9's floor-bias test could not fire on a real dataset; no measured number changes, three statuses become reachable
 
@@ -91,13 +202,13 @@ change can be compared.
 
 - **One rule, `sign_majority()` at `SIGN_MAJORITY = 0.60`, for all three
   signs-agree tests** — the floor sign test, the order control, and per-cell
-  persistence. 0.60 is the campaign's existing majority (`--verdict-majority`'s
-  default, section 8's rule), reused rather than invented, and on `|Σ sign| / N` it
-  means an **80/20 split of cells**, which is a strong lean rather than a bare
-  majority. It reproduces the reading of the only real band data there is: 56% floor
-  against a 3% order control clears neither, and the right call on that was "not a
-  bias, not a drift". Exact via `majority_met()`, for the reason every other majority
-  in the file is.
+  persistence. On `|Σ sign| / N` 0.60 means an **80/20 split of cells**, which is a
+  strong lean rather than a bare majority. It reproduces the reading of the only real
+  band data there is: 56% floor against a 3% order control clears neither, and the
+  right call on that was "not a bias, not a drift". Exact via `majority_met()`, for the
+  reason every other majority in the file is. **It is its own constant, not
+  `--verdict-majority`'s default reused** — see the decoupling entry below; the earlier
+  draft of this bullet said "reused rather than invented", and that was the defect.
 
   Two consequences worth stating. The order control now requires that the floor
   **fail** the majority rather than merely score lower, which is stricter, is what

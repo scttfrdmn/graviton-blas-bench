@@ -125,6 +125,54 @@ DEFAULT_MIN_EFFECT = 0.05
 # neighbour. 25% on a no-turbo, no-SMT host is not thermal or frequency drift.
 DEFAULT_NOISY_SPREAD = 0.25
 
+# BIMODALITY WITHIN ONE CELL POPULATION -- the median's blind spot, and it is not
+# hypothetical. On the first P2 pass at t=128, 6-8 of 35 large gemm-family cases ran
+# at HALF rate (~1030 against ~2030 GFLOP/s) under both memory policies, while the
+# arm medians scaled 1.30-1.32x across the rung and the median ratio between the two
+# policies was 0.995. So every summary statistic the report computes said the rung
+# was fine, and any per-cell efficiency figure landing on one of those cases was
+# wrong by 2x. Standing order 1's denominator is a max over large DGEMM and a max is
+# robust to cells running slow, so the ceiling itself survives -- what does not is
+# the reader's assumption that a cell is represented by its group.
+#
+# The mechanism, measured 2026-08-20: once a cpuset spans two sockets an unbound
+# OpenMP runtime stops placing threads on distinct cores. This detector does not
+# assert that cause, because it cannot from the data it reads -- it reports the
+# split and names the measured mechanism as the leading candidate.
+#
+# 1.5 is the geometric midpoint between the largest legitimate within-routine spread
+# this campaign has measured (the `>4096` versus `<=4096` lift on dsyrk at t=96,
+# 1.206) and the effect being detected (1.97): sqrt(1.206 * 1.97) = 1.54. Putting it
+# there rather than just above the legitimate ceiling is deliberate -- a boundary
+# hugging the largest thing that is allowed to happen fires on the next slightly
+# larger legitimate thing, and this flag is read by a human, so a missed marginal
+# case costs less than a flag people learn to skip.
+BIMODAL_GAP = 1.5
+
+# Below this many cases, a minority low mode is a single point and the size-ordering
+# test that separates a mode from a ramp has nothing to work with: with 4 values, a
+# 1-of-4 low mode is ordered or not by an accident of which size it was. 5 is where
+# both halves of the test start to mean something -- a low mode can be 1 or 2 of 5
+# and still be a minority, and the ordering test has 3 points above it to be
+# non-ordered against.
+#
+# Justified on the statistic and NOT on the ladder, which matters because
+# len(SIZES_LARGE) is also 5 today. That coincidence is not the reason and must not
+# become it: if the large ladder gains a rung this constant does not move. What the
+# coincidence does mean is that a 5-rung large population sits exactly on the
+# boundary, and a routine carrying no pad or transpose axis (dsymm, dsyrk) has
+# exactly 5 large cases -- so it is examined, and the same routine at t=1, where the
+# large cap truncates the ladder to 3, is not. That is a real coverage limit rather
+# than a hidden one: bimodal_populations() counts the populations it declined to
+# examine and section 5 prints the count.
+BIMODAL_MIN_CASES = 5
+
+# Relative gap between the bound and unbound all-core FMA figures at which section 6
+# prints the placement line. A line on every row trains a reader to skip the line
+# that matters, which is why the denominator-restriction cost is printed the same
+# way. Purely a print threshold: nothing decides on it.
+PLACEMENT_NOTE_MIN = 0.05
+
 # There is no DEFAULT_HEADROOM_FACTOR, and there must not be one again.
 #
 # Standing order 1's `peak_fma` cross-check is RETIRED (Scott, 2026-08-20). It was
@@ -2248,10 +2296,102 @@ def report_regime_profile(deficits, cross, args, out):
     return payload
 
 
+def bimodal_populations(cells):
+    """Cell populations that split into two modes, and whether size explains it.
+
+    The median is the report's workhorse and this is its blind spot. Every summary
+    statistic on the first P2 pass said t=128 was fine -- arm medians scaling
+    1.30-1.32x across the rung, a 0.995 median ratio between the two memory
+    policies -- while 6-8 of 35 large gemm-family cases ran at HALF rate under both
+    policies. A population whose members are not represented by their own median is
+    a hazard the summary cannot express, so it is detected directly.
+
+    Grouped per (instance, threads, routine, regime, arm), which is the finest
+    grouping that still has a population in it: sizes, pads and transposes vary
+    inside a group and the quantity does not. Pooling routines instead would be
+    self-defeating -- sgemm runs about 2x dgemm in GFLOP/s, so a dgemm+sgemm
+    population is bimodal by construction and the detector would fire on every host.
+
+    Returns one record per wide split, carrying `size_ordered`. That flag is not a
+    filter here on purpose: a monotone size ramp produces exactly one wide gap too
+    (dsyrk gains 20.6% between n<=4096 and n>4096 at t=96), and the caller reports
+    the two classes differently rather than one of them silently. Detecting and then
+    classifying is not the same as not detecting.
+
+    Alongside the records it returns its own COVERAGE -- how many populations were
+    examined and how many were below BIMODAL_MIN_CASES -- because this detector's
+    reach is uneven by construction and an uneven reach that is not printed reads as
+    a clean result. A 5-rung large population is examined and the same routine at
+    t=1, truncated to 3 rungs by the large cap, is not; that is standing order 11's
+    rule applied to a detector rather than to an arm.
+    """
+    pops = defaultdict(list)
+    for (cond, arm), c in cells.items():
+        inst, thr, routine, m = cond[0], cond[1], cond[2], cond[3]
+        v = c.value
+        # A zero or negative value is already excluded upstream as a poisoned record;
+        # guarding here as well because this function divides by it.
+        if not isinstance(m, int) or not isinstance(v, (int, float)) or v <= 0:
+            continue
+        pops[(inst, thr, routine, regime(m), arm)].append((v, m))
+
+    found = []
+    examined = 0
+    too_small = 0
+    for key, pop in sorted(pops.items(), key=lambda kv: skey((*kv[0][:4], arm_label(kv[0][4])))):
+        if len(pop) < BIMODAL_MIN_CASES:
+            too_small += 1
+            continue
+        examined += 1
+        pop.sort(key=lambda t: t[0])
+        vals = [p[0] for p in pop]
+        # The widest RATIO gap between adjacent values is where a two-mode population
+        # splits. Ratio, not difference: GFLOP/s spans an order of magnitude between
+        # routines and thread counts, so a fixed gap would mean a different thing in
+        # every group.
+        ratio, at = max((vals[i + 1] / vals[i], i) for i in range(len(vals) - 1))
+        if ratio < BIMODAL_GAP:
+            continue
+        low, high = pop[: at + 1], pop[at + 1 :]
+        # The low mode must be the minority. A wide gap with most of the population
+        # underneath it is one fast outlier -- a different finding, and reporting it as
+        # "some cases are slow" would be backwards.
+        if len(low) > len(high):
+            continue
+        low_sizes = sorted({p[1] for p in low})
+        high_sizes = sorted({p[1] for p in high})
+        # Monotone in size, in EITHER direction. Ascending is a routine still climbing
+        # to its asymptote; descending is a bandwidth-bound routine falling off. Both
+        # are size effects the campaign has measured, and both put one wide gap in a
+        # sorted value list. The cost of the symmetric test is that a real
+        # placement-scattered split which happens to land exactly on the size order is
+        # classified as a ramp -- accepted, because a monotone size effect is the far
+        # more likely reading of a monotone split, and the count is still printed.
+        ordered = max(low_sizes) < min(high_sizes) or min(low_sizes) > max(high_sizes)
+        inst, thr, routine, reg, arm = key
+        found.append(
+            {
+                "instance": inst,
+                "threads": thr,
+                "routine": routine,
+                "regime": reg,
+                "arm": arm_label(arm),
+                "cases": len(pop),
+                "n_low": len(low),
+                "gap_ratio": ratio,
+                "low_median": statistics.median(p[0] for p in low),
+                "high_median": statistics.median(p[0] for p in high),
+                "low_sizes": low_sizes,
+                "size_ordered": ordered,
+            }
+        )
+    return {"populations": found, "examined": examined, "too_small": too_small}
+
+
 # ---- 5. anomalies ----------------------------------------------------------
 
 
-def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, overlap, args, out):
+def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, overlap, bimodal, args, out):
     out("\n" + "=" * 78)
     out("5. ANOMALIES  — read this before trusting any number in sections 1-4, 6-9")
     out("=" * 78)
@@ -2483,6 +2623,69 @@ def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, overlap, args, o
                 f"thread counts on the same host",
             )
 
+    # BIMODAL CELL POPULATIONS. Raised here, at "!", and with no exit bit of its own,
+    # and each of those three is a decision rather than a default.
+    #
+    # Here, because section 5 is where a reader is told what to distrust in the other
+    # sections, and this is specifically a reason to distrust a PER-CELL number while
+    # the medians around it stay sound. At "!", because the population is a property
+    # of the machine being measured, not a defect in the record -- the cells verify,
+    # the arm medians scale, and the right response is to read the cases rather than
+    # to discard the host. And with no exit bit, because gate P2 requires
+    # decompose.py "clean bar genuine findings" and this is a genuine finding on a
+    # host that is behaving as measured: a bit here would fail the gate on a known,
+    # explained property of the hardware, and the next person would raise the
+    # threshold to get the gate green. That is the retuning failure this campaign has
+    # already written down twice.
+    pops = bimodal["populations"]
+    scattered = [b for b in pops if not b["size_ordered"]]
+    ramped = len(pops) - len(scattered)
+    for b in scattered[: args.max_listed]:
+        add(
+            "!",
+            "placement_bimodal",
+            f"{b['instance']} t={b['threads']} {b['routine']}/{b['regime']} on {b['arm']}: "
+            f"{b['n_low']} of {b['cases']} cases sit in a separate low mode — "
+            f"{b['low_median']:.1f} against {b['high_median']:.1f} GFLOP/s, a "
+            f"{b['gap_ratio']:.2f}x gap at sizes {b['low_sizes']} — and the split is NOT "
+            f"ordered by size, so it is not a ramp. The median of this group does not "
+            f"represent its members: any per-cell efficiency figure landing in the low mode "
+            f"is out by that factor. Measured cause on c8g at t>=128 (2026-08-20): once a "
+            f"cpuset spans two sockets an unbound OpenMP runtime stops placing threads on "
+            f"distinct cores, and it survives both memory policies. Named as the leading "
+            f"candidate, not asserted — this detector reads GFLOP/s and cannot see placement.",
+        )
+    if len(scattered) > args.max_listed:
+        add(
+            ".",
+            "placement_bimodal_more",
+            f"... and {len(scattered) - args.max_listed} more bimodal cell populations",
+        )
+    if ramped:
+        # Counted rather than dropped. The detector saw these and classified them; a
+        # reader who is told only about the scattered ones cannot tell whether the
+        # ordered ones were absent or unexamined, and those are different claims.
+        add(
+            ".",
+            "bimodal_size_ordered",
+            f"{ramped} population(s) split by more than {BIMODAL_GAP}x but MONOTONICALLY in "
+            f"size — a routine climbing to or falling off its asymptote, not a second mode. "
+            f"Classified, not flagged.",
+        )
+    if bimodal["too_small"]:
+        # The detector's own coverage, printed whether or not it found anything. A
+        # detector that examined 40 populations and skipped 200 has told the reader
+        # much less than "no bimodal populations" sounds like, and the skipped count is
+        # the only thing that distinguishes the two.
+        add(
+            ".",
+            "bimodal_coverage",
+            f"bimodality examined {bimodal['examined']} cell population(s) and skipped "
+            f"{bimodal['too_small']} with fewer than {BIMODAL_MIN_CASES} cases, where a "
+            f"minority low mode cannot be told from a size ramp. Absence of a flag on a "
+            f"skipped population is not evidence about it.",
+        )
+
     # Verification coverage, per routine. dtrsm/dtrmm/dsymm have no check at all,
     # and those are exactly the operations in the 90-kernel N2 gap under study.
     out("\n  verification coverage (verified=true is the only thing that counts):")
@@ -2563,11 +2766,38 @@ def compute_scaling(cells, roof):
         common[inst] = set.intersection(*per_thread) if per_thread else set()
 
     peaks = defaultdict(list)
+    # THE PLACEMENT SPLIT. run-matrix.sh runs roofline twice at every thread count
+    # above one -- unbound, which is the environment the arms run in, and bound
+    # (OMP_PROC_BIND=close), where the all-core FMA figure measures cores instead of
+    # placement. Keeping both is Scott's call (2026-08-20) and the reason is that the
+    # RATIO is itself the measurement: on c8g at t=128 binding moved
+    # peak_fma_allcore 273 -> 501 GFLOP/s at fixed thread count while the memory
+    # policy moved it 273 -> 260.
+    #
+    # Split on peak_fma_allcore ONLY, and deliberately. The single-core `peak_fma`
+    # record is stamped threads=1 by roofline.c whatever invocation produced it, so
+    # pooling it here would put a one-thread number into a bound-versus-unbound
+    # comparison of an all-core one. There is nothing to place at one thread, which
+    # is also why the runner makes no bound invocation there.
+    #
+    # Three buckets, not two: a record that does not SAY how it was bound goes in
+    # neither. Absent and false are different claims -- every pre-2026-08-20 record
+    # was in fact unbound, but reading absence as `false` would manufacture a
+    # placement ratio out of a hand-run bound invocation from an older binary, which
+    # is the one way this column could lie.
+    allcore = defaultdict(lambda: defaultdict(list))
+    BOUND = ("true", "master", "close", "spread")
     for r in roof:
-        if r.get("metric") in ("peak_fma", "peak_fma_allcore"):
+        metric = r.get("metric")
+        if metric in ("peak_fma", "peak_fma_allcore"):
             gf = r.get("gflops_f64")
             if isinstance(gf, (int, float)) and not isinstance(gf, bool):
                 peaks[(r.get("instance"), r.get("threads"))].append(gf)
+                if metric == "peak_fma_allcore":
+                    bind = r.get("omp_proc_bind")
+                    bucket = "bound" if bind in BOUND else ("unbound" if bind == "false" else None)
+                    if bucket:
+                        allcore[(r.get("instance"), r.get("threads"))][bucket].append(gf)
 
     rows = []
     for key in sorted(set(best) | set(peaks), key=skey):
@@ -2596,6 +2826,13 @@ def compute_scaling(cells, roof):
         # An empty peak list must stay None. It used to collapse to 0, so the number
         # printed `nan` and vanished instead of announcing itself.
         pk = max(peaks[key]) if peaks.get(key) else None
+        ac = allcore.get(key) or {}
+        pk_b = max(ac["bound"]) if ac.get("bound") else None
+        pk_u = max(ac["unbound"]) if ac.get("unbound") else None
+        # None, not 1.0, when either side is missing: a ratio of 1.0 reads as "binding
+        # made no difference", which is a measurement, and "the bound invocation did
+        # not run here" is not.
+        ratio = (pk_b / pk_u) if (pk_b is not None and pk_u) else None
         rows.append(
             {
                 "instance": inst,
@@ -2614,6 +2851,13 @@ def compute_scaling(cells, roof):
                 # will then have to decide for itself what a LOWER bound 4x under the
                 # measurement means -- which is the decision that retired the check.
                 "peak_fma": pk,
+                # The placement columns. peak_fma stays max() over everything, so
+                # where a bound invocation exists it is what peak_fma reports -- the
+                # number then means cores rather than placement, which is the point of
+                # taking the measurement. These three say which it was.
+                "peak_fma_allcore_bound": pk_b,
+                "peak_fma_allcore_unbound": pk_u,
+                "peak_fma_placement_ratio": ratio,
             }
         )
     return rows
@@ -2630,6 +2874,23 @@ def report_scaling(rows, out):
     out("lower bound at -O2 (no -march=native, standing order 6) and measures ~4x under")
     out("the best GEMM on Graviton 4, so the empirical ceiling stands alone with no")
     out("independent floor. Retired 2026-08-20; do not read it as a check that passed.")
+    # THE PLACEMENT CAVEAT, printed rather than left in CLAUDE.md. Scott's call
+    # 2026-08-20, and the reason is the same one that retired the headroom check: a
+    # figure sitting 1.8x under what the silicon does, with nothing beside it saying
+    # why, reads like protection and provides none. A reader who watches peak_fma fall
+    # from t=96 to t=128 will reach for a hardware explanation, and there isn't one.
+    # It is safe to print precisely BECAUSE the cross-check is retired -- with no
+    # threshold on this column there is no way to mistake the note for a verdict.
+    out("")
+    out("PLACEMENT: peak_fma above is max() over the single-core and all-core FMA")
+    out("figures, and the all-core one is thread-placement-sensitive. Measured on")
+    out("c8g.metal-48xl 2026-08-20 at FIXED thread count: binding took it 273 -> 501")
+    out("GFLOP/s (eff 0.510 -> 0.937 at t=128) while the memory policy moved it")
+    out("273 -> 260, i.e. not at all. So an unbound figure at a thread count whose")
+    out("cpuset spans two sockets is ~1.8x low, and that is the instrument, not the")
+    out("hardware. It does not reach the arms: OpenBLAS is built USE_OPENMP=0 and is")
+    out("pthread, so OMP_PROC_BIND never touched a bench record. Nothing in sections")
+    out("1-4 or 7-9 reads this column.")
     for s in rows:
         pk = "absent" if s["peak_fma"] is None else f"{s['peak_fma']:9.2f}"
         emp = "absent" if s["best_dgemm"] is None else f"{s['best_dgemm']:9.2f}"
@@ -2658,6 +2919,21 @@ def report_scaling(rows, out):
                 f"{s['best_dgemm_unrestricted']:.2f} at n={s['best_dgemm_unrestricted_m']} "
                 f"(+{100 * s['denom_restriction_cost']:.2f}%), not used: that size is absent "
                 f"at some thread point on this host"
+            )
+        # What binding was worth at this rung, where both invocations ran. Printed on
+        # the gap and not on every row, for the reason the restriction cost is.
+        pr = s.get("peak_fma_placement_ratio")
+        if pr is not None and abs(pr - 1.0) >= PLACEMENT_NOTE_MIN:
+            out(
+                f"      ^ placement: all-core FMA is {s['peak_fma_allcore_bound']:.2f} bound "
+                f"vs {s['peak_fma_allcore_unbound']:.2f} unbound = {pr:.2f}x. The arms ran "
+                f"unbound, so read the unbound figure as the instrument and the bound one as "
+                f"the cores"
+            )
+        elif s.get("peak_fma_allcore_unbound") is not None and s.get("peak_fma_allcore_bound") is None:
+            out(
+                "      ^ all-core FMA is unbound-only at this rung — no bound invocation, so "
+                "how much of this figure is thread placement is not measured here"
             )
     if not rows:
         out("  no large dgemm and no peak_fma record")
@@ -3127,13 +3403,35 @@ def _sign(x):
 # branch and ORDER-CONFOUNDED were fixture-only statuses: they passed at 5-60
 # low-noise synthetic cells and could not fire on the instrument they exist to check.
 #
-# 0.60 is the campaign's existing majority, reused rather than invented -- it is
-# `--verdict-majority`'s default and section 8's rule. On this statistic it means an
-# **80/20 split of cells**, because consistency is |Σ sign| / N: 0.8 - 0.2 = 0.6. That
-# is a strong lean, not a bare majority, which is what a sign test should require.
-# It also reproduces Scott's own reading of the only real band data there is: the
-# first P2 pass came in at 56% floor consistency against a 3% order control, which
-# clears neither threshold, and the right call on it was "not a bias, not a drift".
+# 0.60 IS A STATED CONVENTION, NOT A DERIVED NUMBER, AND IT IS DELIBERATELY NOT
+# `--verdict-majority`. It was first justified here as a reuse of that default, and
+# Scott rejected the justification (2026-08-20): reusing a threshold couples two
+# tests that answer different questions -- "do enough cells lean one way for this to
+# be a bias" and "do enough comparable cells agree for the campaign to publish a
+# direction" -- and the coupling is the density-class defect again. A later change to
+# the verdict majority would move the band test with it, silently, and nothing in
+# either call site would say so. So the two are separate constants and MUST STAY
+# separate: if one is changed, the other is not, even when they hold the same value.
+# `DEFAULT_VERDICT_MAJORITY` is not read here and `SIGN_MAJORITY` is not passed to
+# argparse; gates/p1.sh section 3 asserts both structurally, because "they happen to
+# be equal today" is exactly how a coupling gets reintroduced by someone tidying up.
+#
+# What the number means on this statistic is exact and worth stating: consistency is
+# |Σ sign| / N, so 0.60 is an **80/20 split of cells** (0.8 - 0.2 = 0.6) -- a strong
+# lean, not a bare majority, which is what a sign test should require.
+#
+# WHAT IT IS NOT is derived from the band data, and manufacturing a derivation was
+# the other option. It was rejected for the same reason the binomial at alpha=1/16 was:
+# the pairs are correlated within a cell -- the reps of one (size, floor) share a
+# process, a buffer pool and a thermal moment -- so the effective N is not the pair
+# count and no clean test on it is available. A threshold that is admittedly
+# conventional is fine; one that looks derived and is not is worse than either.
+#
+# The one empirical thing that can be said about it, and it is a consistency check
+# and not a derivation: it reproduces Scott's own reading of the only real band data
+# there is. The first P2 pass came in at 56% floor consistency against a 3% order
+# control, which clears neither threshold, and the call on it was "not a bias, not a
+# drift". A convention that inverted that reading would be the wrong convention.
 #
 # The direction of the change is conservative in every branch it reaches: it can add
 # a caveat (AGREES-WITH-BIAS), add a block (DISAGREES on bias past the reporting
@@ -3144,7 +3442,12 @@ SIGN_MAJORITY = 0.60
 
 
 def sign_majority(signs) -> bool:
-    """Do these signs agree, under the campaign's one majority rule?
+    """Do these signs agree, by SIGN_MAJORITY -- which is not --verdict-majority?
+
+    Takes no threshold argument, on purpose: a parameter here is a place for the CLI's
+    verdict majority to be threaded in, and the two answer different questions (see the
+    block above SIGN_MAJORITY). The constant is read from module scope so there is
+    exactly one way to change it, and changing the other one cannot reach this.
 
     `signs` is a sequence of -1/0/+1. Exact via majority_met(), for the same reason
     every other majority in this file is: a dataset sitting exactly on the threshold
@@ -3546,6 +3849,9 @@ def report_floor_overlap(ov, args, out):
     out("  MAJORITY, not unanimity: |sum of cell signs| / cells, so 60% is an 80/20 split")
     out("  of cells. Unanimity would be anti-monotone in the cell count — see")
     out("  SIGN_MAJORITY in decompose.py for the measurement that showed it failing.")
+    out("  It is a STATED CONVENTION, not derived from this data and not the same knob as")
+    out("  --verdict-majority: the pairs are correlated within a cell, so the effective N")
+    out("  is not the pair count and no clean test on it exists. Read it as a policy.")
     # Replication, and what it does and does not settle. Printed whether or not
     # anything is out of band, because "4 reps and nothing out of band" is a
     # materially stronger statement than "1 rep and nothing out of band" and the
@@ -4420,8 +4726,9 @@ def main(argv=None):
     lda = report_lda_penalty(cells, hosts, args, out)
     regimes = report_regime_profile(deficits, cross, args, out)
     scaling = compute_scaling(cells, inp.roof)
+    bimodal = bimodal_populations(cells)
     anomalies, coverage_table, unver_cells = report_anomalies(
-        inp, cells, hosts, exc, scaling, overlap, args, out
+        inp, cells, hosts, exc, scaling, overlap, bimodal, args, out
     )
     report_scaling(scaling, out)
     coverage = report_coverage(cells, inp, explain, hosts, exc, args, out)
@@ -4529,6 +4836,12 @@ def main(argv=None):
             "lda_penalty": lda,
             "regime_profile": regimes,
             "scaling": scaling,
+            # Both classes under `populations`, with `size_ordered` telling them apart:
+            # a consumer that wants only the flagged ones filters. `examined` and
+            # `too_small` are the detector's coverage, and they are in the payload for
+            # the same reason they are in section 5 -- an empty `populations` list means
+            # nothing without them.
+            "bimodal": bimodal,
             "anomalies": {
                 "count": len(anomalies),
                 "hard": sum(1 for a in anomalies if a["severity"] == "!!"),

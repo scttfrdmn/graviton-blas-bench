@@ -655,21 +655,42 @@ showed is **not** the interleave policy: the alternative is far worse.
 unbound OpenMP placement — and it is **provenance only**, with standing order 1
 forbidding a threshold on it, so no analysis moves. It must still be said out loud,
 because a reader who sees section 6's `peak_fma` fall from t=96 to t=128 will reach for
-a hardware explanation and there isn't one. OpenBLAS is pthread, so `OMP_PROC_BIND`
-never reached the arms; the GEMM headline is untouched.
+a hardware explanation and there isn't one — and **it now is said out loud, in section 6
+itself** rather than only here (Scott, 2026-08-20). OpenBLAS is pthread, so
+`OMP_PROC_BIND` never reached the arms; the GEMM headline is untouched.
 
 **One qualification to carry forward: "large GEMM is immune at t≥128" is true of the
 median and false per case.** At t=128, 6–8 of 35 large gemm-family cases land at
 **half** rate (~1030 against ~2030 GFLOP/s) under *both* memory policies — the same
 placement mechanism, now visible in campaign numbers rather than only in the
 instrument. The arm medians still scale 1.30–1.32× across the rung; the dispersion is
-what is new.
+what is new. **State that claim as median-only wherever it appears** — the denominator
+survives it (standing order 1 takes a `max` over large DGEMM, and a max is robust to
+cells running slow) but a per-cell efficiency figure landing on one of those cases is
+wrong by 2×, and the median is what hides it. Scott raised this above the pinning
+decision it came out of, 2026-08-20, and it is now **detected rather than averaged**:
+`bimodal_populations()` groups per `(instance, threads, routine, regime, arm)`, classifies
+a low mode against a symmetric size-ordering test so a ramp is not called placement, and
+raises `placement_bimodal` in section 5. It publishes its own `examined`/`too_small`
+coverage, because `BIMODAL_MIN_CASES = 5` examines a 5-rung large population and skips
+the same routine at t=1 where the large cap truncates the ladder to 3. It sets **no exit
+bit**, deliberately — a bit on a known and explained hardware property is a bit whose
+threshold gets raised. Do not add one without asking, and do not pool routines into the
+grouping key: sgemm is ~2× dgemm in GFLOP/s, so a pooled population is bimodal by
+construction.
 
-**Two decisions are open and both are Scott's**, because both change a measured
-number: whether the roofline probe should be bound (it would raise `peak_fma_allcore`
-at t≥128 by ~1.8× and make the column mean what it says, at the cost of measuring the
-instrument under a threading environment the arms never see), and whether section 6
-should print the caveat rather than leaving it here. Do not do either without asking.
+**Both decisions that were open here are now taken (Scott, 2026-08-20), and neither is
+reopened without asking.** The roofline probe runs **both ways** — `run-matrix.sh` calls
+`roofline_once` twice at every thread count above one, unbound (the environment the arms
+actually run in) and bound (`OMP_PROC_BIND=close OMP_PLACES=cores`, where
+`peak_fma_allcore` means what its name says), distinguished by `omp_proc_bind` read from
+`omp_get_proc_bind()` and not from the environment. **Neither record is discarded**: the
+ratio between them is the measurement of how much of the cliff is placement, and it costs
+seconds. And **section 6 prints the caveat**, plus the bound/unbound ratio per rung where
+both invocations ran. Printing it is safe *because* the headroom cross-check is retired —
+with no threshold on that column the note cannot be read as a verdict — and it is
+necessary for the same reason the retirement was: a figure 1.8× under the silicon with
+nothing beside it saying why reads like protection and provides none.
 
 ## Ask before
 

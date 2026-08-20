@@ -323,6 +323,14 @@ class Arm:
     gain: dict = field(default_factory=dict)
     gain_routines: tuple | None = None
     gain_sizes: dict = field(default_factory=dict)  # size -> multiplier, overrides gain
+    # {routine: {size: multiplier}} -- gain_sizes for ONE routine, checked first.
+    # gain_sizes deliberately ignores gain_routines, so it cannot express "these
+    # sizes, on this routine only", and that is the shape the bimodality detector
+    # needs: it groups per (instance, threads, routine, regime, arm), so a
+    # gain_sizes plant fires in every routine at once and a fixture asserting "the
+    # detector found the population I planted" could not tell that from a detector
+    # that fires on everything.
+    gain_routine_sizes: dict = field(default_factory=dict)
     gain_incx: dict = field(default_factory=dict)  # incx -> multiplier, multiplies gain
     gain_pad: dict = field(default_factory=dict)  # lda_pad -> multiplier, multiplies gain
     # "NN"/"TN"/"NT"/"TT" -> multiplier, multiplies gain. NN and TN route A through
@@ -412,6 +420,9 @@ class Arm:
         g = self.gain_incx.get(incx, 1.0) * self.gain_pad.get(pad, 1.0)
         if trans:
             g *= self.gain_trans.get(trans, 1.0)
+        per_routine = self.gain_routine_sizes.get(routine)
+        if per_routine and m in per_routine:
+            return g * per_routine[m]
         if self.gain_sizes and m in self.gain_sizes:
             return g * self.gain_sizes[m]
         if self.gain_routines is not None and routine not in self.gain_routines:
@@ -459,6 +470,14 @@ class HostSpec:
     # would keep suggesting the check could fire. Only `peak-fma-retired` raises it
     # above 1, and that scenario exists to assert nothing happens when it does.
     peak_factor: float = 0.23
+    # bound peak_fma_allcore / unbound. run-matrix.sh runs roofline twice above t=1 --
+    # unbound (the arms' environment) and bound (OMP_PROC_BIND=close) -- so the fixture
+    # emits two records too, told apart by `omp_proc_bind` exactly as the producer
+    # tells them apart. 1.0 by default, which is a real measurement and not a
+    # placeholder: within one socket binding changes nothing, and it keeps section 6's
+    # peak_fma unmoved for every scenario that predates the split. `placement-cliff`
+    # raises it.
+    placement_factor: float = 1.0
     host_scale: float = 1.0  # multiplies every arm on this host
     warnings: tuple = ()
     # Three per-host knobs that would otherwise need editing the files back after
@@ -1181,6 +1200,14 @@ def roofline_records(host: HostSpec, bench):
             # launched to chase that cliff -- a place count below the thread count
             # explains a pure-compute efficiency drop with no reference to NUMA.
             "pin_policy": pin_policy_for(threads),
+            # The binding ACTUALLY in force, which roofline.c reads from
+            # omp_get_proc_bind() and not from the environment. It is the field that
+            # separates the two invocations run-matrix.sh now makes at every thread
+            # count above one, so the fixture must carry it or decompose.py's
+            # bound/unbound split has nothing to split on -- and would then quietly
+            # report every dataset as unbound-only, which is a passing report about an
+            # untested code path.
+            "omp_proc_bind": "false",
             "omp_places": threads,
             "omp_place_procs": 1,
             "omp_place_procs_total": threads,
@@ -1205,6 +1232,21 @@ def roofline_records(host: HostSpec, bench):
                     "accumulators": 12,
                     "gflops_f64": round(pk, 4),
                     "scaling_efficiency": 0.94,
+                }
+            )
+            # The bound invocation. Only above t=1, because the producer skips it
+            # there: peak_fma_allcore is not emitted below two threads and there is
+            # nothing to place on one core.
+            recs.append(
+                {
+                    **common,
+                    "pin_policy": pin_policy_for(threads) + ";omp_bind=close omp_places=cores",
+                    "omp_proc_bind": "close",
+                    "threads": threads,
+                    "metric": "peak_fma_allcore",
+                    "accumulators": 12,
+                    "gflops_f64": round(pk * host.placement_factor, 4),
+                    "scaling_efficiency": round(0.94 * host.placement_factor, 4),
                 }
             )
         recs.append(
@@ -2283,6 +2325,260 @@ def sc_peak_absent():
             {"kind": "anomaly_kind_absent", "kind_name": "peak_fma_absent"},
             {"kind": "stdout_absent", "text": "cross-check was NOT performed"},
             {"kind": "stdout_contains", "text": "peak_fma=absent"},
+        ],
+    )
+
+
+def _placement_host(**kw):
+    """A two-socket c8g.metal-48xl at t=1 and t=128 -- the rung where the cliff is.
+
+    128 is not a round number chosen for looks: it is the first rung whose cpuset
+    spans both sockets, and the fixed-t pinning diagnostic showed the variable is
+    socket span and not thread count (96 unbound threads placed across `0-47,96-143`
+    came in WORSE than 128 unbound threads on a contiguous cpuset). t=1 is in the
+    ladder because the large cap truncates it to three rungs there, which is what
+    makes the plant reach only the high rung."""
+    return _host(
+        instance_type="c8g.metal-48xl",
+        instance_id="i-0c8g000000000002",
+        run_id="synth-c8g-placement",
+        threads=(1, 128),
+        cores=192,
+        cpus_online=192,
+        cpus_affinity=192,
+        sockets=2,
+        numa_nodes=2,
+        has_sve2=True,
+        midr="0x413fd4f0",
+        midr_part="0xd4f",
+        core_name="NEOVERSEV2",
+        dynamic_selection="neoversev2",
+        sve_vl=16,
+        **kw,
+    )
+
+
+def sc_placement_cliff():
+    """The median's blind spot, planted: a cell population that its own median misrepresents.
+
+    Corrects a claim this campaign made and then measured its way out of. "Large GEMM
+    is immune to the t>=128 cliff" was read off the medians -- arm medians scaling
+    1.30-1.32x across the rung, a 0.995 median ratio between the two memory policies --
+    and it is true OF THE MEDIAN and false per case: 6-8 of 35 large gemm-family cases
+    at t=128 ran at HALF rate under BOTH memory policies. Standing order 1's
+    denominator is a max over large DGEMM and a max is robust to some cells running
+    slow, so the denominator itself survives; what does not survive is any per-cell
+    efficiency figure that lands in the low mode, which is out by 2x with every summary
+    statistic around it looking fine.
+
+    So the fixture plants exactly that shape and asserts the detector separates it from
+    a size effect. Two things are load-bearing about HOW it is planted:
+
+      - On every arm, not one. Placement is a property of the host and the thread
+        count, so an arm-localised plant would be a different phenomenon -- and it
+        would also move the cross, which must stay at parity here: this scenario is
+        about section 5, and a fixture that planted a headline as a side effect would
+        make the two indistinguishable.
+      - At n=6144 only, which the large cap keeps out of the t=1 stream. So the
+        population is bimodal at t=128 and clean at t=1 on one host, which is the
+        measured shape and also the sharper test: a detector keyed on the wrong
+        grouping would report both rungs or neither.
+
+    `placement_factor=1.8` is the other half, and it is the diagnostic's own number:
+    binding took peak_fma_allcore from 273 to 501 GFLOP/s at fixed thread count. It
+    exercises the bound/unbound split in section 6 -- which exists because
+    run-matrix.sh now runs the roofline binary twice per rung -- and asserts the caveat
+    prints. The two halves are in one scenario deliberately: they are one mechanism
+    seen by two instruments, and a reader of section 5 needs section 6 to name the
+    cause."""
+    return Scenario(
+        name="placement-cliff",
+        description=(
+            "A two-socket host at t=128 where 2 of 10 large dgemm cases run at half rate on "
+            "every arm, with the split NOT ordered by size, and where binding the roofline "
+            "probe is worth 1.8x. The per-case half of the t>=128 cliff, which every median "
+            "in the report hides."
+        ),
+        hosts=[_placement_host(placement_factor=1.8)],
+        # gain_routine_sizes rather than gain_sizes: the detector groups per routine, so
+        # a plant that hit dtrsm and dgemv as well could not distinguish a detector that
+        # found the planted population from one that fires on everything.
+        arms=_arms(gain_routine_sizes={"dgemm": {6144: 0.5}}),
+        expect=[
+            # The population, and its CLASSIFICATION. Presence alone would pass against a
+            # detector that called this a size ramp, which is the whole failure mode:
+            # n=6144 slow with n=8192 fast is not a routine climbing to an asymptote.
+            {
+                "kind": "bimodal_where",
+                "instance": "c8g.metal-48xl",
+                "threads": 128,
+                "routine": "dgemm",
+                "regime": "large",
+                "size_ordered": False,
+                "min_gap": 1.6,
+                "n_low": 2,
+                "min_count": 6,
+            },
+            # And nowhere else SCATTERED. The plant is confined to dgemm/large at t=128,
+            # so a scattered population anywhere else is the detector over-firing -- not
+            # harmless, because it buries the planted one in noise the reader cannot sort.
+            # These two groups do carry ordered populations (the synthetic surface ramps
+            # with size like the real one), which is why the filter names size_ordered
+            # rather than asserting emptiness outright.
+            {
+                "kind": "bimodal_where",
+                "threads": 128,
+                "routine": "dtrsm",
+                "size_ordered": False,
+                "min_count": 0,
+                "max_count": 0,
+            },
+            # t=1 is clean because the large cap truncates the ladder to n<=4096 and the
+            # plant sits at 6144. The same host, the same arms, one rung down.
+            {
+                "kind": "bimodal_where",
+                "threads": 1,
+                "routine": "dgemm",
+                "regime": "large",
+                "size_ordered": False,
+                "min_count": 0,
+                "max_count": 0,
+            },
+            {"kind": "anomaly_kind_present", "kind_name": "placement_bimodal"},
+            {"kind": "stdout_contains", "text": "sit in a separate low mode"},
+            {"kind": "stdout_contains", "text": "not a ramp"},
+            # The detector's own reach, so this scenario cannot pass by examining one
+            # population and getting lucky. Both halves: `examined` alone would pass on a
+            # detector that silently dropped the small populations without counting them,
+            # and the count is the only thing that tells a reader "no flag here" from
+            # "not looked at". The level-1 ladder guarantees plenty of the second kind --
+            # four lengths over three regimes is one or two per group.
+            {"kind": "bimodal_coverage", "op": ">=", "value": 20},
+            {"kind": "json_number", "path": "bimodal.too_small", "op": ">=", "value": 10},
+            # Section 6: the bound/unbound split and the caveat. The ratio is asserted as a
+            # number because "the line printed" would pass on a version that emitted the
+            # note with the two figures the wrong way round.
+            {"kind": "stdout_contains", "text": "PLACEMENT: peak_fma above is max()"},
+            {"kind": "stdout_contains", "text": "^ placement: all-core FMA is"},
+            {"kind": "stdout_contains", "text": "read the unbound figure as the instrument"},
+            {"kind": "placement_ratio", "threads": 128, "op": ">=", "value": 1.7},
+            {"kind": "placement_ratio", "threads": 128, "op": "<=", "value": 1.9},
+            # t=1 emits no peak_fma_allcore at all, so there is nothing to bind and the
+            # ratio must be absent rather than 1.0. Absent and "binding changed nothing"
+            # are different claims and only one of them is true at one thread.
+            {"kind": "placement_ratio", "threads": 1, "absent": True},
+            # It must not become a verdict. Every bit stays clear: the cells verify, the
+            # arms are all present, and the host is behaving as measured. A bit here would
+            # fail gate P2 on a known hardware property and the next person would raise
+            # the threshold to get it green.
+            {"kind": "exit_bits_clear", "bits": [2, 4, 8, 16, 32]},
+            {"kind": "verdict_code", "one_of": ["NULL"]},
+        ],
+    )
+
+
+def sc_placement_size_ramp():
+    """The negative control for `placement-cliff`, and the reason the gap test is not enough.
+
+    A monotone size ramp puts exactly one wide gap in a sorted value list, so a
+    detector that only measures the widest adjacent ratio reports a routine climbing to
+    its asymptote as a second mode. That is not a hypothetical shape in this campaign:
+    dsyrk gains 20.6% between n<=4096 and n>4096 at t=96 and dgemv spreads 14.0% at
+    t=8, both measured, and both are the size effect the large ladder exists to show.
+    Here the top two rungs are halved instead of one interior one -- so the split is
+    the same width as `placement-cliff`'s and ORDERED by size -- and the scenario
+    asserts it is classified, counted, and not flagged.
+
+    Counted matters as much as not-flagged. The detector reports the ordered class at
+    "." rather than dropping it, because a reader told only about the scattered ones
+    cannot tell whether the ordered ones were absent or unexamined, and this scenario
+    is where that distinction is defended: silently filtering would pass a
+    `placement_bimodal` absence check while quietly removing the detector's only
+    evidence that it looked."""
+    return Scenario(
+        name="placement-size-ramp",
+        description=(
+            "The same 2x split as `placement-cliff` but on the top two rungs, so it IS "
+            "ordered by size -- a routine falling off its asymptote. Must be classified as a "
+            "ramp and counted, never flagged as a second mode."
+        ),
+        hosts=[_placement_host()],
+        arms=_arms(gain_routine_sizes={"dgemm": {6144: 0.5, 8192: 0.5}}),
+        expect=[
+            {
+                "kind": "bimodal_where",
+                "threads": 128,
+                "routine": "dgemm",
+                "regime": "large",
+                "size_ordered": True,
+                "min_gap": 1.6,
+                "n_low": 4,
+                "min_count": 6,
+            },
+            # Nothing scattered anywhere on this host. This is the assertion the whole
+            # scenario exists for, and it is worth nothing without the coverage check
+            # underneath it -- a detector that examined no population would pass it.
+            {"kind": "anomaly_kind_absent", "kind_name": "placement_bimodal"},
+            {"kind": "stdout_absent", "text": "sit in a separate low mode"},
+            {"kind": "bimodal_coverage", "op": ">=", "value": 20},
+            # Classified and counted, not dropped.
+            {"kind": "anomaly_kind_present", "kind_name": "bimodal_size_ordered"},
+            {"kind": "stdout_contains", "text": "MONOTONICALLY in size"},
+            # placement_factor stays 1.0 here, so section 6 prints the caveat (it is
+            # unconditional) and NOT the per-row note (it is on the gap). Both are
+            # asserted: a version that printed the row note on every rung would train a
+            # reader to skip the one that matters.
+            {"kind": "stdout_contains", "text": "PLACEMENT: peak_fma above is max()"},
+            {"kind": "stdout_absent", "text": "^ placement: all-core FMA is"},
+            {"kind": "exit_bits_clear", "bits": [2, 4, 8, 16, 32]},
+        ],
+    )
+
+
+def sc_placement_fast_outlier():
+    """The same data described backwards: one FAST case is not "most cases are slow".
+
+    A wide gap in a sorted value list says nothing on its own about which side of it is
+    the anomaly. Here six of ten large dgemm cells are at half rate and four are not,
+    and the honest reading is that four cells are fast -- one lucky rung, a cache
+    coincidence, a size that happens to block well. Reporting it as "6 of 10 cases sit
+    in a separate low mode, any per-cell efficiency figure landing there is out by 2x"
+    would be exactly backwards, and it would put the report's most alarming sentence on
+    its least alarming shape.
+
+    The split is deliberately NOT ordered by size (2048/4096/6144 low, 3072/8192 high),
+    so the ordering test cannot catch this one and the minority rule is the only thing
+    standing between the fixture and a false alarm. That is the point: a control that
+    two independent guards both catch does not tell you which guard works."""
+    return Scenario(
+        name="placement-fast-outlier",
+        description=(
+            "Six of ten large dgemm cells at half rate with a scattered split -- a majority "
+            "low 'mode', which is four fast cells and not six slow ones. The detector must "
+            "report nothing rather than describe the population upside down."
+        ),
+        hosts=[_placement_host()],
+        arms=_arms(gain_routine_sizes={"dgemm": {2048: 0.5, 4096: 0.5, 6144: 0.5}}),
+        expect=[
+            # No population at all in this group, in either class. The minority rule drops
+            # it before classification, so asserting only `placement_bimodal` absent would
+            # pass on a version that recorded it as a ramp -- which would be a second wrong
+            # description of the same data.
+            {
+                "kind": "bimodal_where",
+                "threads": 128,
+                "routine": "dgemm",
+                "regime": "large",
+                "min_count": 0,
+                "max_count": 0,
+            },
+            {"kind": "anomaly_kind_absent", "kind_name": "placement_bimodal"},
+            {"kind": "stdout_absent", "text": "sit in a separate low mode"},
+            # The detector still ran. Without this the scenario passes on a detector that
+            # examines nothing, and its whole claim is about what a working detector
+            # declines to say.
+            {"kind": "bimodal_coverage", "op": ">=", "value": 20},
+            {"kind": "exit_bits_clear", "bits": [2, 8, 16, 32]},
         ],
     )
 
@@ -5111,6 +5407,9 @@ SCENARIOS = {
         sc_forcing_unavailable,
         sc_peak_fma_retired,
         sc_peak_absent,
+        sc_placement_cliff,
+        sc_placement_size_ramp,
+        sc_placement_fast_outlier,
         sc_replicate_reproduces,
         sc_replicate_diverges,
         sc_replicate_majority,
@@ -5863,6 +6162,97 @@ def check_one(exp, report, stdout, exit_code, root):
         got = sorted({r.get("incx") for r in cross_rows(report) if r.get("routine") == "daxpy"})
         want = sorted(exp["values"])
         return got == want, f"daxpy cross rows carry incx {got}, want {want}"
+
+    if kind == "bimodal_where":
+        # The bimodality detector, asserted on its CLASSIFICATION and not only on
+        # whether it fired. anomaly_kind_present would be satisfied by a detector that
+        # found the planted population and called a scattered split a size ramp, and
+        # that confusion is the whole content of the check.
+        #
+        # `size_ordered` is a FILTER and not a property assertion, which is what makes
+        # the two directions expressible with one kind. `size_ordered: false,
+        # min_count: 6` fails if the detector reclassified the plant as a ramp; the same
+        # filter with `max_count: 0` says "nothing scattered here", which is the
+        # assertion `placement-size-ramp` exists for and it has to be able to pass with
+        # ordered populations present in the same group.
+        pops = dig(report, "bimodal.populations") or []
+        f = {
+            k: v
+            for k, v in exp.items()
+            if k in ("instance", "threads", "routine", "regime", "arm", "size_ordered")
+        }
+        rows = [p for p in pops if all(p.get(k) == v for k, v in f.items())]
+        where = ", ".join(f"{k}={v}" for k, v in sorted(f.items())) or "any"
+        # `min_count` is here so a scenario that plants the split in one routine can say
+        # so. Without an upper bound the check also passes on a detector that fires
+        # everywhere, and that is not harmless: an over-firing detector buries the
+        # planted population in noise the reader has no way to sort.
+        lo = exp.get("min_count", 1)
+        hi = exp.get("max_count")
+        seen = (
+            f"detector reported {len(pops)} population(s) over "
+            f"{dig(report, 'bimodal.examined')} examined "
+            f"({dig(report, 'bimodal.too_small')} too small)"
+        )
+        if len(rows) < lo:
+            return False, f"{len(rows)} population(s) matching {where}, want >= {lo}; {seen}"
+        if hi is not None and len(rows) > hi:
+            return False, (
+                f"{len(rows)} population(s) matching {where}, want <= {hi}: "
+                + ", ".join(
+                    f"{p['routine']}/{p['regime']}/{p['arm']} gap={p['gap_ratio']:.2f}" for p in rows[:4]
+                )
+            )
+        if not rows:
+            return True, f"no population matching {where}, as required; {seen}"
+        bad = []
+        for p in rows:
+            if "min_gap" in exp and p["gap_ratio"] < exp["min_gap"]:
+                bad.append(f"{p['routine']}/{p['regime']}/{p['arm']} gap={p['gap_ratio']:.2f}")
+            if "n_low" in exp and p["n_low"] != exp["n_low"]:
+                bad.append(f"{p['routine']}/{p['regime']}/{p['arm']} n_low={p['n_low']}")
+        return not bad, (
+            f"{len(rows)} bimodal population(s) matching {where}, "
+            f"gaps {[round(p['gap_ratio'], 2) for p in rows[:4]]}, "
+            f"n_low {[p['n_low'] for p in rows[:4]]}"
+            + (f"; WRONG: {bad[:5]}" if bad else "")
+        )
+
+    if kind == "placement_ratio":
+        # section 6's bound/unbound all-core FMA ratio, at one rung. Reached through the
+        # scaling rows rather than by json_number path because the rows are a list and
+        # the thread point is what identifies one -- an index would move the moment a
+        # host's ladder changes.
+        rows = [r for r in (report.get("scaling") or []) if r.get("threads") == exp["threads"]]
+        if not rows:
+            return False, f"no scaling row at t={exp['threads']}"
+        got = [r.get("peak_fma_placement_ratio") for r in rows]
+        if exp.get("absent"):
+            return all(g is None for g in got), (
+                f"t={exp['threads']} placement ratio {got}, want absent — no bound "
+                f"invocation runs at this rung"
+            )
+        bad = [g for g in got if not isinstance(g, (int, float)) or isinstance(g, bool)]
+        if bad or not got:
+            return False, f"t={exp['threads']} placement ratio {got}, not a number"
+        return all(OPS[exp["op"]](g, exp["value"]) for g in got), (
+            f"t={exp['threads']} placement ratio {[round(g, 3) for g in got]} "
+            f"{exp['op']} {exp['value']}"
+        )
+
+    if kind == "bimodal_coverage":
+        # The detector's reach, asserted so a fixture cannot pass its absence checks by
+        # examining nothing. `placement-size-ramp` asserts no scattered population, and
+        # that assertion is worth nothing if every population fell under
+        # BIMODAL_MIN_CASES -- which is exactly what a large ladder truncated by the
+        # thread cap would do.
+        got = dig(report, "bimodal.examined")
+        if not isinstance(got, int) or isinstance(got, bool):
+            return False, f"bimodal.examined is {got!r}, not an integer"
+        return OPS[exp["op"]](got, exp["value"]), (
+            f"bimodal.examined={got} {exp['op']} {exp['value']} "
+            f"({dig(report, 'bimodal.too_small')} population(s) too small to examine)"
+        )
 
     return False, f"unknown expectation kind {kind!r} -- check() must implement every kind a scenario uses"
 

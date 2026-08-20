@@ -279,6 +279,63 @@ else
   bad "the timing-floor copy drifted — $floors"
 fi
 
+# The roofline record's SHAPE, against src/roofline.c. The ladders above are
+# bench.c's; roofline.c had no fidelity check at all, and it just grew the field the
+# whole bound/unbound split turns on. If synth.py stops emitting `omp_proc_bind`,
+# decompose.py's placement columns go quietly absent and every scenario still passes
+# -- a green gate over an untested code path, which is the same failure the
+# ladder checks exist to prevent one producer over. Asserted as a set in both
+# directions: a fixture emitting a field the producer does not is the other half of
+# the drift, and it is the half that invents a column for the analysis to read.
+if roof=$("$PY" - <<'EOF'
+import importlib.util, pathlib, re, sys
+
+src = pathlib.Path("src/roofline.c").read_text()
+from_c = set(re.findall(r'\\"([a-z_0-9]+)\\"\s*:', src))
+
+spec = importlib.util.spec_from_file_location("synth", pathlib.Path("tools/synth.py"))
+synth = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(synth)
+
+host = synth.HostSpec(
+    instance_type="c8g.metal-48xl", instance_id="i-0", run_id="synth-fidelity", threads=(1, 128)
+)
+recs = synth.roofline_records(host, [])
+from_py = {k for r in recs for k in r}
+
+bad = []
+if not from_c:
+    bad.append("no JSON keys matched in src/roofline.c")
+if from_c - from_py:
+    bad.append(f"roofline.c emits {sorted(from_c - from_py)}, synth.py does not")
+if from_py - from_c:
+    bad.append(f"synth.py emits {sorted(from_py - from_c)}, roofline.c does not")
+
+# The two invocations, which is a property of the RUNNER and of the fixture together.
+# run-matrix.sh calls the binary twice above t=1 and once at t=1, so the fixture must
+# carry both bind modes at t=128 and one at t=1 -- and the bound one must be the
+# all-core metric, because that is the only figure placement can move.
+allcore = [r for r in recs if r["metric"] == "peak_fma_allcore"]
+got128 = sorted(r["omp_proc_bind"] for r in allcore if r["threads"] == 128)
+if got128 != ["close", "false"]:
+    bad.append(f"t=128 all-core FMA carries omp_proc_bind {got128}, want ['close', 'false']")
+if any(r["threads"] == 1 for r in allcore):
+    bad.append("the fixture emits peak_fma_allcore at t=1, which roofline.c does not")
+# And the runner really does invoke it twice, so the fixture is not modelling a shape
+# the producer cannot make.
+runner = pathlib.Path("scripts/run-matrix.sh").read_text()
+if runner.count("roofline_once ") < 2:
+    bad.append("run-matrix.sh no longer invokes the roofline binary twice per thread count")
+
+print("; ".join(bad) if bad else f"{len(from_c)} fields match, t=128 all-core is {got128}")
+sys.exit(1 if bad else 0)
+EOF
+); then
+  ok "roofline fixture matches src/roofline.c: $roof"
+else
+  bad "the roofline record copy drifted — $roof"
+fi
+
 # The overlap band's numbers agreeing (ladder_check above) is not the same as the
 # band still DOING anything. Three ways it can be silently neutered, none of which
 # a value comparison catches:
@@ -879,7 +936,14 @@ fi
 # on it clears a float comparison by luck. 0.34 and 0.55 round just over and
 # would fail. The campaign's own --max-nodata-fraction is 0.34, so this is not a
 # hypothetical threshold.
-head_ "3. majority arithmetic is exact (no tolerance constant)"
+#
+# The second half of this section is the DECOUPLING of SIGN_MAJORITY from
+# --verdict-majority, which is unreachable from a fixture for a sharper reason: the
+# two hold the same value today, so no dataset can distinguish a decoupled
+# implementation from a coupled one. Scott's instruction (2026-08-20) was to split
+# them "even if you set both to 0.60 today, so a future edit to one can't move the
+# other", and the only thing that can hold that is a structural assertion here.
+head_ "3. majority arithmetic is exact, and SIGN_MAJORITY is decoupled"
 if exact=$("$PY" - <<'EOF'
 import importlib.util, pathlib, sys
 from fractions import Fraction
@@ -926,13 +990,87 @@ src = pathlib.Path("analysis/decompose.py").read_text()
 if "MAJORITY_EPS" in src:
     bad.append("MAJORITY_EPS is back in decompose.py")
 
-print("; ".join(bad) if bad else "exact on the boundary, order-independent, no epsilon")
+# ---- SIGN_MAJORITY is structurally decoupled from --verdict-majority --------
+# Four checks, and they are four because each closes a different route back to the
+# coupling Scott rejected. Both constants are 0.60 today, so none of this is
+# observable from a dataset: a fixture cannot tell a decoupled implementation from
+# one that reads the wrong constant, which is exactly why the assertion is here and
+# not in a scenario.
+import ast
+
+tree = ast.parse(src)
+assigns = {}
+for node in ast.walk(tree):
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+        assigns.setdefault(node.targets[0].id, []).append(node.value)
+
+# 5. Each is assigned its own numeric LITERAL. `SIGN_MAJORITY = DEFAULT_VERDICT_MAJORITY`
+#    is the tidy-up that reintroduces the coupling, and it would leave both call sites
+#    reading exactly as they do now.
+for name in ("SIGN_MAJORITY", "DEFAULT_VERDICT_MAJORITY"):
+    vals = assigns.get(name) or []
+    if len(vals) != 1:
+        bad.append(f"{name} assigned {len(vals)} times at module scope, want exactly 1")
+    elif not (isinstance(vals[0], ast.Constant) and isinstance(vals[0].value, float)):
+        bad.append(f"{name} is not assigned a float literal: {ast.dump(vals[0])[:80]}")
+
+# 6. sign_majority() takes no threshold. A parameter is a place for the CLI value to
+#    be threaded in later, and a default of SIGN_MAJORITY would make that invisible at
+#    every call site.
+fn = next(
+    (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "sign_majority"),
+    None,
+)
+if fn is None:
+    bad.append("sign_majority() is gone")
+else:
+    argnames = [a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs]
+    if argnames != ["signs"]:
+        bad.append(f"sign_majority{tuple(argnames)} takes more than the signs")
+    # 7. And its body reads SIGN_MAJORITY and nothing else that could carry the other
+    #    threshold. `args` reaching in here is the coupling arriving by the back door.
+    names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+    attrs = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+    if "SIGN_MAJORITY" not in names:
+        bad.append("sign_majority() does not read SIGN_MAJORITY")
+    for leak in ("DEFAULT_VERDICT_MAJORITY", "args"):
+        if leak in names:
+            bad.append(f"sign_majority() reads {leak}")
+    if "verdict_majority" in attrs:
+        bad.append("sign_majority() reads .verdict_majority")
+
+# 8. Behavioural, because 5-7 are all about the source text: moving the OTHER constant
+#    must not change this predicate's answer. Set at the boundary, where a coupled
+#    implementation would flip -- 3 of 5 signs is exactly 0.60, so a threshold of 0.61
+#    rejects it and one of 0.60 does not.
+if dc.SIGN_MAJORITY == 0.60 and not dc.sign_majority([1, 1, 1, 0, 0]):
+    bad.append("3 of 5 one-sided signs does not clear SIGN_MAJORITY=0.60")
+dc.DEFAULT_VERDICT_MAJORITY = 0.99
+if not dc.sign_majority([1, 1, 1, 0, 0]):
+    bad.append("moving DEFAULT_VERDICT_MAJORITY to 0.99 changed sign_majority()'s answer")
+dc.DEFAULT_VERDICT_MAJORITY = 0.60
+
+# 9. And the report says which it is. A decoupled pair that publishes one number under
+#    one name is decoupled in the code and coupled in the reader's head.
+if '"sign_majority": SIGN_MAJORITY' not in src:
+    bad.append("the JSON payload does not publish sign_majority from SIGN_MAJORITY")
+
+print(
+    "; ".join(bad)
+    if bad
+    else (
+        f"exact on the boundary, order-independent, no epsilon; "
+        f"SIGN_MAJORITY={dc.SIGN_MAJORITY:g} and DEFAULT_VERDICT_MAJORITY="
+        f"{dc.DEFAULT_VERDICT_MAJORITY:g} are separate literals, sign_majority(signs) "
+        f"reads neither the CLI value nor the other constant"
+    )
+)
 sys.exit(1 if bad else 0)
 EOF
 ); then
-  ok "majority comparisons are exact: $exact"
+  ok "majority comparisons are exact and the two thresholds are independent: $exact"
 else
-  bad "majority arithmetic is not exact — $exact"
+  bad "majority arithmetic or threshold independence — $exact"
 fi
 
 # ---- 4. every scenario ----------------------------------------------------

@@ -661,26 +661,100 @@ for CT in $CORETYPES; do
   VERIFIED_CORETYPES="$VERIFIED_CORETYPES $CT"
 done
 
-# ---- roofline, once per thread count --------------------------------------
-# Under the same external binding as the bench arms. Standing order 1 makes the
-# best observed GEMM the denominator and peak_fma the cross-check; if the two
-# were measured under different placement policies the cross-check would be
-# comparing different machines.
+# ---- roofline, twice per thread count above one ----------------------------
+# UNBOUND FIRST, and that one is the sweep's own environment: same external
+# binding as the bench arms, OMP_PROC_BIND=false exactly as PIN_DESC records. If
+# the instrument and the arms were measured under different placement policies,
+# the instrument would be describing a different machine from the one the arms
+# ran on.
+#
+# BOUND SECOND, and it is not redundant. peak_fma_allcore is registers-only, so no
+# memory policy can move it -- and it still fell from 94% to 53% per core between
+# t=96 and t=128. The fixed-t pinning diagnostic (2026-08-20) showed why: at fixed
+# thread count, binding takes it 273 -> 501 GFLOP/s while the memory policy moves
+# it 273 -> 260. The cliff in that column is thread PLACEMENT, and once the cpuset
+# spans both sockets an unbound OpenMP runtime stops placing threads on distinct
+# cores. So the unbound figure describes the instrument as the sweep ran it and the
+# bound figure describes the silicon; the campaign wants both, because the RATIO is
+# the measurement of how much of the cliff is placement. It costs seconds -- the
+# whole binary is a 128M-FMA chain plus five triad reps.
+#
+# Skipped at T=1, where there is nothing to place: peak_fma_allcore is not even
+# emitted below two threads, so the second invocation would re-measure the
+# single-core chain and the triad and call the duplicate provenance.
+#
+# The two are told apart by `omp_proc_bind`, which roofline.c reads from
+# omp_get_proc_bind() rather than from the environment -- the runtime's answer, not
+# the request. Binding cannot be applied from inside the process: OpenMP specifies
+# that a `proc_bind` clause is IGNORED when OMP_PROC_BIND is false, so a self-bound
+# region would silently do nothing under the sweep's own environment.
+#
+# GBB_PIN_POLICY is passed to BOTH, and until now it was passed to neither: 26317de
+# added the field to roofline.c's output and this loop never set it, so every
+# campaign roofline record carried roofline.c's `"none"` default while the bench
+# records beside it carried the real policy. Standing order 9 asks for the policy
+# per arm and the instrument is censused as an arm.
 : > "$ROOFOUT"
-for T in $THREADS; do
+
+# The policy string for a given rung and bind mode. PIN_DESC[T] already carries the
+# unbound one and is reused verbatim rather than rebuilt, so the two cannot drift;
+# the bound variant substitutes the one token that differs. When no external binding
+# was available at all PIN_DESC[T] is the bare word "none", and that stays readable.
+roof_policy() {   # $1 = thread count, $2 = bind mode
+  local desc="${PIN_DESC[$1]}"
+  if [ "$2" = "false" ]; then
+    printf '%s' "$desc"
+  else
+    printf '%s;omp_bind=%s omp_places=cores' "${desc%;omp_bind=false}" "$2"
+  fi
+}
+
+roofline_once() {   # $1 = thread count, $2 = OMP_PROC_BIND value
+  local T="$1" bind="$2"
+  local -a extra=()
+  # OMP_PLACES is meaningless with binding off, and an EMPTY OMP_PLACES is not the
+  # same as an absent one -- libgomp warns on it. So it is set only where it applies
+  # and otherwise not present at all, which is also what the sweep's arms see.
+  [ "$bind" = "false" ] || extra=(OMP_PLACES=cores)
   # shellcheck disable=SC2086
-  env GBB_THREADS="$T" OMP_NUM_THREADS="$T" OMP_PROC_BIND=false \
+  env GBB_THREADS="$T" OMP_NUM_THREADS="$T" \
+    OMP_PROC_BIND="$bind" ${extra[@]+"${extra[@]}"} \
+    GBB_PIN_POLICY="$(roof_policy "$T" "$bind")" \
     ${PIN_CMD[$T]} "$BIN/gbb-roofline" >> "$ROOFOUT" 2>>"$STDERRLOG"
+}
+
+for T in $THREADS; do
+  roofline_once "$T" false
   RC=$?
   if [ $RC -ne 0 ]; then
-    census roofline native "" "" "$T" runtime_failed "$RC" 0 "" "${PIN_DESC[$T]}" \
-      "gbb-roofline failed; the measured-peak cross-check is absent at this thread count"
-    die "roofline failed at threads=$T (exit $RC). Aborting: without peak_fma there is
-     no cross-check on the denominator, and standing order 1 depends on it."
+    census roofline native "" "" "$T" runtime_failed "$RC" 0 "" "$(roof_policy "$T" false)" \
+      "gbb-roofline failed unbound; the host's measured-peak provenance is absent at this thread count"
+    die "roofline failed at threads=$T (exit $RC). Aborting: peak_fma and the triad are
+     this host's instrument-side provenance, and standing order 5 does not admit a
+     number without it."
   fi
-  census roofline native "" "" "$T" measured 0 "$(wc -l < "$ROOFOUT")" "" "${PIN_DESC[$T]}" ""
+  census roofline native "" "" "$T" measured 0 "$(wc -l < "$ROOFOUT")" "" \
+    "$(roof_policy "$T" false)" ""
+
+  [ "$T" -gt 1 ] || continue
+  # A bound invocation that fails is a lost provenance column, not a lost sweep.
+  # The unbound run above already carries everything the analysis reads, so this one
+  # warns and records a reason rather than aborting: letting a placement-provenance
+  # extra kill a launched host would trade a hundred dollars of instance time for a
+  # column nothing in sections 1-4 or 7-9 depends on.
+  roofline_once "$T" close
+  RC=$?
+  if [ $RC -ne 0 ]; then
+    log "WARNING: bound roofline failed at threads=$T (exit $RC). The placement"
+    log "         provenance is absent at this rung; the unbound figures stand."
+    census roofline native "" "" "$T" runtime_failed "$RC" 0 "" "$(roof_policy "$T" close)" \
+      "bound roofline failed; peak_fma_allcore at this thread count is unbound-only, so the placement ratio cannot be computed here"
+  else
+    census roofline native "" "" "$T" measured 0 "$(wc -l < "$ROOFOUT")" "" \
+      "$(roof_policy "$T" close)" ""
+  fi
 done
-log "roofline written to $ROOFOUT"
+log "roofline written to $ROOFOUT (unbound + bound above t=1)"
 ship
 
 # ---- the arm list ---------------------------------------------------------

@@ -51,6 +51,33 @@
  *   The OPTIMIZER HAZARD block above is NOT retired with it. sanity_check()'s
  *   abort guards against the chain being folded away, which is a different
  *   question from whether the resulting number bounds anything, and it stays.
+ *
+ * PLACEMENT, AND WHY THIS BINARY IS RUN TWICE PER THREAD COUNT:
+ *   peak_fma_allcore is 32 accumulators per thread living in registers with no
+ *   streaming traffic, so it cannot be moved by a memory policy -- and it fell
+ *   from 94% to 53% per core between t=96 and t=128 anyway. The fixed-t pinning
+ *   diagnostic (2026-08-20, one c8g.metal-48xl, quarantined role=diagnostic)
+ *   settled it: the cause is thread PLACEMENT, not memory. Binding took the
+ *   figure from 273 to 501 GFLOP/s at fixed thread count -- eff 0.510 -> 0.937 --
+ *   while switching the memory policy moved it 273 -> 260, which is nothing. The
+ *   memory policy moves triad_gbs instead (164 -> 364), and binding does not
+ *   (164 -> 159). Two mechanisms, each blind to the other's variable.
+ *
+ *   So the runner invokes this binary TWICE at each thread count above one:
+ *   unbound, which is the environment the OpenBLAS arms actually run in, and
+ *   bound (OMP_PROC_BIND=close, OMP_PLACES=cores), where the number means what
+ *   its name says. Both are emitted, distinguished by `omp_proc_bind`, and
+ *   NEITHER is discarded -- the ratio between them is the measurement of how much
+ *   of the t>=128 cliff is placement, and it costs seconds. Binding cannot be
+ *   done from inside this process: OpenMP specifies that when OMP_PROC_BIND is
+ *   `false` the proc_bind clause is IGNORED, so a self-bound region would
+ *   silently do nothing under the sweep's own environment. It is applied from
+ *   outside, which is standing order 9's rule anyway.
+ *
+ *   This does not reach the arms and must not be read as if it did. OpenBLAS is
+ *   built USE_OPENMP=0 and is pthread, so OMP_PROC_BIND never touched a bench
+ *   record; the bound figure describes the silicon, the unbound one describes the
+ *   instrument as the sweep ran it.
  */
 
 #define _GNU_SOURCE
@@ -169,10 +196,35 @@ int main(void) {
        2026-08-20 these records did not: bench.c emitted `pin_policy` and roofline
        did not, so for the one instrument that showed the t>=128 efficiency cliff
        most starkly -- peak_fma_allcore fell from 94% to 53% per core between t=96
-       and t=128 -- the applied policy was not in the record. The runner sets the
-       same GBB_PIN_POLICY for both binaries; only the printf was missing. */
+       and t=128 -- the applied policy was not in the record. The printf landed in
+       26317de and the runner still did not set the variable, so campaign roofline
+       records carried this "none" default while the bench records beside them
+       carried the real policy; run-matrix.sh now passes it to both invocations. A
+       field with a plausible default is the harder half of a provenance gap: the
+       record parsed, validated, and said the wrong thing. */
     const char *pin_policy = env_or("GBB_PIN_POLICY","none");
     int threads = atoi(env_or("GBB_THREADS","1"));
+
+    /* The thread-binding policy ACTUALLY IN FORCE, from the runtime and not from
+     * the environment. Standing order 10's rule one instrument over: OMP_PROC_BIND
+     * is a request, omp_get_proc_bind() is the answer, and they differ -- a
+     * `proc_bind` clause overrides the variable, and a runtime that was built
+     * without affinity support reports `false` however the variable was set. This
+     * is the field that separates the two roofline invocations the runner now makes
+     * per thread count (unbound, matching the arms; bound, so peak_fma_allcore
+     * measures cores rather than placement), so reading it from getenv() would make
+     * the label a restatement of the intent that produced it. */
+#ifdef _OPENMP
+    const char *proc_bind;
+    switch (omp_get_proc_bind()) {
+        case omp_proc_bind_false:  proc_bind = "false";  break;
+        case omp_proc_bind_true:   proc_bind = "true";   break;
+        case omp_proc_bind_master: proc_bind = "master"; break;
+        case omp_proc_bind_close:  proc_bind = "close";  break;
+        case omp_proc_bind_spread: proc_bind = "spread"; break;
+        default:                   proc_bind = "unknown"; break;
+    }
+#endif
 
     /* Shared provenance, built once. It carries the OpenMP PLACE MAP, which is
      * here to eliminate a whole class of explanation for that cliff before an
@@ -200,14 +252,14 @@ int main(void) {
     for (int p = 0; p < nplaces; p++) ptotal += omp_get_place_num_procs(p);
     snprintf(prov, sizeof prov,
              "\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\",\"build\":\"%s\","
-             "\"role\":\"%s\",\"pin_policy\":\"%s\","
+             "\"role\":\"%s\",\"pin_policy\":\"%s\",\"omp_proc_bind\":\"%s\","
              "\"omp_places\":%d,\"omp_place_procs\":%d,\"omp_place_procs_total\":%d",
-             run_id, host, instance, build, role, pin_policy,
+             run_id, host, instance, build, role, pin_policy, proc_bind,
              nplaces, p0procs, ptotal);
 #else
     snprintf(prov, sizeof prov,
              "\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\",\"build\":\"%s\","
-             "\"role\":\"%s\",\"pin_policy\":\"%s\","
+             "\"role\":\"%s\",\"pin_policy\":\"%s\",\"omp_proc_bind\":null,"
              "\"omp_places\":null,\"omp_place_procs\":null,"
              "\"omp_place_procs_total\":null",
              run_id, host, instance, build, role, pin_policy);

@@ -441,10 +441,21 @@ support opposite conclusions.
   unanimous, and a fixture set that only plants unanimity cannot tell "detects a
   consistent bias" from "detects exact agreement". Two things follow. Route every
   signs-agree test through one majority rule — `sign_majority()` at
-  `SIGN_MAJORITY = 0.60`, which on `|Σ sign| / N` means an 80/20 split of cells,
-  reusing the campaign's existing majority rather than inventing a threshold, and
-  reproducing the reading of the only real band data there is (56% floor against a
-  3% order control: not a bias, not a drift). And plant at least one fixture with a
+  `SIGN_MAJORITY = 0.60`, which on `|Σ sign| / N` means an 80/20 split of cells and
+  reproduces the reading of the only real band data there is (56% floor against a
+  3% order control: not a bias, not a drift). It is **its own constant, not
+  `--verdict-majority`'s default reused** — the first version reused it, which is this
+  same hazard class in its threshold form: two thresholds answering different questions
+  through one definition means a later edit to the verdict majority silently moves the
+  band test. The two hold the same value today, so no *dataset* can distinguish a
+  decoupled implementation from a coupled one, and `gates/p1.sh` therefore asserts the
+  split structurally — an `ast` pass for two separate literals and a `sign_majority(signs)`
+  that takes no threshold, plus a behavioural check that moving the other constant to 0.99
+  does not change its answer. 0.60 for the band test is a **stated convention and not a
+  derivation**: the band pairs are correlated within a cell, so the effective N is not the
+  pair count and the data cannot argue the number cleanly. A threshold that is admittedly
+  conventional is fine; one that looks derived and is not is the failure.
+  And plant at least one fixture with a
   **dissenting minority** at a realistic count — `floor-band-bias-dissent` is
   36/60, exactly on the threshold, so one more dissenting cell flips it and the
   restored `== 1.0` turns it green-as-AGREES. The sweep for other all-of-N
@@ -668,6 +679,57 @@ support opposite conclusions.
   there would emit a second record for the same condition in the same run, which
   min-within-run would then silently resolve — a duplicated case masquerading as a
   quietly different sample. `gates/p1.sh` checks both tables on both sides.
+- **One allocation-policy flag turns `dgemv` into a 230× catastrophe that reads as an
+  OpenBLAS deficit.** The fixed-t pinning diagnostic (one `c8g.metal-48xl`,
+  2026-08-20, `role=diagnostic`, not campaign data) varied the memory policy at fixed
+  thread count to settle whether `pin_for()` should keep `--interleave`. It did settle
+  it, and the more important result is the one it was not looking for: under
+  `--localalloc` at t=128, `dgemv` falls from **76.7 GFLOP/s to 0.33** from m=1280 up,
+  degrading monotonically to 0.328× at m=8192 — **and every result still verifies**.
+  That is not a tuning difference. It is every thread on both sockets hammering one
+  node's memory controller, and nothing in the record looks wrong: the numbers are
+  correct, reproducible, and would be published. Explicit policies (`interleave`,
+  `membind`) are immune to page migration; `localalloc` is the default policy and leaves
+  autonuma free to thrash pages between sockets. So the campaign's threading layer is
+  **one config flag away from producing a table that looks like a catastrophic OpenBLAS
+  deficit and is entirely an allocation policy** — and the flag in question is the one
+  you get by *not* setting a policy. Two things follow. `pin_for()` keeps deriving the
+  policy from the thread count and keeps `--interleave`, which is a null with teeth
+  rather than an absence of evidence: over all 544 cases at t=128 the median
+  `localalloc / interleave` ratio is 0.995, so the routines are indifferent and the
+  alternative is far worse. And the 128/96 `dgemv` drop the sweep itself showed is
+  therefore *not* the interleave policy — a reading anyone re-litigating this will
+  arrive at, which is why the measurement is written down here rather than left in a
+  commit message. Any future change to the pinning policy is a change to the
+  measurement, and this is the number it has to beat.
+- **A median can be clean while a third of the cells under it are wrong by 2×.**
+  Everything summary-level said t≥128 was fine — arm medians scaling 1.30–1.32× across
+  the rung, a 0.995 median policy ratio, the GEMM headline untouched — and underneath,
+  6–8 of 35 large gemm-family cases at t=128 ran at **half rate** (~1030 against ~2030
+  GFLOP/s) under *both* memory policies. Same placement mechanism as the roofline
+  cliff: once a cpuset spans two sockets, an unbound runtime stops placing threads on
+  distinct cores. Standing order 1's denominator is a `max` over large DGEMM and a max
+  is robust to cells running slow, so the denominator survives; **any per-cell
+  efficiency figure that lands on one of those cases does not.** So "large GEMM is
+  immune at t≥128" is stated as median-only everywhere it appears, and the per-case
+  effect is now *detected* rather than averaged: `bimodal_populations()` groups per
+  `(instance, threads, routine, regime, arm)` — the finest grouping with a population
+  in it, and not pooled across routines, since sgemm is ~2× dgemm in GFLOP/s and a
+  pooled population is bimodal by construction. Gaps are ratios rather than
+  differences, because GFLOP/s spans an order of magnitude across the routine set. The
+  hard part is not detection but *classification*: a low mode made of the largest sizes
+  is a size ramp (`dsyrk` climbs 20.6% between ≤4096 and >4096 at t=96), so the
+  ordering test is symmetric — monotone in either direction is a ramp, at the accepted
+  cost that a scattered split which happens to align with size order is called one.
+  Both classes reach the payload with `size_ordered` telling them apart, because a
+  detector that filtered would make "absent" indistinguishable from "unexamined". For
+  the same reason the detector publishes its own coverage: `BIMODAL_MIN_CASES = 5`
+  examines a 5-rung large population and skips the same routine at t=1, where the large
+  cap truncates the ladder to 3, so `examined` and `too_small` print beside the finding.
+  A detector that examined 40 populations and skipped 200 has told the reader much less
+  than "no bimodal populations" sounds like. It sets **no exit bit**, on purpose: a bit
+  on a known and explained hardware property is a bit whose threshold gets raised later,
+  which is the retuning failure two other hazards on this list already describe.
 - **The alarming dispatch outcome is narrower than the above.** Generic `ARMV8`
   selected on a host that *has* SVE would mean the SVE detection itself failed;
   `NO_SVE` set at build time would mean the SVE kernels were never compiled in.
