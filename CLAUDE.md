@@ -404,12 +404,18 @@ comparability.
   after install rather than guessed — the directory name carries the GCC version and
   is part of what `build-libs.sh` records. Verified end to end on aarch64 Linux
   2026-08-19, through `make armpl` and `ldd`.
-- **Pin `BLIS_REF` before P3.** In the P2 pass it was `master` and resolved to
-  `061c2ebef87eda9189e6cdf38af4ea3d4a8efe7b` with a recorded warning. A mutable ref
-  means two hosts, or two passes days apart, can build different trees — so the
-  cross-host reference comparison would be comparing two libraries and nothing in the
-  report would say so. Exactly the failure a mutable `OPENBLAS_REF` would be, one
-  library over, and the P3 gate's `blas_sha` check does not cover it.
+- **`BLIS_REF` is pinned — done 2026-08-20.** It was `master`, and a mutable ref means
+  two hosts, or two passes days apart, can build different trees, so the cross-host
+  reference comparison would be comparing two libraries and nothing in the report
+  would say so. Exactly the failure a mutable `OPENBLAS_REF` would be, one library
+  over, and the P3 gate's `blas_sha` check is about OpenBLAS and does not cover it.
+  The pin is `061c2ebef87eda9189e6cdf38af4ea3d4a8efe7b`, **read off the running P2
+  host's manifest, not chosen** — that is what its `master` resolved to, so the pin
+  is a no-op against the P2 dataset by construction and P3 stays comparable to P2.
+  An explicit `BLIS_REF=master` still only warns: the reference arm is not the
+  subject, so an override is a recorded fact rather than a refusal. What is covered
+  after the fact is `blas_sha_conflict`, which keys on `(library, target)` and so
+  flags `blis/auto` carrying two SHAs without needing a new check.
 
 ## Ask before
 

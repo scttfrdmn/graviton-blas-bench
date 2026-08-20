@@ -15,6 +15,19 @@ change can be compared.
 
 ### Changed — affects how a number is produced
 
+- **`BLIS_REF` is pinned to a SHA instead of tracking `master`.**
+  `061c2ebef87eda9189e6cdf38af4ea3d4a8efe7b`, read off the first P2 host's manifest
+  rather than chosen — that is what its `master` resolved to, so the pin does not
+  move the P2 dataset and P3 stays comparable to it. `master` was defensible while
+  BLIS was "a reference arm, not the subject"; it stops being defensible at P3,
+  where five hosts are built on five days and three passes run days apart, so the
+  reference arm could differ between the passes whose agreement is the campaign's
+  strongest evidence. A BLIS-vs-OpenBLAS gap that moved between passes would be
+  indistinguishable from the effect the passes exist to test, and the p3 gate's
+  `blas_sha` check is about OpenBLAS. An explicit `BLIS_REF=master` still only
+  warns; `blas_sha_conflict` keys on `(library, target)`, so `blis/auto` carrying
+  two SHAs across hosts is already flagged after the fact.
+
 - **Warmup decays to zero at the expensive end, and the calibration call is reused
   as the first sample.** A large case cost seven calls — verify 1, warmup 2,
   calibration 1, samples 3 — and `ABS_MIN_SAMPLES = 3` rather than

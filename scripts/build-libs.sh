@@ -36,8 +36,23 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PREFIX="${GBB_PREFIX:-$HOME/graviton-blas-bench-libs}"
 SRCDIR="${GBB_SRC:-$HOME/graviton-blas-bench-src}"
 JOBS="${JOBS:-$(nproc)}"
-BLIS_REF="${BLIS_REF:-master}"
 MANIFEST="$PREFIX/build-manifest.ndjson"
+
+# BLIS is a reference arm, not the subject, so the default used to be `master` on
+# the reasoning that a moving reference arm is a recorded warning rather than a
+# hard error (see the BLIS section below, which keeps that distinction for an
+# explicit override). That reasoning does not survive P3: the five hosts are built
+# on five separate days and P3 runs three times days apart, so `master` means the
+# reference arm can differ between the passes whose agreement is the campaign's
+# strongest evidence -- and a BLIS-vs-OpenBLAS gap that moves between passes would
+# be indistinguishable from the effect the passes exist to test. The p3 gate's
+# blas_sha check is about OpenBLAS and does not cover this.
+#
+# Pinned to what the first P2 host actually resolved `master` to, read off its
+# manifest rather than chosen: flame/blis HEAD at 2026-08-20, committed
+# 2026-07-10. So this is a no-op against the P2 dataset by construction, and P3 is
+# comparable to P2 for the same reason.
+BLIS_REF="${BLIS_REF:-061c2ebef87eda9189e6cdf38af4ea3d4a8efe7b}"
 
 # The audited tree. KICKOFF.md's source audit -- the 5-vs-99 SVE kernel count,
 # KERNEL.NEOVERSEN2's missing includes, the dispatch fall-through -- was done
@@ -374,10 +389,13 @@ else
 fi
 
 # ---- BLIS -----------------------------------------------------------------
-# BLIS is a third-party reference arm, not the subject, so a mutable ref is a
-# recorded warning here rather than the hard error it is for OpenBLAS. The full
-# SHA is still captured, which lets decompose.py detect after the fact that two
-# hosts got different BLISes.
+# BLIS is a third-party reference arm, not the subject, so an *explicitly
+# overridden* mutable ref is a recorded warning here rather than the hard error it
+# is for OpenBLAS. The default is a SHA (see BLIS_REF above), so reaching this
+# warning takes a deliberate `BLIS_REF=master`. The full SHA is captured either
+# way, which lets decompose.py detect after the fact that two hosts got different
+# BLISes -- blas_sha_conflict already keys on (library, target), so blis/auto with
+# two SHAs is flagged without any new check.
 if [ ! -d "$SRCDIR/blis" ]; then
   log "cloning BLIS"
   git clone --quiet https://github.com/flame/blis.git "$SRCDIR/blis"
