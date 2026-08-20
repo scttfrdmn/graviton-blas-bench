@@ -202,6 +202,39 @@ change can be compared.
   re-derives them per host rather than scaling `c8g`'s. **No cost figure is added to
   `CLAUDE.md`**, per its own rule on the three struck figures; the method is written down,
   the numbers stay in #3.
+
+  With five more rungs measured the model resolves into **two terms, `flat + large(t)`,
+  and only the second needs measuring per host.** `flat` (small + medium + level-1) is
+  `MIN_SECONDS`-floored and measured flat: **1.35 → 1.23 min/stream from t=8 to t=96,
+  −9% across a 12× thread range**, of which medium is ~75%. `large` is
+  `ABS_MIN_SAMPLES`-bound: 5.20 → 1.04 over the same range. So `flat × (arms × rungs)` is
+  derivable for a host that has not been launched and only `large` has to be measured
+  there — with one check first, since `flat` is host-independent only where the floor
+  binds, and `c6g` is Graviton2. The cost table in `CLAUDE.md` now carries a **rungs**
+  column and an instruction to read it before the `large` column, because t=8 costing more
+  than t=1 (5.20 against 4.60) is **different work, not slower work** — the cap lifts at
+  t=8, so t=8 measures `n=6144` and `n=8192` and t=1 does not. Without that column the
+  inversion invites a threading explanation that does not exist.
+- **`LARGE_CAP_MIN_THREADS = 8` is validated by measurement and marked must-not-raise.**
+  Scott asked whether the "a 1-thread n=8192 DGEMM answers no hypothesis anyone will cite"
+  argument extends to 8 of 192 cores, which would cut a large fraction of P3. Checked
+  against the first P2 pass; the answer is no on all three grounds. (a) The premise holds
+  for GEMM and fails elsewhere: at t=8 `dgemm`/`sgemm`/`dsymm` are flat across
+  `n=2048…8192` to 0.4–0.7%, but `dsyrk` spreads 7.3% with `n=8192` the max, `dgemv`
+  14.0%, and the `>4096` lift grows monotonically with thread count for every non-GEMM
+  routine (`dsyrk` +4.2% at t=8 → **+20.6% at t=96**; `dtrsm` +1.2% → +11.0%) — so the
+  cells the cap would remove are where TRSM/TRMM/SYRK are still climbing, and
+  TRSM/TRMM/SYMM is the family the C11 false negative was confined to. (b) The saving is
+  ~$9 per host per pass against the existing t<8 cap's ~$34, because `n=6144`+`n=8192` at
+  one thread cost ~24 min/stream against a whole t=1 stream's 7.22. (c) t=1 is the only
+  rung where truncation is free and the data says so — worst t=1 spread is 3.2%
+  (`dgemv`). A routine-aware cap would recover ~71% of the saving without the data loss
+  (`gemm/symm` is 70% of the `>4096` cost at t=8) and is **explicitly not implemented**:
+  it moves `matrix_id`, so this pass would stop pooling with P3's, for ~$9 a host.
+  Also recorded: `decompose.py`'s own `denom_restriction_cost` for the intersection
+  denominator, which rises with thread count and stays about 1% (0.000% at t=1 to
+  **1.240% at t=96**, where the unrestricted max would be 1708.28 at `n=6144` against
+  1687.35 at `n=3072`). Read off the report, not computed by hand.
 - **Section 1's reference arm is chosen once per host, not per comparison group.**
   The last of the count-derived-selection defects and the worst of them: the group
   key carries the regime, so on a host with two reference candidates whose coverage

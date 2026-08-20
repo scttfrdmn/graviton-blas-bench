@@ -182,11 +182,43 @@ Measure it on the **slowest** arm of the first P2 iteration, not a representativ
 one — see §Wall-clock is anti-correlated with arm quality for why a representative
 arm extrapolates low.
 
-**And sum it per rung, never per stream.** A stream is not a unit of cost. Measured
-on the first P2 pass, one `openblas/DYNAMIC` stream costs **7.2 min at t=1, 6.6 at
-t=8, 4.1 at t=16** and falls further above that, because the small, medium and
-level-1 regimes are `MIN_SECONDS`-floored and therefore flat in thread count while
-the large regime is `ABS_MIN_SAMPLES = 3`-bound and scales with it. So
+**And sum it per rung, never per stream — but the per-rung costs are two terms, and
+only one of them needs measuring per host.** A stream is not a unit of cost. The cost
+model is `flat + large(t)`, and it is not an approximation of the measurements, it is
+what they decompose into. Per stream, on `c8g.metal-48xl`:
+
+| t | small | medium | level-1 | **flat** | large | rungs | stream |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.24 | 2.30 | 0.08 | 2.62 | 4.60 | 3 | **7.22** |
+| 8 | 0.25 | 1.02 | 0.08 | **1.35** | 5.20 | 5 | **6.55** |
+| 16 | 0.25 | 0.98 | 0.08 | 1.31 | 2.87 | 5 | 4.18 |
+| 32 | 0.25 | 0.96 | 0.08 | 1.29 | 1.72 | 5 | 3.00 |
+| 64 | 0.25 | 0.94 | 0.07 | 1.27 | 1.22 | 5 | 2.48 |
+| 96 | 0.25 | 0.91 | 0.07 | 1.23 | 1.04 | 5 | 2.27 |
+
+**Read the `rungs` column before reading the `large` column.** t=8 costs more in the
+large regime than t=1 (5.20 against 4.60) and that is **not a threading effect — it is
+different work.** `LARGE_CAP_MIN_THREADS = 8` lifts the truncation, so t=8 measures
+`n=6144` and `n=8192` and t=1 does not. Anyone who reads 5.20 against 4.60 without the
+rung count will reach for a threading explanation and find none. The rungs are part of
+the measurement; the two columns are not comparable without it.
+
+The **flat** term is `MIN_SECONDS`-floored, so it is flat in thread count by
+construction and measured so: **1.35 → 1.23 min/stream from t=8 to t=96, −9% across a
+12× thread range.** Medium is ~75% of it, not small. It is flat only from t=8 up — at
+t=1 medium has not yet flattened (2.30) and the flat term is double. So `flat × (arms ×
+rungs)` is derivable from first principles for a host that has not been launched, and
+only the **large** term, which is `ABS_MIN_SAMPLES = 3`-bound and scales with per-thread
+call time, has to be measured there. On the 5-rung hosts (`c6g`, `hpc7g`) that puts most
+of a pass's cost inside the derivable term. **One thing to check before relying on that
+on a slower host:** `flat` is host-independent only where the `MIN_SECONDS` floor
+actually binds, which is why it is flat above t=8 and not at t=1 — at t=1 the medium
+cases still exceed the floor on their own. `c6g` is Graviton2 and several times slower
+per core, so confirm medium is floored there before treating `flat` as derived rather
+than measured. Where the floor binds, the term is a property of `MIN_SECONDS` and the
+case count, not of the silicon.
+
+So
 `mean_stream_cost × stream_count` priced at the head of the thread ladder runs high —
 it did, by ~1.4–1.8× on the first P2 pass, whose pre-launch band priced all eight
 thread points at about the `t=8` cost and counted the roofline streams, which cost
@@ -475,6 +507,49 @@ are the fixtures, each mutation-validated — the second one because the obvious
 implementation (intersect over the host's thread points rather than over the thread
 points that *have* large dgemm) turns one dark rung into a host-wide loss of
 comparability.
+
+**`LARGE_CAP_MIN_THREADS = 8` is now validated by measurement, not by argument, and it
+must not be raised.** Asked by Scott 2026-08-20: if a 1-thread `n=8192` DGEMM answers no
+hypothesis anyone will cite, does the same argument apply at 8 of 192 cores, and would
+raising the threshold to 16 or 32 cut a large fraction of P3? Checked against the first
+P2 pass (`ARMV8` arm, spread across the large ladder at each thread point). The answer
+is **no, on all three of the grounds it could have been yes on:**
+
+- **The premise holds for GEMM and fails for everything else.** At t=8, `dgemm`/`sgemm`/
+  `dsymm` are flat across `n=2048…8192` to **0.4–0.7%** — those cells genuinely are
+  redundant, exactly as the question supposed. But `dsyrk` already spreads **7.3%** with
+  `n=8192` the maximum, `dtrsm` 2.4%, `dtrmm` 1.0%, and `dgemv` **14.0%**. Worse, the
+  `>4096`-versus-`≤4096` lift grows monotonically with thread count for every non-GEMM
+  routine — `dsyrk` +4.2% at t=8, +6.6% at t=32, **+20.6% at t=96**; `dtrsm` +1.2% →
+  +11.0% — so the rungs the cap would remove are where those routines are still climbing
+  to their asymptote. **That is the family the campaign's most likely finding lives in**:
+  the C11 false negative was an effect confined to TRSM/TRMM/SYMM, which is why item 1 of
+  the #2 expansion landed before anything else. Truncating them to save instance-hours
+  would be tuning the matrix until the effect is harder to see.
+- **The money is not there.** Raising the threshold to 32 saves **70.5 min per host per
+  pass, ~$9 on `c8g`** — against the existing t<8 cap, which saves **~4.5 h and ~$34**,
+  five times more. `n=6144` and `n=8192` at one thread cost ~24 min/stream against a
+  whole t=1 stream's 7.22, and that asymmetry is the entire reason the cap earns its
+  keep at t=1 and stops earning it immediately above.
+- **t=1 is the only rung where truncation is free, and the data says so.** At t=1 every
+  large routine is flat: worst spread 3.2% (`dgemv`), 1.5% (`dtrsm`), ≤0.5% for the rest.
+  At t=8 it already is not. The threshold sits exactly on the boundary.
+
+A **routine-aware** cap would recover most of the saving without the data loss —
+`gemm/symm` is **70% of the `>4096` cost at t=8** and is the provably flat part, so
+truncating only those routines below t=32 recovers ~71% of the blunt cap's saving and
+removes no cell that carries a trend. **Not implemented, and not to be implemented
+without asking**: it changes the routine/size design, so `matrix_id` moves and this
+pass's `7c371fee324b7304` stops pooling with P3's — a real cost for ~$9 a host.
+
+One observed consequence of the denominator policy, read off `decompose.py`'s own
+`denom_restriction_cost` on the partial pass rather than computed by hand: the
+intersection is `{2048, 3072, 4096}` (set by t=1), and what it costs **rises with thread
+count but stays about 1%** — 0.000% at t=1, 0.022% at t=8, 0.181% at t=16, 0.000% at
+t=32, 0.461% at t=64, **1.240% at t=96**, where the unrestricted max would have been
+1708.28 at `n=6144` against the restricted 1687.35 at `n=3072`. That is standing order 1
+paying a little headroom to keep two efficiency columns commensurable, which is what it
+was changed to do, and the price is now known rather than assumed.
 
 ### Reference arms are a P3 prerequisite, not a P3 discovery
 
