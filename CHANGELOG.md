@@ -13,6 +13,55 @@ change can be compared.
 
 ## [Unreleased]
 
+### Changed — the t≥128 cliff is measured, not argued; `pin_for()` stays as it is, and no measured number changes
+
+- **The fixed-t pinning diagnostic ran and answered its question with a null that has
+  teeth.** One on-demand `c8g.metal-48xl`, 17 minutes of instance time, **$2.17**
+  against a $3.50–4.10 estimate, self-terminated. 29 cells all rc=0, 1752 bench
+  measurements, zero verification failures, `matrix_id=7c371fee324b7304` — the P2 pass's
+  stamp. Quarantined by construction: `role=diagnostic`, its own run_id namespace, and
+  `gbb/diagnostics/` in S3. **Not campaign data.**
+
+- **The two roofline numbers that cliff at t=128 have different causes, and varying the
+  memory policy and the binding independently separated them completely.** Both reps of
+  every cell agree.
+
+  | varied at fixed t | `peak_fma_allcore` | `triad_gbs` |
+  |---|---|---|
+  | `--interleave=0,1` → `--localalloc` | 273 → 260 (no effect) | 164 → 364 (**2.2×**) |
+  | `OMP_PROC_BIND=false` → `close` | 273 → **501** (1.8×) | 164 → 159 (no effect) |
+
+  `triad_gbs` is the memory policy, proven by the control at a thread count that was
+  never in question: the same 96 CPUs on node 0, policy alone, **340.9 → 135.1 GB/s**.
+  `peak_fma_allcore` is thread placement, which it had to be — 32 doubles per thread in
+  registers, no traffic to place. **The cheapest hypothesis was refuted rather than
+  skipped**: `OMP_PLACES=cores` enumerates exactly 128/128, 192/192, 96/96 places, so it
+  is the absence of binding once the cpuset spans sockets, not a miscounted place map.
+  96 unbound threads spanning sockets come in *worse* than 128, so the variable is
+  socket span.
+
+- **`pin_for()` keeps `--interleave` and keeps deriving the policy from the thread
+  count.** Median `localalloc / interleave` over all 544 cases at t=128 is **0.995** —
+  the routines are indifferent — and `--localalloc` **destroys `dgemv`** from m=1280 up
+  (0.33 GFLOP/s against 76.7), monotone to 0.328× at m=8192, every result still
+  verifying. Explicit policies are immune to page migration; `localalloc` leaves autonuma
+  free to thrash. So the `dgemv` drop across the rung is not the policy: the alternative
+  is far worse. No code changed, which is the point of asking the question first.
+
+- **Two facts recorded for how the report is read, neither of which moves an analysis.**
+  `triad_gbs` is not consumed by `decompose.py`. Section 6's `peak_fma` is depressed
+  ~1.8× at t≥128 by unbound OpenMP placement, and is provenance only under standing
+  order 1 — stated because a reader seeing it fall from t=96 to t=128 will otherwise
+  reach for a hardware explanation. OpenBLAS is pthread, so `OMP_PROC_BIND` never
+  reached the arms and the GEMM headline is untouched. And **"large GEMM is immune at
+  t≥128" is true of the median and false per case**: 6–8 of 35 large gemm-family cases
+  at t=128 land at half rate under *both* policies, the same placement mechanism now
+  visible in campaign numbers.
+
+- **Two decisions left open for Scott**, both because they change a measured number:
+  whether to bind the roofline probe, and whether section 6 should print the caveat
+  rather than leaving it in `CLAUDE.md`.
+
 ### Fixed — section 9's floor-bias test could not fire on a real dataset; no measured number changes, three statuses become reachable
 
 - **`biased` and `order_explains` required UNANIMITY over cells, and "all N agree" is

@@ -601,6 +601,76 @@ was changed to do, and the price is now known rather than assumed.
   P2 dataset needs it to be read, and `GBB_BLIS=on` overrides with the override logged.
   Re-adding BLIS to P3 is a spend and framing decision: ask.
 
+### The t≥128 cliff is two mechanisms, and `pin_for()` stays as it is
+
+Measured 2026-08-20 by the fixed-t pinning diagnostic — one on-demand
+`c8g.metal-48xl`, 17 minutes, $2.17, run
+`diag-numa-20260820T215337Z-ip-172-31-32-214`, `role=diagnostic`, quarantined by
+construction and **not campaign data**. It varies the memory policy and the thread
+binding independently at fixed thread count, which the sweep cannot do because
+`pin_for()` derives the policy from the thread count. 29 cells, all rc=0, 1752 bench
+measurements, zero verification failures, `matrix_id=7c371fee324b7304` — the same
+stamp as the P2 pass.
+
+**The two roofline numbers that cliff at t=128 have different causes, and the 2×2
+separates them completely.** Both reps of every cell agree; these are medians of two.
+
+| varied | `peak_fma_allcore` | `triad_gbs` |
+|---|---|---|
+| memory policy: `--interleave=0,1` → `--localalloc` | 273 → 260 (**no effect**) | 164 → 364 (**2.2×**) |
+| binding: `OMP_PROC_BIND=false` → `close` | 273 → **501** (1.8×) | 164 → 159 (**no effect**) |
+
+- **`triad_gbs` is the memory policy, and the control proves it at a thread count that
+  was never in question**: the same 96 CPUs on node 0, changing only the policy, goes
+  **340.9 → 135.1 GB/s**. `--membind=1` (every page one hop) is 68.1, so cross-socket
+  on this box is **5× local**, not 2×, and interleave lands where a half-and-half blend
+  of those two predicts. `--localalloc` at t=192 reads **482.6 GB/s**, the highest
+  bandwidth in the dataset — higher than t=96 local.
+- **`peak_fma_allcore` is thread placement**, which it had to be: 32 doubles per thread
+  in registers with no streaming traffic to place. Binding takes t=128 from eff 0.510 to
+  **0.937** and t=192 from 0.547 to **0.926**, while the single-node control moves only
+  0.947 → 0.953. The unbound cells are also *dispersed* (0.327–0.610 across reps) and
+  the bound ones are tight, which is the top-rung dispersion signature.
+- **The cheapest hypothesis is refuted, and it was refuted rather than skipped.**
+  `OMP_PLACES=cores` does **not** under-enumerate: the bound cells report exactly
+  128/128, 192/192 and 96/96 places. The mechanism is the *absence* of binding once the
+  cpuset spans both sockets, not a miscounted place map. `t96-split-interleave` — 96
+  unbound threads on `0-47,96-143` — comes in at eff 0.404, **worse than 128 unbound
+  threads**, so the variable is socket span and not thread count.
+
+**`pin_for()` keeps deriving the policy from the thread count, and keeps
+`--interleave`.** That is the diagnostic's answer to the question it was launched for,
+and it is a null with teeth rather than an absence of evidence: over all 544 cases at
+t=128 the median `localalloc / interleave` ratio is **0.995**, so the routines are
+indifferent to the policy — and `--localalloc` **destroys `dgemv`** from m=1280 up,
+0.33 GFLOP/s against interleave's 76.7, degrading monotonically to 0.328× at m=8192,
+with every result still verifying. Explicit policies (`interleave`, `membind`) are
+immune to page migration; `localalloc` is the default policy and leaves autonuma free
+to thrash pages between sockets under 128 threads. So the 128/96 `dgemv` drop the sweep
+showed is **not** the interleave policy: the alternative is far worse.
+
+**What this changes about reading the report, and it is nothing about the headline.**
+`triad_gbs` is not consumed by `decompose.py` at all. `peak_fma` in section 6 is
+`max()` over `peak_fma` and `peak_fma_allcore`, so at t≥128 it is depressed ~1.8× by
+unbound OpenMP placement — and it is **provenance only**, with standing order 1
+forbidding a threshold on it, so no analysis moves. It must still be said out loud,
+because a reader who sees section 6's `peak_fma` fall from t=96 to t=128 will reach for
+a hardware explanation and there isn't one. OpenBLAS is pthread, so `OMP_PROC_BIND`
+never reached the arms; the GEMM headline is untouched.
+
+**One qualification to carry forward: "large GEMM is immune at t≥128" is true of the
+median and false per case.** At t=128, 6–8 of 35 large gemm-family cases land at
+**half** rate (~1030 against ~2030 GFLOP/s) under *both* memory policies — the same
+placement mechanism, now visible in campaign numbers rather than only in the
+instrument. The arm medians still scale 1.30–1.32× across the rung; the dispersion is
+what is new.
+
+**Two decisions are open and both are Scott's**, because both change a measured
+number: whether the roofline probe should be bound (it would raise `peak_fma_allcore`
+at t≥128 by ~1.8× and make the column mean what it says, at the cost of measuring the
+instrument under a threading environment the arms never see), and whether section 6
+should print the caveat rather than leaving it here. Do not do either without asking.
+
 ## Ask before
 
 - Launching **any** EC2 instance.
