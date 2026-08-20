@@ -3113,6 +3113,49 @@ def _sign(x):
     return (x > 0) - (x < 0)
 
 
+# AGREEMENT IS A MAJORITY, NEVER UNANIMITY. Three tests in the band analysis ask
+# "do these signs agree" -- the floor sign test, the order control, and per-cell
+# persistence -- and all three were written as all-of-N. That is the density-coupling
+# defect class one shape over: **a predicate whose meaning depends on a count another
+# change is free to move.** `all N agree` is anti-monotone in N, so every axis the
+# campaign adds makes a real, consistent effect *harder* to declare, silently, and in
+# the direction of finding nothing. Measured on this file: a planted 2% bias over 240
+# replicated pairs at 92.5% consistency reported as scattered. Reducing pairs to cells
+# fixed the unit and left the predicate, which is worse than it looks -- a real host
+# has 390 cells (5 band sizes x arms x thread points), so unanimity over cells is
+# unreachable on any real dataset and AGREES-WITH-BIAS, the bias-past-band DISAGREES
+# branch and ORDER-CONFOUNDED were fixture-only statuses: they passed at 5-60
+# low-noise synthetic cells and could not fire on the instrument they exist to check.
+#
+# 0.60 is the campaign's existing majority, reused rather than invented -- it is
+# `--verdict-majority`'s default and section 8's rule. On this statistic it means an
+# **80/20 split of cells**, because consistency is |Σ sign| / N: 0.8 - 0.2 = 0.6. That
+# is a strong lean, not a bare majority, which is what a sign test should require.
+# It also reproduces Scott's own reading of the only real band data there is: the
+# first P2 pass came in at 56% floor consistency against a 3% order control, which
+# clears neither threshold, and the right call on it was "not a bias, not a drift".
+#
+# The direction of the change is conservative in every branch it reaches: it can add
+# a caveat (AGREES-WITH-BIAS), add a block (DISAGREES on bias past the reporting
+# floor), or name a cause more precisely (ORDER-CONFOUNDED, which blocks either way).
+# It cannot turn a block into a pass. `MIN_FOR_SIGN` still guards the small-N end,
+# where a majority is not evidence of anything.
+SIGN_MAJORITY = 0.60
+
+
+def sign_majority(signs) -> bool:
+    """Do these signs agree, under the campaign's one majority rule?
+
+    `signs` is a sequence of -1/0/+1. Exact via majority_met(), for the same reason
+    every other majority in this file is: a dataset sitting exactly on the threshold
+    must clear it, and float division puts that outcome at the mercy of which decimal
+    the constant was written as. Empty is never a majority.
+    """
+    return bool(signs) and majority_met(
+        Fraction(abs(sum(signs))), Fraction(len(signs)), SIGN_MAJORITY
+    )
+
+
 def compute_floor_overlap(probe_cells, args):
     """Does the same case measured at both MIN_SECONDS floors give the same answer?
 
@@ -3254,8 +3297,12 @@ def compute_floor_overlap(probe_cells, args):
             continue
         # Majority of the cell's reps out of band AND agreeing in sign. Sign
         # agreement matters: two out-of-band pairs pointing opposite ways are
-        # dispersion, not a floor that reads one way.
-        same_sign = len({_sign(p["delta"]) for p in out}) == 1
+        # dispersion, not a floor that reads one way. Through sign_majority() rather
+        # than all-of-N for the reason given there -- OVERLAP_REPS is exactly the kind
+        # of count a later change moves, and at the reps this cell actually has the
+        # majority rule *is* unanimity (3 of 3 and 4 of 4 both need every sign), so
+        # this is a no-op today and stops being one only if the rep count grows.
+        same_sign = sign_majority([_sign(p["delta"]) for p in out])
         rec = {
             "cell": cell_key,
             "out_of": (len(out), len(ps)),
@@ -3306,11 +3353,18 @@ def compute_floor_overlap(probe_cells, args):
     # keeps meaning what it meant when it was argued for, on replicated and
     # pre-replication datasets alike.
     MIN_FOR_SIGN = 5
-    biased = len(signs) >= MIN_FOR_SIGN and floor_consistency == 1.0
+    biased = len(signs) >= MIN_FOR_SIGN and sign_majority(signs)
+    # The order control must clear the majority AND the floor must fail it. That is
+    # stricter than the `order_consistency > floor_consistency` it replaces, and it is
+    # what the status claims in words: the differences follow measurement order and
+    # they do NOT follow the floor. It also keeps ORDER-CONFOUNDED and `biased`
+    # mutually exclusive by construction rather than by the accident of two
+    # unanimities being incompatible, so the status chain cannot reach a state where
+    # both are true and precedence alone decides which cause the reader is sent after.
     order_explains = (
         len(order_signs) >= MIN_FOR_SIGN
-        and order_consistency == 1.0
-        and order_consistency > floor_consistency
+        and sign_majority(order_signs)
+        and not sign_majority(signs)
     )
 
     if not pairs:
@@ -3338,9 +3392,10 @@ def compute_floor_overlap(probe_cells, args):
     elif order_explains and not persistent:
         status = "ORDER-CONFOUNDED"
         why = (
-            f"all {len(order_signs)} cell differences follow measurement order and only "
-            f"{100 * floor_consistency:.0f}% follow the floor, so the probe measured drift "
-            f"rather than the floor and cannot settle the n=256 ambiguity"
+            f"{100 * order_consistency:.0f}% of {len(order_signs)} cell differences follow "
+            f"measurement order and only {100 * floor_consistency:.0f}% follow the floor "
+            f"(threshold {100 * SIGN_MAJORITY:.0f}%), so the probe measured drift rather "
+            f"than the floor and cannot settle the n=256 ambiguity"
         )
         if outside:
             why += (
@@ -3370,7 +3425,8 @@ def compute_floor_overlap(probe_cells, args):
     elif biased and abs(median_bias) > args.min_effect:
         status = "DISAGREES"
         why = (
-            f"every pair is inside its own band, but all {len(signs)} cells lean the same way "
+            f"every pair is inside its own band, but {100 * floor_consistency:.0f}% of "
+            f"{len(signs)} cells lean the same way (threshold {100 * SIGN_MAJORITY:.0f}%) "
             f"and the median bias is {100 * median_bias:+.1f}%, past the "
             f"{100 * args.min_effect:.0f}% reporting floor. The bands were widened by "
             f"dispersion; a bias this size can produce a section-4 step on its own"
@@ -3378,7 +3434,9 @@ def compute_floor_overlap(probe_cells, args):
     elif biased:
         status = "AGREES-WITH-BIAS"
         why = (
-            f"all {len(signs)} cells agree within band, but consistently signed: the "
+            f"all {len(pairs)} pairs agree within band, but {100 * floor_consistency:.0f}% of "
+            f"{len(signs)} cells are consistently signed (threshold "
+            f"{100 * SIGN_MAJORITY:.0f}%): the "
             f"{float(pairs[0]['floor_short']):g} s floor reads {100 * median_bias:+.1f}% against "
             f"the {float(pairs[0]['floor_long']):g} s floor. Below the "
             f"{100 * args.min_effect:.0f}% reporting floor, so it cannot create a finding — "
@@ -3388,7 +3446,8 @@ def compute_floor_overlap(probe_cells, args):
         status = "AGREES"
         why = (
             f"all {len(pairs)} pairs agree within band, cell signs scattered "
-            f"({100 * floor_consistency:.0f}% consistent), median "
+            f"({100 * floor_consistency:.0f}% consistent, under the "
+            f"{100 * SIGN_MAJORITY:.0f}% threshold), median "
             f"{100 * median_bias:+.1f}%. The step at n=256 in section 4 is the hardware"
         )
 
@@ -3405,6 +3464,11 @@ def compute_floor_overlap(probe_cells, args):
         "median_bias": median_bias,
         "worst_delta": worst["delta"] if worst else None,
         "min_pairs_for_sign_test": MIN_FOR_SIGN,
+        # The rule the two consistency numbers above are judged against. In the payload
+        # so a fixture can assert the threshold it was written for rather than
+        # hard-coding 0.60 in four places, and so a reader of --json can tell a 0.62
+        # that cleared from a 0.58 that did not without knowing the source.
+        "sign_majority": SIGN_MAJORITY,
         "reps_per_cell": reps_per_cell,
         "cells": len(by_cell),
         # Counts alongside the lists, not derivable from them by a consumer that
@@ -3473,11 +3537,15 @@ def report_floor_overlap(ov, args, out):
     out(
         f"  sign consistency over {ov['cells']} cell(s): "
         f"floor {100 * ov['floor_sign_consistency']:.0f}%, "
-        f"order {100 * ov['order_sign_consistency']:.0f}% "
+        f"order {100 * ov['order_sign_consistency']:.0f}%, "
+        f"threshold {100 * ov['sign_majority']:.0f}% "
         f"(order is the control; bench.c alternates which floor runs first so that a "
         f"first-vs-second"
     )
-    out("  drift cannot masquerade as a short-vs-long floor effect)")
+    out("  drift cannot masquerade as a short-vs-long floor effect). The threshold is a")
+    out("  MAJORITY, not unanimity: |sum of cell signs| / cells, so 60% is an 80/20 split")
+    out("  of cells. Unanimity would be anti-monotone in the cell count — see")
+    out("  SIGN_MAJORITY in decompose.py for the measurement that showed it failing.")
     # Replication, and what it does and does not settle. Printed whether or not
     # anything is out of band, because "4 reps and nothing out of band" is a
     # materially stronger statement than "1 rep and nothing out of band" and the

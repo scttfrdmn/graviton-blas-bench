@@ -13,6 +13,70 @@ change can be compared.
 
 ## [Unreleased]
 
+### Fixed — section 9's floor-bias test could not fire on a real dataset; no measured number changes, three statuses become reachable
+
+- **`biased` and `order_explains` required UNANIMITY over cells, and "all N agree" is
+  anti-monotone in N.** Found by the all-of-N sweep Scott asked for after the
+  pair→cell fix, and the first thing it found was that the pair→cell fix was
+  incomplete: it moved the *unit* and left the *predicate*. A real host has 390 band
+  cells (5 sizes × arms × thread points), so `floor_consistency == 1.0` was
+  unreachable, and **`AGREES-WITH-BIAS`, the bias-past-the-band `DISAGREES` and
+  `ORDER-CONFOUNDED` were fixture-only statuses** — they fired at 5–60 low-noise
+  synthetic cells and could not fire on the instrument they exist to check. The
+  measured evidence for the class is the same two numbers as before: the first P2
+  pass came in at 56% floor consistency, and a planted 2% bias over 240 replicated
+  pairs came in at 92.5% and reported as `scattered`.
+
+  **The fixture set could not have caught this, and that is the second finding.**
+  Every signed mode `synth.py` planted was unanimous over cells, so the fixtures
+  could not distinguish "the analysis detects a consistent bias" from "the analysis
+  detects exact agreement". `floor-band-bias-dissent` is the new mode: a 2% bias with
+  12 of 60 cells leaning the other way, giving `36/60` — **exactly the 0.60
+  threshold**, so one more dissenting cell flips it to `AGREES` and it fails in both
+  directions. Mutation-validated three ways: restoring `== 1.0` turns it green as
+  `AGREES` with the bias printed as scattered (the pre-fix behaviour); moving the
+  dissent from cells to reps drives consistency to 1.0 and trips the `< 1.0`
+  assertion, which the status alone does not catch; and the threshold is read off the
+  payload's new `sign_majority` field, so moving `SIGN_MAJORITY` has to come through
+  the fixture.
+
+- **One rule, `sign_majority()` at `SIGN_MAJORITY = 0.60`, for all three
+  signs-agree tests** — the floor sign test, the order control, and per-cell
+  persistence. 0.60 is the campaign's existing majority (`--verdict-majority`'s
+  default, section 8's rule), reused rather than invented, and on `|Σ sign| / N` it
+  means an **80/20 split of cells**, which is a strong lean rather than a bare
+  majority. It reproduces the reading of the only real band data there is: 56% floor
+  against a 3% order control clears neither, and the right call on that was "not a
+  bias, not a drift". Exact via `majority_met()`, for the reason every other majority
+  in the file is.
+
+  Two consequences worth stating. The order control now requires that the floor
+  **fail** the majority rather than merely score lower, which is stricter, is what
+  `ORDER-CONFOUNDED` claims in words, and makes it mutually exclusive with `biased`
+  by construction instead of by the accident of two unanimities being incompatible.
+  And per-cell `same_sign` is a **no-op today** — at 3-of-3 and 4-of-4 the majority
+  rule still demands every sign — which is the point: it stops being a no-op only if
+  `OVERLAP_REPS` grows, which is exactly the count that broke the test the first time.
+
+- **Direction of the change is conservative in every branch it reaches**: it can add a
+  caveat (`AGREES-WITH-BIAS`), add a block (`DISAGREES` on a bias past the reporting
+  floor), or name a cause more precisely (`ORDER-CONFOUNDED`, which blocks either
+  way). It cannot turn a block into a pass. `MIN_FOR_SIGN = 5` still guards the
+  small-N end, where a majority is not evidence of anything.
+
+- **The sweep's other five all-of-N predicates stand, and why is recorded** in
+  README's hazards entry rather than left to be re-derived: all five are anti-monotone
+  toward *blocking* rather than toward silence. The one to watch is
+  `report_replicates()`'s "every dissenter is non-directional", which is safe only
+  because the spend policy pins the pass count at three.
+
+- **`README.md` §Hazards gains the class**, next to the density-coupling cluster it
+  belongs to, and a stale sentence in that cluster is corrected in the same pass:
+  it still described `meets()` and `MAJORITY_EPS = 1e-9`, both of which were removed
+  in favour of `majority_met()`/`as_exact()` — and `gates/p1.sh` fails if
+  `MAJORITY_EPS` reappears, so the README was documenting a mechanism the gate
+  forbids.
+
 ### Fixed — the pinning diagnostic could not attribute its own records; no measured number changes
 
 - **`diag-numa.sh`'s roofline cells never passed `GBB_PIN_POLICY`, so every record in

@@ -400,10 +400,15 @@ support opposite conclusions.
   weights happened to be added, and the two directions of one comparison can
   disagree with each other. `full-routine-set` is that dataset and it went from
   green to red on nothing but a ladder edit. Every majority comparison goes
-  through `meets()`, which carries `MAJORITY_EPS = 1e-9` of slack: far below any
-  difference the campaign could resolve, far above the accumulated error, and it
-  settles the tie in favour of the hand-arithmetic answer, which is the one the
-  policy is written in.
+  through `majority_met()`, which does the division in `Fraction` and converts the
+  threshold with `as_exact()` — `Fraction(str(0.55))` is exactly 11/20, so the
+  comparison is between the policy as written and the data as measured with no
+  binary in between. An epsilon was the first fix and is **gone**: a tolerance
+  wide enough to settle the tie is a tolerance, and `gates/p1.sh` fails if
+  `MAJORITY_EPS` reappears. Converting the threshold is not optional — an exact
+  left side against a float threshold is the same bug from the other side, because
+  the double written `0.55` is `0.55000000000000004` and a dataset exactly on the
+  threshold would fail it.
 - **A wrong answer was blocked from the headline by a coverage threshold, which
   was never the guard — it only happened to be one.** `verify-fail` plants a V1
   arm that returns wrong `dgemm` results; standing order 4 says that poisons the
@@ -418,6 +423,36 @@ support opposite conclusions.
   it is precisely where a kernel difference was most likely — a kernel that gets
   the answer wrong is a kernel doing something different. A null is a claim about
   the whole design, and the excluded part is the part that cannot support it.
+- **"All N agree" is anti-monotone in N, so a unanimity test silently reverses
+  direction the moment anything increases N.** Same shape as the four entries
+  above — a quantity whose meaning depends on a count another change is free to
+  move — but it fails in the harder direction to notice: the guard gets *quieter*
+  as the campaign measures more. Section 9's floor-bias test was
+  `floor_consistency == 1.0`. Replicating the band 4× per cell, which was bought
+  to make the question answerable, made it unanswerable: a planted 2% bias went
+  from 5 unanimous observations to 240 at **92.5% consistent** and was reported as
+  `scattered`, because one rep of one cell need only draw the wrong way to break
+  unanimity. Moving the statistic from pairs to cells fixed the *unit* and left the
+  *predicate*, which was worse than it looked — a real host has 390 cells (5 band
+  sizes × arms × thread points), so `AGREES-WITH-BIAS`, the bias-past-the-band
+  `DISAGREES` and `ORDER-CONFOUNDED` were **fixture-only statuses**: they fired at
+  5–60 low-noise synthetic cells and could not fire on the instrument they exist to
+  check. The fixture set could not see it, because every signed mode it planted was
+  unanimous, and a fixture set that only plants unanimity cannot tell "detects a
+  consistent bias" from "detects exact agreement". Two things follow. Route every
+  signs-agree test through one majority rule — `sign_majority()` at
+  `SIGN_MAJORITY = 0.60`, which on `|Σ sign| / N` means an 80/20 split of cells,
+  reusing the campaign's existing majority rather than inventing a threshold, and
+  reproducing the reading of the only real band data there is (56% floor against a
+  3% order control: not a bias, not a drift). And plant at least one fixture with a
+  **dissenting minority** at a realistic count — `floor-band-bias-dissent` is
+  36/60, exactly on the threshold, so one more dissenting cell flips it and the
+  restored `== 1.0` turns it green-as-AGREES. The sweep for other all-of-N
+  predicates found five more in `decompose.py`; all five are anti-monotone toward
+  *blocking* (harder to certify a pass, more likely to refuse), which is the safe
+  direction and is why they stand — but `report_replicates()`'s dissenter test is
+  safe only because the pass count is pinned at three by the spend policy. If that
+  pin ever moves, it moves with it.
 - **A comparison key that omits an axis lets each target shop along it.** The
   same max-over-cell defect that size shopping produced returns for any axis the
   key does not name, and transposes are the next one: with `transa`/`transb`

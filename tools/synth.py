@@ -933,9 +933,9 @@ OVERLAP_REPS = 4
 def floor_probe_records(sc: Scenario, host: HostSpec):
     """src/bench.c run_floor_overlap(), field for field.
 
-    Four modes, one per way the band can come out, because the analysis reports
-    four statuses and a fixture that only exercises the happy one asserts nothing
-    about the other three:
+    Modes, one per way the band can come out, because the analysis reports several
+    statuses and a fixture that only exercises the happy one asserts nothing
+    about the others:
 
       agree     independent jitter on each floor. Signs scatter and every delta is
                 well inside the band -> AGREES.
@@ -949,6 +949,18 @@ def floor_probe_records(sc: Scenario, host: HostSpec):
                 while the order-signed ones do not, which is the whole point of
                 alternating -> ORDER-CONFOUNDED.
       half      only one floor is emitted -> INCOMPLETE.
+      bias-dissent
+                a real bias with a dissenting MINORITY of cells: the short floor
+                reads `amount` low everywhere except every `dissent_every`-th cell,
+                where it reads `amount` high. Same status as `bias`, reached by a
+                dataset that no all-of-N predicate can see -- which is the whole
+                reason it exists. `bias` plants a bias that is unanimous over cells,
+                and a unanimous bias is what a real instrument never produces: the
+                first P2 pass came in at 56% and a planted 2% bias over 240
+                replicated pairs came in at 92.5%. A fixture set whose only signed
+                mode is unanimous cannot distinguish "the analysis detects a
+                consistent bias" from "the analysis detects nothing but exact
+                agreement", and the second is what decompose.py was doing.
 
     `order` is the mode that would be unreachable if bench.c ran the short floor
     first every time: with a fixed order, "first reads high" and "short reads high"
@@ -968,6 +980,12 @@ def floor_probe_records(sc: Scenario, host: HostSpec):
     mode = spec.get("mode", "agree")
     amount = spec.get("amount", 0.0)
     legacy = bool(spec.get("legacy"))
+    # Which cells dissent under `bias-dissent`. Counted on CELLS and not on records
+    # or pairs, because the analysis's sign test is per cell: a dissent expressed as
+    # "every Nth record" would put both signs inside one cell's reps, which the median
+    # then absorbs, and the fixture would silently be `bias` again.
+    dissent_every = int(spec.get("dissent_every", 0) or 0)
+    cell_index = -1
     reps = 1 if legacy else OVERLAP_REPS
     mfields = matrix_fields(sc, host)
     recs = []
@@ -976,6 +994,8 @@ def floor_probe_records(sc: Scenario, host: HostSpec):
             continue
         for threads in host.threads:
             for i, m in enumerate(OVERLAP_SIZES):
+                cell_index += 1
+                dissents = bool(dissent_every) and cell_index % dissent_every == 0
                 base = (
                     base_gflops("dgemm", m, threads)
                     * arm.multiplier("dgemm", m, 1, 0, None)
@@ -994,6 +1014,11 @@ def floor_probe_records(sc: Scenario, host: HostSpec):
                         mult = 1.0
                         if mode in ("bias", "disagree") and is_short:
                             mult = 1.0 - amount
+                        elif mode == "bias-dissent" and is_short:
+                            # Same magnitude either way, so the dissent cannot push a
+                            # pair outside its band and turn this into `disagree` --
+                            # the fixture has to reach the SIGN test, not the band test.
+                            mult = 1.0 + amount if dissents else 1.0 - amount
                         elif mode == "order" and pos == 0:
                             mult = 1.0 + amount
                         # Keyed on the floor as well, so `agree` gets two independent
@@ -4510,6 +4535,132 @@ def sc_floor_band_unreplicated():
     )
 
 
+def sc_floor_band_bias_dissent():
+    """A real 2% bias that 20% of cells lean against — the dataset an all-of-N sign
+    test cannot see, at a cell count a real host actually has.
+
+    THIS IS THE ANTI-MONOTONE FIXTURE, and it is here because the analysis it guards
+    was wrong in the direction that produces silence. Every signed mode above plants a
+    bias that is UNANIMOUS over cells, and `biased` was written as
+    `floor_consistency == 1.0`, so those fixtures passed and told nobody that the
+    predicate they were exercising is anti-monotone in the number of cells: `all N
+    agree` gets strictly harder to satisfy as N grows, so the more the campaign
+    measures, the less able it is to declare a bias it is actually measuring. The two
+    numbers that make it concrete are both real. The first P2 pass came in at 56% floor
+    consistency over 390 cells. A planted 2% bias over 240 replicated pairs came in at
+    92.5% and was reported as `scattered`. A real host has 390 cells, so on any real
+    dataset the unanimous branch was unreachable and AGREES-WITH-BIAS, the
+    bias-past-the-band DISAGREES and ORDER-CONFOUNDED were all fixture-only statuses:
+    they fired at 5-60 low-noise synthetic cells and could not fire on the instrument
+    they exist to check. That is the same shape as the density-coupling class in
+    README's hazards — a quantity whose meaning depends on a count another change is
+    free to move — and it is worse than a wrong threshold, because a fixture set that
+    only ever plants unanimity cannot tell "detects a consistent bias" from "detects
+    exact agreement".
+
+    THE CELL COUNT IS EXACT AND IT IS ON THE BOUNDARY, on purpose. 6 arms x 2 thread
+    points x 5 sizes = 60 cells; `dissent_every=5` flips 12 of them, so
+    `|sum of signs| / cells` is `(48 - 12) / 60 = 36/60`, which is **exactly 0.60**.
+    That makes it the tightest possible test of the rule: a dataset sitting exactly on
+    the threshold must clear it, and one more dissenting cell must flip the fixture to
+    AGREES, so it can fail in both directions rather than only in the lenient one.
+
+    It does NOT test the exactness of the comparison, and saying so is worth more than
+    implying it does. That was checked rather than assumed: replacing `majority_met()`
+    with plain `abs(sum) / len >= SIGN_MAJORITY` leaves this fixture passing, and it
+    has to — 36/60 divides to the nearest double to 0.6, which is the same double the
+    literal `0.60` is, so the two comparisons cannot disagree. Boundary exactness bites
+    only where the threshold's double rounds the other way (0.55, 0.34), and it is
+    tested there, arithmetically and over every threshold in the file, by `gates/p1.sh`
+    section 3. `majority_met()` is used here anyway because it is the campaign's one
+    majority comparison and a second hand-rolled one is how the two drift; the point is
+    that this scenario is not what guards it.
+
+    Everything else is held where `floor-band-biased` holds it. The magnitude is the
+    same either way, so no pair leaves its band and the BAND test still passes — this
+    has to reach the sign test, not the band test. 2% is below --min-effect, so the
+    status is the caveat and not the block; the same dissent at 12% would be
+    `floor-band-disagrees` and says nothing about signs. And the dissent is per CELL,
+    not per rep: reps of one cell are repeat measurements of one condition and the
+    median absorbs them, which is exactly why the sign test was moved to cells in the
+    first place."""
+    return _floor_band(
+        "floor-band-bias-dissent",
+        (
+            "The 0.05 s floor reads 2% low on 48 of 60 cells and 2% HIGH on the other 12 — "
+            "36/60 = exactly the 60% sign majority. Reported as a bias to discount, which "
+            "a unanimity test could not do at any realistic cell count."
+        ),
+        {"mode": "bias-dissent", "amount": 0.02, "dissent_every": 5},
+        [
+            # The status the unanimous predicate could not reach. This is the assertion
+            # that fails if `biased` goes back to `== 1.0`: it becomes AGREES, with the
+            # 2% bias printed as `scattered` and no caveat attached to section 4.
+            {"kind": "json_string", "path": "floor_overlap.status", "expect": "AGREES-WITH-BIAS"},
+            {"kind": "json_bool", "path": "floor_overlap.confirmed", "value": True},
+            # The band test still passes, so the status came from the SIGN test. Without
+            # this the fixture would also pass on an analysis that had simply widened
+            # what counts as out of band.
+            {"kind": "json_number", "path": "floor_overlap.outside_band", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "floor_overlap.cells", "op": "==", "value": 60},
+            {"kind": "json_number", "path": "floor_overlap.n_pairs", "op": "==", "value": 60 * OVERLAP_REPS},
+            {"kind": "json_number", "path": "floor_overlap.reps_per_cell", "op": "==", "value": OVERLAP_REPS},
+            # Exactly on the boundary, asserted from both sides. A fixture that only
+            # said `>= 0.6` would not notice a producer change that moved the dissent
+            # count, and one that only said `< 1.0` would not notice one that moved it
+            # the other way. See the docstring for what this does NOT test.
+            {
+                "kind": "json_number",
+                "path": "floor_overlap.floor_sign_consistency",
+                "op": "<",
+                "value": 0.601,
+            },
+            {
+                "kind": "json_number",
+                "path": "floor_overlap.floor_sign_consistency",
+                "op": ">",
+                "value": 0.599,
+            },
+            # It is NOT unanimous, which is the property that distinguishes this fixture
+            # from `floor-band-biased`. If a producer change made it unanimous, the
+            # scenario would still say AGREES-WITH-BIAS and would silently stop testing
+            # the majority rule -- the exact failure mode this fixture exists to close.
+            {
+                "kind": "json_number",
+                "path": "floor_overlap.floor_sign_consistency",
+                "op": "<",
+                "value": 1.0,
+            },
+            # The threshold the two consistency numbers are judged against, read off the
+            # payload rather than assumed, so a change to SIGN_MAJORITY has to come here
+            # and be argued for rather than quietly moving what the fixture proves.
+            {"kind": "json_number", "path": "floor_overlap.sign_majority", "op": "==", "value": 0.60},
+            # Signed and negative: the majority direction survives the dissent. The
+            # median over cells is robust to the 12 that lean the other way, which is
+            # the reason the reported bias is a median and not a mean.
+            {"kind": "json_number", "path": "floor_overlap.median_bias", "op": "<", "value": -0.01},
+            {"kind": "json_number", "path": "floor_overlap.median_bias", "op": ">", "value": -0.04},
+            # The order control must NOT explain it. bench.c alternates the order, so an
+            # order-signed delta averages out across a cell's reps; if it did clear the
+            # majority the status would be ORDER-CONFOUNDED and the reader would be sent
+            # after a drift instead of a floor.
+            {
+                "kind": "json_number",
+                "path": "floor_overlap.order_sign_consistency",
+                "op": "<",
+                "value": 0.60,
+            },
+            {"kind": "exit_bits_clear", "bits": [32]},
+            {"kind": "stdout_contains", "text": "consistently signed"},
+            # The printed rule, not just the applied one. A reader of section 9 seeing
+            # "60% consistent" has to be told that 60% is the threshold and that it means
+            # an 80/20 split of cells, or the number reads like a coin flip.
+            {"kind": "stdout_contains", "text": "MAJORITY, not unanimity"},
+            {"kind": "anomaly_kind_absent", "kind_name": "floor_overlap_unconfirmed"},
+        ],
+    )
+
+
 def sc_probe_inapplicable():
     """The DYNAMIC_ARCH probe did not run because the DYNAMIC build failed, so
     there was nothing to probe.
@@ -5003,6 +5154,7 @@ SCENARIOS = {
         sc_floor_band_bias_past_floor,
         sc_floor_band_half,
         sc_floor_band_unreplicated,
+        sc_floor_band_bias_dissent,
         sc_matrix_stamped,
         sc_matrix_mixed,
         sc_matrix_unstamped,
