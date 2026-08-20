@@ -13,7 +13,86 @@ change can be compared.
 
 ## [Unreleased]
 
+### Changed
+
+- **Every threshold in `analysis/decompose.py` that was a fraction of raw cells
+  is now either balanced-weighted or an absolute count.** Two defects found
+  separately — cell-count majorities, so the longest size ladder voted, and
+  `--max-nodata-fraction` at 34% while `dgemm`'s total exclusion moved from 40%
+  of the cross to 29% purely by densifying the ladders — were one root cause:
+  *a quantity defined as a fraction of cells is coupled to ladder density*. Both
+  were latent from the start and only became reachable when the denominator
+  moved, and items 3–5 of the #2 expansion move it again (transposes multiply
+  `dgemm`'s cells by four), so the class was swept rather than the instances
+  patched. `balanced_weights()` is now the single weighting rule: one unit per
+  `(routine_family, regime)` group, split evenly among the routines in the group
+  and then among each routine's cells. Pads, transposes and `incx` are
+  deliberately *not* layers — they are the same hardware claim re-asked at a
+  different alignment, not independent votes. Anything left unchanged by the
+  sweep is density-invariant by construction.
+- The coverage guard gained an **absolute half**, because no threshold on a
+  fraction can express "one whole family of the design was not measured": a
+  share can always be diluted by densifying elsewhere. `verdict.dark_groups`
+  counts `(family, regime)` groups in which nothing was measured at all, and one
+  of them refuses a directional verdict outright. Dark is measured against data
+  (`n_sizes > 0` on an admissible host), not against a verdict — a group that
+  compared and came out thin or split is inconclusive, not dark. The level-1
+  ladder puts exactly one length in the medium regime, so `(axpy, medium)` and
+  `(dot, medium)` are permanently thin by construction and must not read as holes.
+- The majority comparison is now **exact rational arithmetic** rather than a
+  float comparison with a tolerance. Balanced weight is a sum of reciprocals of
+  integers, so it is exactly rational: `fractions.Fraction` accumulates it with
+  no ordering sensitivity, and `as_exact()` reads a threshold as the decimal it
+  was written as. This is not cosmetic — making the left side exact is precisely
+  what breaks a float threshold, and it breaks it in a direction that depends on
+  the threshold rather than on the data. Both of the campaign's own defaults sit
+  exactly on a reachable boundary and they fall opposite ways against a float:
+  `Fraction(3,5) >= 0.60` is **true** (binary `0.6` rounds down, so exactly
+  three fifths clears it) while `Fraction(17,50) >= 0.34` is **false** (binary
+  `0.34` rounds up, so exactly 34% does not). No epsilon is right for both, which
+  is the argument against having one. `MAJORITY_EPS` is gone, and `gates/p1.sh`
+  section 3 asserts it stays gone.
+- The **effect-size floor stays on the raw median, on purpose**, and now says so.
+  The directional branch asks two deliberately different questions — "how much of
+  the design moved" (balanced) and "did the work move" (raw) — and weighting both
+  collapses them into one question asked twice, which makes `MIXED` unreachable:
+  the `family-swamped` fixture, a 22% effect on three of five families, then reads
+  as a global `V1-SET-AHEAD`. The balanced median is kept as a diagnostic and
+  printed where the two diverge, since a gap between them means the effect is
+  concentrated in whichever routines have the longest ladders.
+- The timing floor is part of the comparison key (`canon_floor()`), so the same
+  `(routine, size)` measured at 0.05 s and at 0.30 s cannot collapse into one
+  cell with min-within-run keeping whichever floor looked worse. Absent means the
+  legacy 0.30 s, so pre-per-regime data is read unchanged.
+- `transa`/`transb` are now in the **coverage census** cell key, not just the
+  comparison key. An arm that ran NN and never ran TN at all was recorded as
+  `partial` — "some sizes of this cell are absent" — where the truth was a whole
+  missing copy kernel, which is what a SIGILL in `dgemm_tcopy` on a cross-built
+  arm looks like. Standing order 11 turns on that difference.
+- `tools/synth.py` now emits `min_seconds` per regime the way `src/bench.c` does.
+  It is part of the comparison key, so a fixture that omitted it keyed every
+  record at the legacy floor and no fixture exercised the small floor at all.
+
 ### Added
+
+- Three P1 fixtures, each mutation-validated in both directions:
+  `nodata-group-hole` (one dark `(family, regime)` group at 25% non-comparable
+  balanced weight — under the 34% threshold — of which only 8% is the actual
+  hole, so no threshold catches it and only the absolute count does),
+  `medium-large-localised` (an effect on `dtrsm` in medium+large, which is 6 of
+  11 raw cross rows = 55% and fails the majority, but 2 of 3 balanced groups =
+  67% and passes, because large buys one `lda_pad` where small and medium buy
+  four — so the alignment axis, not the hardware, decides whether a *regime*
+  effect is reportable, and it decides against the large regime specifically,
+  which is where the DDR generation and the L3 step live), and
+  `transpose-lost` (an arm that produced no TN records whatsoever).
+- `gates/p1.sh` section 3 asserts the majority arithmetic is exact on the
+  boundary, order-independent, and free of a tolerance constant — a property of
+  the analysis that no dataset can reach.
+- `gates/p1.sh` section 2 cross-checks the `MIN_SECONDS` copies against
+  `src/bench.c`, including the ladder→floor mapping read back off `sweep()`'s
+  call sites. The constants agreeing is not the same as the mapping agreeing, and
+  the mapping lives in call sites rather than in a table.
 
 - Initial harness, scripts and analysis are in tree and heading toward `v0.0.1`.
 - `docs/pre-P1-audit.md` — consolidated triage of three adversarial reviews run

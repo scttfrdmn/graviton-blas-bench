@@ -85,6 +85,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from fractions import Fraction
 
 # ---- named thresholds -----------------------------------------------------
 # Every threshold that decides anything is here, with its default and the reason
@@ -107,10 +108,19 @@ DEFAULT_NOISY_SPREAD = 0.25
 # ordinary gap between an FMA-chain microbenchmark and a real blocked GEMM.
 DEFAULT_HEADROOM_FACTOR = 1.15
 
-# Sizes that must be comparable at identical (m,n,k,lda_pad) before a regime may
-# carry a directional verdict. 3 because MEDIUM and LARGE hold 5 sizes each and
-# SMALL holds 10; a verdict from one or two sizes is a size-specific anecdote,
-# which is exactly how the old max()-over-the-regime bug produced its inversion.
+# Sizes that must be comparable at identical (m,n,k,lda_pad,transa,transb) before
+# a regime may carry a directional verdict. A verdict from one or two sizes is a
+# size-specific anecdote, which is exactly how the old max()-over-the-regime bug
+# produced its inversion.
+#
+# 3 is an ABSOLUTE count over a HOMOGENEOUS group -- one routine, one regime, one
+# pad, one transpose, one stride -- so it is density-invariant and the sweep leaves
+# it alone. Its justification used to read "MEDIUM and LARGE hold 5 sizes each and
+# SMALL holds 10", which the #2 densification made false: bench.c now holds 16/10/5
+# (SIZES_SMALL/MEDIUM/LARGE). The number is unchanged and the reason is restated
+# rather than rescaled -- 3 sizes is still not one or two sizes -- but the stale
+# arithmetic is exactly how a fraction-of-cells assumption hides inside a constant
+# that looks absolute.
 DEFAULT_MIN_SIZES = 3
 
 # Fraction of the compared sizes that must agree in sign for a directional
@@ -121,33 +131,156 @@ DEFAULT_WIN_FRACTION = 0.60
 # Fraction of comparable cells that must agree for a campaign-level verdict.
 DEFAULT_VERDICT_MAJORITY = 0.60
 
-# Slack on every majority comparison. Balanced weighting makes each (family,
-# regime) group contribute one unit of weight *as a sum of reciprocals* — a
-# 24-cell group is 24 * (1/24), which is not exactly 1.0 in binary. A dataset
-# that lands exactly on the threshold by construction (five small-regime
-# families, three of them one-sided: 3.0/5.0 = 0.60) therefore has its verdict
-# decided by summation order rather than by the data, and the two directions of
-# a comparison can disagree with each other. One part in 10^9 is far below any
-# difference the campaign could resolve and far above the accumulated error of
-# summing a few thousand reciprocals, so it decides the tie in favour of the
-# hand-arithmetic answer, which is the one the policy is written in.
-MAJORITY_EPS = 1e-9
+# Majority comparisons are EXACT, in rational arithmetic, with no tolerance
+# constant.
+#
+# Balanced weighting makes each group contribute one unit of weight *as a sum of
+# reciprocals of integers* — a 24-cell group is 24 * (1/24) — so the quantity
+# being compared is exactly rational and does not need a tolerance. In binary
+# floating point it does: 24 * (1/24) is not 1.0, and a dataset that lands on the
+# threshold by construction (five small-regime families, three of them one-sided:
+# 3/5 = 0.60) had its verdict decided by summation order rather than by the data,
+# with the two directions of one comparison able to disagree with each other. An
+# epsilon covers that, but it is a tolerance around a number that does not need
+# one, and a future weighting scheme could land on a boundary the epsilon happens
+# not to cover. Fraction accumulates the weight with no ordering sensitivity.
+#
+# The THRESHOLD has to be converted too, and that half is not optional — making
+# the left side exact is precisely what breaks a float threshold. Fraction >=
+# float compares against the float's *exact* rational value, not against the
+# rounded decimal it was written as, so the slack that float-vs-float arithmetic
+# silently provided disappears. Measured: `Fraction(3, 5) >= 0.60` is True
+# (0.60 as a double is 0.59999999999999997779..., just under), but
+# `Fraction(11, 20) >= 0.55` is **False** and `Fraction(17, 50) >= 0.34` is
+# **False**, because those two doubles round just over. A dataset sitting exactly
+# on the threshold would fail it, which is the same class of bug as the epsilon,
+# reintroduced from the other side. Fraction(str(x)) reads the decimal that was
+# actually written — repr() is the shortest decimal that round-trips, so
+# Fraction(str(0.55)) is exactly 11/20 — and the comparison is then between the
+# policy as written and the data as measured, with no binary in between.
 
 
-def meets(value: float, threshold: float) -> bool:
-    """value >= threshold, with MAJORITY_EPS of slack. See MAJORITY_EPS."""
-    return value >= threshold - MAJORITY_EPS
+def as_exact(threshold: float) -> Fraction:
+    """A threshold as the exact decimal it was written as. See above."""
+    return Fraction(str(threshold))
+
+
+def majority_met(part: Fraction, total: Fraction, threshold: float) -> bool:
+    """Exact `part / total >= threshold`. Zero total is never a majority: it
+    means nothing was comparable, which the callers report separately."""
+    return bool(total) and part / total >= as_exact(threshold)
+
+
+def balanced_weights(cells):
+    """Per-cell weight under the campaign's ONE weighting rule.
+
+    `cells` is a sequence of (routine_family, routine, regime) triples, one per
+    cell. Returns a list of Fractions parallel to it. The total is exactly the
+    number of distinct (family, regime) groups present, because that is the whole
+    construction: **one unit of weight per (family, regime) group, divided evenly
+    among the ROUTINES in the group, and each routine's share divided evenly among
+    its own cells.**
+
+    Every fraction-of-cells quantity in this file that decides anything runs
+    through here, and that is the point. The alternative -- each site deriving its
+    own denominator from whatever it happened to have counted -- is the defect
+    class this function exists to close, and that class has now appeared four
+    times: raw cells in coherent_subsets (C11), raw cells on the regime axis in
+    compute_verdict, a raw --max-nodata-fraction, and an unweighted median as the
+    effect-size floor. Every one of them was latent until src/bench.c's ladder
+    moved, and the #2 expansion moves it twice more (transposes multiply dgemm's
+    cells by four, complex again after that). A quantity defined as a fraction of
+    cells is a quantity that means something different after every expansion.
+
+    Three layers, each with a reason:
+
+      family   dgemm/sgemm/zgemm/cgemm are one family, so adding complex types
+               cannot multiply GEMM's vote. See routine_family().
+      regime   small/medium/large each carry one unit per family. bench.c's
+               ladders are 16/10/5 sizes and the pad axis is 5 values below the
+               large regime against 2 within it, so small+medium hold ~93% of
+               every padded routine's cells: on raw counts an effect confined to
+               the large regime -- where the DDR generation and the L3 step show,
+               and where the campaign's memory-side finding would live -- cannot
+               reach a 60% majority no matter how large it is.
+      routine  a routine's cells are its own. Without this layer the family's unit
+               splits by cell count *inside* the family, so dgemm (5 pads) already
+               holds 5/6 of the gemm unit against sgemm's 1/6, and after the
+               transposes land it holds ~20/21. That makes an sgemm-localised
+               effect unreachable and a dgemm-localised one self-certifying --
+               the family layer's own argument, one level down.
+
+    A pad, a transpose and an incx are NOT layers: they are the same kernel-set
+    claim re-asked at a different alignment or a different operand orientation, so
+    they divide the routine's share rather than adding units of their own. That is
+    the axis-assignment policy in CLAUDE.md, and it is why densifying those axes
+    is weight-neutral here.
+    """
+    routines = defaultdict(set)
+    per_routine = defaultdict(int)
+    for fam, routine, reg in cells:
+        routines[(fam, reg)].add(routine)
+        per_routine[(fam, reg, routine)] += 1
+    return [
+        Fraction(1, len(routines[(fam, reg)]) * per_routine[(fam, reg, routine)])
+        for fam, routine, reg in cells
+    ]
+
+
+def weighted_median(values, weights):
+    """The value at which cumulative weight first reaches half the total.
+
+    Used for the effect-size floor, and it has to be weighted for the same reason
+    the majority does. The directional branch asks two questions -- "how much of
+    the experiment moved" (the balanced majority) and "did the experiment move"
+    (this) -- and it was asking the first on balanced weight and the second on raw
+    cells. So the floor was decided by whichever routine had the longest ladder:
+    dgemm carries five pads today and four transposes after item 3, at which point
+    ~80% of the deltas in an unweighted median are dgemm's. A verdict whose two
+    halves disagree about what a cell is worth is not a verdict about the hardware.
+
+    Weights are exact Fractions, so the half-total comparison is exact and the
+    ordering of equal-value cells cannot move the answer.
+    """
+    pairs = sorted(zip(values, weights, strict=True), key=lambda vw: vw[0])
+    total = sum(weights, Fraction(0))
+    if not pairs or not total:
+        return None
+    half = total / 2
+    acc = Fraction(0)
+    for v, w in pairs:
+        acc += w
+        if acc >= half:
+            return v
+    return pairs[-1][0]
 
 
 # Comparable cells a single axis value (one routine, one regime, one instance)
 # must hold before it is allowed to block the NULL branch. 3 for the same reason
 # as DEFAULT_MIN_SIZES: two cells agreeing is not a localised effect.
+#
+# Deliberately an ABSOLUTE count, not a fraction, and it therefore survives the
+# density sweep unchanged: it is a floor on how much evidence exists, not on what
+# share of the design that evidence is. The share is already guarded, and by
+# construction -- under balanced_weights() a qualifying subset carries at least
+# --verdict-majority of at least one full group-unit -- so the two guards are not
+# two spellings of one thing. What does change with density is the stringency
+# ratio: 3 cells was 3-of-20 and is now 3-of-~80. That is the accepted cost of an
+# absolute count, and the alternative (a fraction of the axis value's cells) is
+# the defect class itself.
 DEFAULT_SUBSET_MIN_CELLS = 3
 
-# If more than this fraction of the cells in the target cross are not comparable
-# (missing arm, thin, unequal N, inadmissible host), the campaign verdict is
-# INCONCLUSIVE rather than directional: with a third of the design absent the
-# sign of the aggregate is decided by which cells happened to survive.
+# If more than this share of the target cross is not comparable (missing arm,
+# thin, unequal N, inadmissible host), the campaign verdict is INCONCLUSIVE rather
+# than directional: with a third of the design absent the sign of the aggregate is
+# decided by which cells happened to survive.
+#
+# The share is BALANCED WEIGHT, not raw cells, and 0.34 is unchanged from when it
+# was a raw fraction on purpose. Retuning it would have hidden what it revealed:
+# the #2 densification took dgemm's total exclusion for wrong answers from 40% of
+# the cross to 29% -- under the threshold -- without a single measurement
+# changing, purely because the small ladder went from 10 sizes to 16. The number
+# was never wrong; the denominator was.
 DEFAULT_MAX_NODATA_FRACTION = 0.34
 
 # The two kernel sets under test, as they appear in TARGET= and in
@@ -292,6 +425,41 @@ def canon_trans(v):
         return "N"
     s = str(v).strip().upper()
     return s if s in ("N", "T", "C") else "N"
+
+
+# The single MIN_SECONDS floor in force before src/bench.c floored it per regime. A
+# record with no min_seconds field was measured under that one floor, so that is
+# what absent has to mean -- see canon_floor(). Copied from bench.c's MIN_SECONDS
+# and cross-checked against it by gates/p1.sh, the same way the size ladders are,
+# so the copy cannot rot silently.
+LEGACY_MIN_SECONDS = 0.300
+
+
+def canon_floor(v):
+    """The MIN_SECONDS floor a record was measured under, as a stable key.
+
+    This is part of the comparison condition, for the same reason transa/transb
+    are. The floor sets how much work each measurement averages over, so the same
+    (routine, size) taken at 0.05 s and at 0.30 s are two measurements with
+    different noise characteristics, not two samples of one -- and the campaign is
+    about to produce exactly that pair on purpose. The overlap band (n=192..384 at
+    both floors, once) exists to show that the step at n=256 is the GEMM_SMALL_*
+    crossover and not the floor changing underneath it. Without the floor in the
+    key those pairs collapse into one cell, and min-within-run keeps whichever
+    floor happened to look worse -- so the band designed to rule out an instrument
+    artefact would be read through one. That is the max()-over-the-cell defect in
+    its fourth shape, closed before the data exists rather than after.
+
+    The probe records are kept out of the main cross by their own tag rather than
+    by this key (see split_floor_probe()); this is the fail-safe under it.
+
+    Quantised to the 3 decimals bench.c prints (%.3f), so the key is the number as
+    written and not a float that may or may not compare equal. Absent means
+    LEGACY_MIN_SECONDS: defaulting rather than None-propagating is what lets the
+    key be extended without splitting pre-per-regime data into two cells."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return f"{LEGACY_MIN_SECONDS:.3f}"
+    return f"{float(v):.3f}"
 
 
 # Routine families for verdict weighting. The family is the routine name minus
@@ -926,6 +1094,7 @@ def build_cells(bench, hosts, exc: Excluded):
             r.get("incx", 1),
             canon_trans(r.get("transa")),
             canon_trans(r.get("transb")),
+            canon_floor(r.get("min_seconds")),
         )
         if not isinstance(gf, (int, float)) or isinstance(gf, bool):
             exc.no_gflops += 1
@@ -1331,12 +1500,21 @@ def cell_groups(cells):
     same conflation as the max()-over-the-cell bug, one level up. Section 3 is
     where the two leading dimensions are compared against each other. The
     transposes are in the key on the same argument: NN and TN exercise different
-    packing kernels, so their median is a statement about neither."""
+    packing kernels, so their median is a statement about neither.
+
+    The timing floor is in the key for the same reason, as a fail-safe. Under the
+    per-regime floor it partitions nothing -- the floor is a function of the regime,
+    so every cell in a group already shares one -- and the overlap-band probe is
+    kept out of this cross by its own tag rather than by this key (see
+    split_floor_probe()). But if a probe record ever arrives untagged, the floor
+    being here turns "medianed together with real data, silently" into "an extra
+    thin row, visibly", and that is the direction to fail in. Appended last so the
+    existing k[0..7] positions are unchanged."""
     g = defaultdict(lambda: defaultdict(list))
     for cond, arm in cells:
         inst, thr, routine, m, pad, incx = cond[0], cond[1], cond[2], cond[3], cond[6], cond[7]
-        ta, tb = cond[8], cond[9]
-        g[(inst, thr, routine, regime(m or 0), pad, incx, ta, tb)][arm].append(cond)
+        ta, tb, floor = cond[8], cond[9], cond[10]
+        g[(inst, thr, routine, regime(m or 0), pad, incx, ta, tb, floor)][arm].append(cond)
     return g
 
 
@@ -1362,7 +1540,7 @@ def report_deficit_by_routine(cells, groups, hosts, explain, pass_explain, args,
         tag = "" if (h and h.admissible) else "  [HOST-NOT-ADMISSIBLE]"
         for k in sorted((k for k in groups if k[0] == inst), key=skey):
             arms = groups[k]
-            _, thr, routine, reg, pad, incx, ta, tb = k
+            _, thr, routine, reg, pad, incx, ta, tb, floor = k
             present_refs = [a for a in arms if a in refs]
             if not present_refs:
                 for arm in sorted((a for a in arms if a[0] == "openblas"), key=arm_label):
@@ -1404,6 +1582,7 @@ def report_deficit_by_routine(cells, groups, hosts, explain, pass_explain, args,
                         "incx": incx,
                         "transa": ta,
                         "transb": tb,
+                        "min_seconds": floor,
                         "arm": arm_label(arm),
                         "reference_arm": arm_label(ref),
                         "shipped_arm": is_shipped(arm),
@@ -1491,7 +1670,7 @@ def report_target_cross(cells, groups, hosts, explain, pass_explain, inp, args, 
                 arms = groups[k]
                 conds = sorted(set(arms.get(arm_a, [])) | set(arms.get(arm_b, [])), key=skey)
                 rows = per_size(cells, conds, arm_a, arm_b, args.min_effect, pass_explain)
-                _, thr, routine, reg, pad, incx, ta, tb = k
+                _, thr, routine, reg, pad, incx, ta, tb, floor = k
                 if rows:
                     comparable += 1
                     s = summarise(rows, args, "V1-set", "V2-set")
@@ -1525,6 +1704,7 @@ def report_target_cross(cells, groups, hosts, explain, pass_explain, inp, args, 
                         "incx": incx,
                         "transa": ta,
                         "transb": tb,
+                        "min_seconds": floor,
                         "mechanism": mech,
                         "arm_v1": arm_label(arm_a),
                         "arm_v2": arm_label(arm_b),
@@ -1589,8 +1769,11 @@ def report_lda_penalty(cells, hosts, args, out):
     tight = {}
     padded = {}
     for (cond, arm), c in cells.items():
-        inst, thr, routine, m, n, k, pad, incx, ta, tb = cond
-        base = (inst, arm, thr, routine, m, n, k, incx, ta, tb)
+        inst, thr, routine, m, n, k, pad, incx, ta, tb, floor = cond
+        # `floor` stays in the pairing key. A tight-vs-padded penalty read across
+        # two timing floors would be part stride and part instrument, which is the
+        # same objection as pairing across passes two lines down.
+        base = (inst, arm, thr, routine, m, n, k, incx, ta, tb, floor)
         if pad == 0:
             tight[base] = c
         elif pad:
@@ -1603,7 +1786,7 @@ def report_lda_penalty(cells, hosts, args, out):
             cp = padded[pad][base]
             if ct is None:
                 continue
-            inst, arm, thr, routine, m, _n, _k, incx, ta, tb = base
+            inst, arm, thr, routine, m, _n, _k, incx, ta, tb, floor = base
             # Same paired rule as per_size(): a tight-vs-padded penalty measured
             # over different passes on each side would be part stride and part
             # box. Both sides are the same arm here, so a pass that has one and
@@ -1646,6 +1829,7 @@ def report_lda_penalty(cells, hosts, args, out):
                     "incx": incx,
                     "transa": ta,
                     "transb": tb,
+                    "min_seconds": floor,
                     "regime": regime(m or 0),
                     "tight": ct.value,
                     "padded": cp.value,
@@ -2104,7 +2288,26 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
         arms = sorted(arms_by_inst[inst] | expected_arms, key=arm_label)
         cellset = defaultdict(list)
         for cond in conds:
-            cellset[(cond[1], cond[2], regime(cond[3] or 0), cond[6], cond[7])].append(cond)
+            # The census cell key must be the comparison's key, minus only the
+            # sizes it aggregates over. It was missing transa/transb, so an arm
+            # that lost an entire transpose while keeping the others was recorded
+            # as `partial` on one cell instead of MISSING-UNEXPLAINED on its own --
+            # section 7 saying "some sizes are absent" where the truth was "this
+            # arm never ran TN at all". `floor` is here for the same reason it is
+            # in group_cells(): so an untagged probe record cannot merge into a
+            # real cell's expectation and make it look complete.
+            cellset[
+                (
+                    cond[1],
+                    cond[2],
+                    regime(cond[3] or 0),
+                    cond[6],
+                    cond[7],
+                    cond[8],
+                    cond[9],
+                    cond[10],
+                )
+            ].append(cond)
         for arm in arms:
             for ck, clist in sorted(cellset.items(), key=skey):
                 thr = ck[0]
@@ -2135,6 +2338,9 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
                             "regime": ck[2],
                             "lda_pad": ck[3],
                             "incx": ck[4],
+                            "transa": ck[5],
+                            "transb": ck[6],
+                            "min_seconds": ck[7],
                             "status": status,
                             "measured_conditions": have,
                             "expected_conditions": len(clist),
@@ -2166,7 +2372,7 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
         for m in shown[: args.max_listed]:
             out(
                 f"    {m['instance']!s:14s} {m['arm']:30s} t={m['threads']!s:<4} {m['routine']!s:6s} "
-                f"{m['regime']:6s} pad={m['lda_pad']!s:<3} "
+                f"{m['regime']:6s} pad={m['lda_pad']!s:<3} tr={m['transa']}{m['transb']} "
                 f"0/{m['expected_conditions']} conditions — {m['reason']}"
             )
         if len(shown) > args.max_listed:
@@ -2177,7 +2383,7 @@ def report_coverage(cells, inp, explain, hosts, exc: Excluded, args, out):
         for m in partial[: args.max_listed]:
             out(
                 f"    {m['instance']!s:14s} {m['arm']:30s} t={m['threads']!s:<4} {m['routine']!s:6s} "
-                f"{m['regime']:6s} pad={m['lda_pad']!s:<3} "
+                f"{m['regime']:6s} pad={m['lda_pad']!s:<3} tr={m['transa']}{m['transb']} "
                 f"{m['measured_conditions']}/{m['expected_conditions']} conditions"
             )
         if len(partial) > args.max_listed:
@@ -2462,19 +2668,25 @@ def coherent_subsets(cross, args):
     Found by C11: before this, gates/p1.sh certified the analysis on `dgemm` and
     `dgemv` only, and the routine-localised fixture read out as a global null.
 
-    **The majority is over routine families, normalised, not over raw cells**, and
-    that is what makes the guard survive a larger matrix. Cell counts follow
-    bench.c's ladder: a routine measured at five pads and four transposes
-    contributes twenty times the rows of one measured at one pad and one
-    transpose, all of them the same hardware claim repeated. Counting rows would
-    let GEMM's row count decide whether an effect on TRSM/TRMM/SYMM is coherent,
-    so every family contributes one unit of weight to an axis value, divided among
-    its own rows. Expanding the matrix therefore cannot dilute the guard it was
-    built to be -- which it would have done, worse than before C11, since every
-    planned addition multiplies GEMM's rows faster than anything else's."""
-    weights = defaultdict(lambda: defaultdict(float))
+    **The majority is over balanced weight, not raw cells**, and that is what makes
+    the guard survive a larger matrix. Cell counts follow bench.c's ladder: a
+    routine measured at five pads and four transposes contributes twenty times the
+    rows of one measured at one pad and one transpose, all of them the same
+    hardware claim repeated. Counting rows would let GEMM's row count decide
+    whether an effect on TRSM/TRMM/SYMM is coherent, so expanding the matrix would
+    dilute the guard it was built to be -- worse than before C11, since every
+    planned addition multiplies GEMM's rows faster than anything else's.
+
+    The weighting is `balanced_weights()`, the same rule compute_verdict() uses,
+    applied *within each axis value*. It was family-only here, and that was two
+    thirds of a fix: a family's unit split evenly across its rows regardless of
+    regime, so for the routine/instance/trans axes an effect confined to the large
+    regime of one routine could not reach 60% -- 10 large rows against 130
+    small+medium ones -- which is the same false negative one level down, on the
+    axis where the memory-side finding lives. And the family's unit split by row
+    count *inside* the family, so dgemm already outweighed sgemm 5:1 on the pad
+    axis alone. Both are properties of the ladder, not of the hardware."""
     raw = defaultdict(lambda: defaultdict(int))
-    fam_rows = defaultdict(lambda: defaultdict(int))
     deltas = defaultdict(list)
     contributing = []
     for c in cross:
@@ -2496,17 +2708,30 @@ def coherent_subsets(cross, args):
             ("instance", c["instance"]),
             ("trans", f"{canon_trans(c.get('transa'))}{canon_trans(c.get('transb'))}"),
         )
-        contributing.append((axes, fam, bucket, c["median_delta"]))
-        for axis, value in axes:
-            fam_rows[(axis, value)][fam] += 1
+        contributing.append((axes, (fam, c["routine"], c["regime"]), bucket, c["median_delta"]))
 
-    for axes, fam, bucket, delta in contributing:
-        for axis, value in axes:
-            w = 1.0 / fam_rows[(axis, value)][fam]
-            weights[(axis, value)][bucket] += w
-            raw[(axis, value)][bucket] += 1
+    # Weighted per axis value, because the denominator is that axis value's own
+    # groups: at ("routine", "dtrsm") the groups are dtrsm's three regimes, and at
+    # ("regime", "large") they are the families that reach the large regime.
+    by_axis = defaultdict(list)
+    for i, (axes, _grp, _bucket, _delta) in enumerate(contributing):
+        for av in axes:
+            by_axis[av].append(i)
+
+    weights = defaultdict(lambda: defaultdict(Fraction))
+    groups_seen = defaultdict(set)
+    for av, idx in by_axis.items():
+        cells = [contributing[i][1] for i in idx]
+        for i, w in zip(idx, balanced_weights(cells), strict=True):
+            _axes, (fam, _routine, reg), bucket, delta = contributing[i]
+            weights[av][bucket] += w
+            raw[av][bucket] += 1
+            groups_seen[av].add((fam, reg))
             if delta is not None:
-                deltas[(axis, value, bucket)].append(delta)
+                # Carried with its weight: the subset's reported median is
+                # weighted for the same reason the campaign median is, and this is
+                # the number `located()` prints beside the share.
+                deltas[(av[0], av[1], bucket)].append((delta, w))
 
     found = []
     for (axis, value), t in sorted(weights.items(), key=lambda kv: skey(kv[0])):
@@ -2517,7 +2742,7 @@ def coherent_subsets(cross, args):
         if not total_w:
             continue
         for direction, side in (("V1", "v1"), ("V2", "v2")):
-            if not meets(t[side] / total_w, args.verdict_majority):
+            if not majority_met(t[side], total_w, args.verdict_majority):
                 continue
             d = deltas[(axis, value, side)]
             found.append(
@@ -2527,10 +2752,18 @@ def coherent_subsets(cross, args):
                     "direction": direction,
                     "wins": raw[(axis, value)][side],
                     "comparable": n_raw,
-                    "weight": round(t[side], 4),
-                    "weight_total": round(total_w, 4),
-                    "families": sorted(fam_rows[(axis, value)]),
-                    "median_delta": statistics.median(d) if d else None,
+                    # Cast at the wire boundary, not in the arithmetic: Fraction
+                    # is not JSON-serialisable, and the share is rendered from
+                    # the exact ratio rather than from two rounded floats.
+                    "weight": round(float(t[side]), 4),
+                    "weight_total": round(float(total_w), 4),
+                    "weight_share": float(t[side] / total_w),
+                    # The group count is the audit trail for the weighting: it is
+                    # exactly what `weight_total` counts, so a reader can check the
+                    # share without re-deriving the rule.
+                    "groups": len(groups_seen[(axis, value)]),
+                    "families": sorted({fam for fam, _reg in groups_seen[(axis, value)]}),
+                    "median_delta": weighted_median([v for v, _w in d], [w for _v, w in d]),
                 }
             )
     return found
@@ -2541,25 +2774,49 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
     unconditional literal text, so `grep -q parity` and `grep -q "publish the
     negative result"` both passed on a dataset with zero comparisons.
 
-    The majority is over (routine_family, regime)-BALANCED weight, not over raw
-    cells, for the same reason coherent_subsets() normalises by family: a raw
-    count makes bench.c's ladder a voter. This is the third appearance of that
-    defect and the first one on the regime axis, and the #2 ladder densification
-    is what surfaced it. Before it, the three regimes each contributed 20 cells
-    to the default fixture -- balanced by accident, so nothing showed. After it
-    they contribute 160/110/20, and the consequences are both directions of
-    wrong: an effect confined to small+medium clears a 60% majority on cell count
-    alone and reads as a campaign-level V1-SET-AHEAD, while an effect confined to
-    the large regime cannot reach 60% no matter how large it is, because large is
-    ~6% of the cells. The large regime is where the DDR generation and the L3 step
-    show, so that second failure would have silently removed the memory-side
+    **Nothing in this function is a fraction of raw cells.** Three quantities
+    decide the verdict and all three now run through balanced_weights():
+
+      the majority       which bucket carries --verdict-majority
+      the effect size    the median tested against --min-effect
+      the coverage guard the share tested against --max-nodata-fraction
+
+    They were fixed one at a time, in that order, and each fix made the next one's
+    absence louder -- a branch whose majority half was balanced and whose
+    effect-size half was raw is not half-right, it is a verdict whose two halves
+    disagree about what a cell is worth. The first was the third appearance of the
+    defect and the first on the regime axis: before the #2 densification the three
+    regimes each contributed 20 cells to the default fixture -- balanced by
+    accident, so nothing showed -- and after it they contribute 160/110/20, wrong
+    in both directions. An effect confined to small+medium clears a 60% majority on
+    cell count alone and reads as a campaign-level V1-SET-AHEAD; an effect confined
+    to the large regime cannot reach 60% no matter how large it is, because large
+    is ~6% of the cells. The large regime is where the DDR generation and the L3
+    step show, so that second failure would have silently removed the memory-side
     finding from the campaign's reach.
 
-    So each (family, regime) group contributes one unit of weight, divided among
-    its cells. Raw counts are still printed beside the fraction: the balanced
-    fraction is what decides, and the reader can see both. Asserted in both
-    directions by the fixtures -- a rule that could manufacture a direction out of
-    a genuine null would be worse than the false negative it fixes.
+    Raw counts are still printed beside every balanced fraction: the balanced one
+    decides, and the reader can see both. Asserted in both directions by the
+    fixtures -- a rule that could manufacture a direction out of a genuine null
+    would be worse than the false negative it fixes.
+
+    The coverage guard also has an ABSOLUTE half, and it needs one. A share can
+    always be diluted by densifying elsewhere, so no threshold on a fraction can
+    express "one whole family of the design did not compare"; `dark_groups` is a
+    count of (family, regime) groups in which nothing was measured at all, and a
+    single one of them refuses a directional verdict outright.
+
+    Dark is measured against DATA, not against a verdict, and the distinction is
+    load-bearing: a group whose cells compared and came out thin, split, or
+    unequal-N is not dark, it is inconclusive, and those are already counted.
+    Level-1's four lengths put exactly one size in the medium regime, so
+    (axpy, medium) and (dot, medium) are permanently `inconclusive(thin:1<3)` --
+    a property of the ladder, not a hole in the data. Reading those as dark made
+    every clean scenario INCONCLUSIVE, which is the coverage guard refusing the
+    design it was given rather than the data it was missing. So a cell lights its
+    group when `n_sizes > 0` on an admissible host, and the only two buckets that
+    leave it dark are `no_data` (nothing to compare) and `inadmissible` (a host
+    the campaign excluded).
 
     `exc` is read for one thing only: which routines an arm got WRONG. A wrong
     answer is not a slow answer. The kernel computed something other than the
@@ -2576,11 +2833,14 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
     order 4 says a failed verification poisons the record; this is that order at
     the one branch where the poison would have been published as a finding."""
     tally = defaultdict(int)
-    weight = defaultdict(float)
-    group_cells = defaultdict(int)
-    comparable_cells = []
+    weight = defaultdict(Fraction)
     per_ir = defaultdict(lambda: defaultdict(int))
     fam_cells = defaultdict(int)
+    # One entry per cross row, comparable or not. The nodata guard's denominator is
+    # the WHOLE cross, so both halves have to be weighted in the same group space
+    # or the fraction compares two different things.
+    all_groups = []
+    all_buckets = []
     deltas = []
     unverified = 0
     under = 0
@@ -2602,13 +2862,11 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
             bucket = "inconclusive"
         tally[bucket] += 1
         per_ir[(c["instance"], c["regime"])][bucket] += 1
+        fam = c.get("routine_family") or routine_family(c.get("routine"))
+        all_groups.append((fam, c["routine"], c["regime"]))
+        all_buckets.append(bucket)
         if bucket in ("v1_wins", "v2_wins", "parity"):
-            fam = c.get("routine_family") or routine_family(c.get("routine"))
             fam_cells[fam] += 1
-            group_cells[(fam, c["regime"])] += 1
-            comparable_cells.append((bucket, fam, c["regime"]))
-            if c["median_delta"] is not None:
-                deltas.append(c["median_delta"])
             if not c["verified"]:
                 unverified += 1
             if c.get("under_replicated"):
@@ -2617,18 +2875,93 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
 
     total = sum(tally.values())
     comparable = tally["v1_wins"] + tally["v2_wins"] + tally["parity"]
-    for bucket, fam, regime in comparable_cells:
-        weight[bucket] += 1.0 / group_cells[(fam, regime)]
-    weight_total = sum(weight.values())
 
-    def share(bucket):
-        """Balanced share of the comparable weight. Falls back to the raw
-        fraction only when there is no weight at all, which means no comparable
-        cells, which the INCONCLUSIVE branch above has already caught."""
-        return (weight[bucket] / weight_total) if weight_total else 0.0
+    COMPARABLE = ("v1_wins", "v2_wins", "parity")
+    # Two weightings, over two populations, and the distinction is the point.
+    #
+    #   cross_w  over EVERY cross row -- the denominator of the coverage guard,
+    #            which asks what share of the DESIGN is missing.
+    #   weight   over the comparable rows only -- the denominator of the verdict,
+    #            which asks what share of the MEASUREMENTS moved.
+    #
+    # Weighting the comparable rows inside the full cross instead would make a
+    # verdict share depend on how much data is absent, which is a different
+    # question and not this one.
+    cross_w = balanced_weights(all_groups)
+    cross_total = sum(cross_w, Fraction(0))
+    nodata_w = sum(
+        (w for w, b in zip(cross_w, all_buckets, strict=True) if b not in COMPARABLE),
+        Fraction(0),
+    )
+    nodata_share = (nodata_w / cross_total) if cross_total else Fraction(0)
+    # A (family, regime) group in which nothing was measured at all. This is the
+    # ABSOLUTE half of the coverage guard and it is what --max-nodata-fraction
+    # never was: no share, at any density, can express "one whole family of the
+    # design did not compare". A fraction can always be diluted by densifying
+    # somewhere else -- that is exactly what took dgemm's exclusion from 40% to
+    # 29% -- and a count of dark groups cannot.
+    #
+    # `n_sizes > 0` is the signal, not the verdict: a group that compared and came
+    # out thin or split is inconclusive, not dark. See the docstring for why --
+    # (axpy, medium) holds one level-1 length by construction and would otherwise
+    # make every scenario in the campaign INCONCLUSIVE forever.
+    group_lit = defaultdict(int)
+    for c, (fam, _routine, reg), b in zip(cross, all_groups, all_buckets, strict=True):
+        group_lit[(fam, reg)] += 1 if (b != "inadmissible" and c["n_sizes"] > 0) else 0
+    dark_groups = sorted(f"{fam}/{reg}" for (fam, reg), n in group_lit.items() if n == 0)
 
-    med = statistics.median(deltas) if deltas else None
+    cmp_rows = [(c, g, b) for c, g, b in zip(cross, all_groups, all_buckets, strict=True) if b in COMPARABLE]
+    cmp_w = balanced_weights([g for _c, g, _b in cmp_rows])
+    weight_total = sum(cmp_w, Fraction(0))
+    for (c, _g, b), w in zip(cmp_rows, cmp_w, strict=True):
+        weight[b] += w
+        if c["median_delta"] is not None:
+            deltas.append((c["median_delta"], w))
+
+    def majority(bucket):
+        """Whether this bucket carries --verdict-majority of the balanced
+        weight. Exact; see majority_met()."""
+        return majority_met(weight[bucket], weight_total, args.verdict_majority)
+
+    def pct(bucket):
+        """The same share, as a percentage, for printing only. Zero weight means
+        no comparable cells, which the INCONCLUSIVE branch has already caught."""
+        return float(100 * weight[bucket] / weight_total) if weight_total else 0.0
+
+    # The effect-size floor is tested against the RAW median, on purpose, and
+    # this is the one place in this function that is not balanced-weighted. Do
+    # not "fix" it — it is the counterweight that makes the branch below able to
+    # say MIXED.
+    #
+    # The directional branch asks two deliberately different questions, and it is
+    # only informative because they are different:
+    #
+    #   majority()  — how much of the DESIGN moved. Balanced, so the longest
+    #                 ladder cannot vote (that was defect 1).
+    #   med         — did the WORK move. Raw, so a family carrying 12 cells
+    #                 cannot speak for one carrying 240.
+    #
+    # Weighting both collapses them into one question asked twice. Measured:
+    # under a weighted median the `family-swamped` fixture — V1 ahead 22% on
+    # three of five families, which is the N2 gap and exactly the "where" this
+    # campaign exists to report — reads as a global V1-SET-AHEAD, because the
+    # three moving families carry 3/5 of balanced weight in the majority AND 3/5
+    # of it in the median. The MIXED branch becomes unreachable. The raw median
+    # is what notices that those three families are the small ones.
+    #
+    # The balanced median is kept as a diagnostic and printed where they diverge:
+    # a gap between them says the effect is concentrated in whichever routines
+    # have the longest ladders, which is a finding in itself and should not have
+    # to be inferred.
+    med = statistics.median([d for d, _w in deltas]) if deltas else None
+    med_bal = weighted_median([d for d, _w in deltas], [w for _d, w in deltas])
     band_pct = 100 * args.min_effect
+    # Printed only where a median is printed, and only when the two disagree by
+    # enough to matter (a tenth of the effect floor). Silence means the ladder is
+    # not skewing the aggregate, which is worth being able to see too.
+    skew = ""
+    if med is not None and med_bal is not None and abs(med - med_bal) > args.min_effect / 10:
+        skew = f" (balanced {100 * med_bal:+.1f}%, so the effect is unevenly spread across the design)"
     subsets = coherent_subsets(cross, args)
     poisoned = sorted({r.get("routine") for r in exc.verified_false} - {None})
 
@@ -2637,7 +2970,7 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
         located effect, so a reader never has to learn two phrasings for it."""
         return "; ".join(
             f"{s['axis']} {s['value']}: {s['direction']} set ahead in {s['wins']}/{s['comparable']} cells "
-            f"({100 * s['weight'] / s['weight_total']:.0f}% of family weight)"
+            f"({100 * s['weight_share']:.0f}% of family weight)"
             + (f" (median {100 * s['median_delta']:+.1f}%)" if s["median_delta"] is not None else "")
             for s in subsets[: args.max_listed]
         )
@@ -2648,14 +2981,19 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
             f"VERDICT: NO-DATA — no {args.v1_set}/{args.v2_set} comparison exists in this dataset; "
             f"nothing here can answer whether the N2 gap is worth closing"
         )
-    elif comparable == 0 or (total - comparable) / total > args.max_nodata_fraction:
+    elif comparable == 0 or nodata_share > as_exact(args.max_nodata_fraction) or dark_groups:
         code = "INCONCLUSIVE"
+        why = (
+            f"{', '.join(dark_groups[: args.max_listed])} was not measured at all"
+            if dark_groups
+            else f"{100 * float(nodata_share):.0f}% of the design's balanced weight is not comparable"
+        )
         line = (
-            f"VERDICT: INCONCLUSIVE — {total - comparable} of {total} cells have no comparable "
+            f"VERDICT: INCONCLUSIVE — {why}; {total - comparable} of {total} cells have no comparable "
             f"{args.v1_set}-set measurement (no_data={tally['no_data']}, "
             f"inconclusive={tally['inconclusive']}, inadmissible-host={tally['inadmissible']})"
         )
-    elif meets(share("v1_wins"), args.verdict_majority) or meets(share("v2_wins"), args.verdict_majority):
+    elif majority("v1_wins") or majority("v2_wins"):
         # A balanced majority is necessary for a directional headline and not
         # sufficient. It answers "how much of the experiment moved", and the
         # second question — "did the experiment move" — is an effect size, so it
@@ -2670,7 +3008,7 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
         # sourced from a minority of the work. The floor is --min-effect, the same
         # one the parity band uses, and it is signed — a V1 majority whose median
         # runs the other way is not a V1 headline either.
-        direction = "V1" if meets(share("v1_wins"), args.verdict_majority) else "V2"
+        direction = "V1" if majority("v1_wins") else "V2"
         bucket = "v1_wins" if direction == "V1" else "v2_wins"
         signed = (med or 0.0) if direction == "V1" else -(med or 0.0)
         if med is not None and signed >= args.min_effect:
@@ -2681,20 +3019,21 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
                 else ("against the V1 set; the NEON choice was right, publish the negative result")
             )
             line = (
-                f"VERDICT: {code} — median {100 * med:+.1f}% over {tally[bucket]}/{comparable} "
-                f"comparable cells ({100 * share(bucket):.0f}% of balanced weight), {tail}"
+                f"VERDICT: {code} — median {100 * med:+.1f}%{skew} over "
+                f"{tally[bucket]}/{comparable} comparable cells "
+                f"({pct(bucket):.0f}% of balanced weight), {tail}"
             )
         else:
             code = "MIXED"
-            shown = f"{100 * med:+.2f}%" if med is not None else "undefined"
+            shown = f"{100 * med:+.2f}%{skew}" if med is not None else "undefined"
             line = (
-                f"VERDICT: MIXED — the {direction} set carries {100 * share(bucket):.0f}% of balanced "
-                f"weight but only {tally[bucket]}/{comparable} comparable cells, and the median across "
-                f"all of them is {shown}, below the {band_pct:.0f}% floor. So the effect is located, "
+                f"VERDICT: MIXED — the {direction} set carries {pct(bucket):.0f}% of balanced "
+                f"weight but only {tally[bucket]}/{comparable} comparable cells, and the median "
+                f"across all of them is {shown}, below the {band_pct:.0f}% floor. So the effect is located, "
                 f"not global: {located()}. A balanced majority over a minority of the work is not a "
                 f"campaign-level direction"
             )
-    elif meets(share("parity"), args.verdict_majority) and not subsets and poisoned:
+    elif majority("parity") and not subsets and poisoned:
         # Parity everywhere the comparison ran, and a routine that never ran
         # because an arm got it wrong. See the docstring: this is refused as a
         # null on principle, not on a coverage threshold.
@@ -2706,14 +3045,14 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
             f"A null is a claim about the whole design; fix the correctness failure and re-run "
             f"before reading this as parity"
         )
-    elif meets(share("parity"), args.verdict_majority) and not subsets:
+    elif majority("parity") and not subsets:
         code = "NULL"
         line = (
             f"VERDICT: NULL — {args.v1_set}-set and {args.v2_set}-set at parity in "
             f"{tally['parity']}/{comparable} comparable cells "
-            f"({100 * share('parity'):.0f}% of balanced weight); publish the negative result"
+            f"({pct('parity'):.0f}% of balanced weight); publish the negative result"
         )
-    elif meets(share("parity"), args.verdict_majority):
+    elif majority("parity"):
         # A parity majority with a coherent minority is not a null. See
         # coherent_subsets(): the majority here is an artefact of how many cells
         # the unaffected routines contribute, so reporting NULL would publish a
@@ -2730,8 +3069,8 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
             f"VERDICT: MIXED — {tally['v1_wins']} cells favour the V1 set, {tally['v2_wins']} the V2 "
             f"set, {tally['parity']} at parity, of {comparable} comparable; no majority at "
             f"{100 * args.verdict_majority:.0f}% of balanced weight "
-            f"(V1 {100 * share('v1_wins'):.0f}%, V2 {100 * share('v2_wins'):.0f}%, "
-            f"parity {100 * share('parity'):.0f}%)"
+            f"(V1 {pct('v1_wins'):.0f}%, V2 {pct('v2_wins'):.0f}%, "
+            f"parity {pct('parity'):.0f}%)"
         )
     # A directional headline that rests on any intersected comparison is not a
     # full-replication claim, and must not be able to be read as one. The code
@@ -2759,7 +3098,12 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
         "no_data": tally["no_data"],
         "inconclusive": tally["inconclusive"],
         "inadmissible_host": tally["inadmissible"],
+        # median_delta is raw and is what the effect-size floor tested;
+        # median_delta_balanced is the diagnostic. See the comment above them.
         "median_delta": med,
+        "median_delta_balanced": med_bal,
+        "nodata_share_balanced": float(nodata_share),
+        "dark_groups": dark_groups,
         "min_effect": args.min_effect,
         "unverified_cells": unverified,
         "poisoned_routines": poisoned,

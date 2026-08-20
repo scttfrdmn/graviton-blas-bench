@@ -63,6 +63,26 @@ LDA_PADS_EXTRA_LARGE = (8,)
 PADDED_ROUTINES = ("dgemm", "dtrsm", "dsymm")
 REGIMES = ("small", "medium", "large")
 
+# The per-regime timing floor, copied like the ladders. This is not cosmetic: it
+# is part of decompose.py's comparison key (see canon_floor()), so a fixture that
+# omitted the field keyed every record at the legacy 0.30 s and no fixture
+# exercised the small floor at all. gates/p1.sh checks these two numbers against
+# bench.c's #defines AND checks that bench.c still passes them at the ladders this
+# mapping assumes -- the mapping lives in bench.c's sweep() call sites, so the
+# constants agreeing is not enough on its own.
+MIN_SECONDS = 0.300
+MIN_SECONDS_SMALL = 0.050
+
+
+def min_seconds_for(m):
+    """The floor bench.c measured this size under.
+
+    bench.c passes MIN_SECONDS_SMALL for SIZES_SMALL and MIN_SECONDS for the other
+    two ladders, and sets g_min_seconds = MIN_SECONDS explicitly for level 1. The
+    level-1 lengths start at 1024, so keying off the ladder membership reproduces
+    all four call sites exactly."""
+    return MIN_SECONDS_SMALL if m in SIZES_SMALL else MIN_SECONDS
+
 
 # bench.c's regime boundaries, likewise.
 def regime(n):
@@ -197,6 +217,20 @@ class Arm:
     # remove the whole arm: this is the "arm ran and produced only some sizes"
     # case that decompose.py counts as `partial`, and it was inexpressible.
     omit_sizes: tuple = ()
+    # {routine: sizes} -- sizes this arm produced no record for, on ONE routine.
+    # omit_sizes cuts the same sizes out of every routine, which kills a whole
+    # regime across every family at once; this cuts one family's regime and leaves
+    # the rest of the design intact. That is the shape the ABSOLUTE half of the
+    # coverage guard exists for (a sweep that died inside dtrsm's large ladder --
+    # n=8192 TRSM is the campaign's largest working set), and it was inexpressible:
+    # with a fraction-of-cells guard alone, one dark (family, regime) group out of
+    # twelve is ~8% of the design and passes a 34% threshold unnoticed.
+    omit_routine_sizes: dict = field(default_factory=dict)
+    # Transposes ("NN"/"TN"/...) this arm produced no record for at all. An arm that
+    # ran NN and never ran TN is what a SIGILL in one copy kernel looks like, and
+    # until transa/transb were part of the COVERAGE census key it was recorded as
+    # "some sizes absent" on a merged cell rather than as a whole missing transpose.
+    omit_trans: tuple = ()
     # Routines this arm produced no record for at all. The reference arm's version
     # of omit_sizes, and the only way to reach section 1's per-arm "NO DATA --
     # reference arm absent" branch: a reference library that ran but has no kernel
@@ -463,7 +497,11 @@ def bench_records(sc: Scenario, host: HostSpec):
             for routine, m, n, k, pad, incx, ta, tb in conds:
                 if m in arm.omit_sizes or routine in arm.omit_routines:
                     continue
+                if m in arm.omit_routine_sizes.get(routine, ()):
+                    continue
                 trans = f"{ta}{tb}" if ta is not None else None
+                if trans is not None and trans in arm.omit_trans:
+                    continue
                 # The transpose enters the noise key only when it exists, so adding
                 # the axis leaves every pre-existing fixture's numbers bit-identical:
                 # a scenario whose verdict moved because an unrelated field joined a
@@ -529,6 +567,9 @@ def bench_records(sc: Scenario, host: HostSpec):
                             "reps": 15,
                             "batch": 1,
                             "calls": 15,
+                            # Part of the comparison key, so it is emitted per
+                            # regime the way bench.c does rather than left absent.
+                            "min_seconds": min_seconds_for(m),
                             "timer_overhead_ns": 21.0,
                             "timer_res_ns": 1.0,
                             "t_min": t_min,
@@ -2860,6 +2901,202 @@ def sc_topology_defaulted():
     )
 
 
+def sc_nodata_group_hole():
+    """One (family, regime) group measured nowhere, under a coverage fraction that
+    passes -- the absolute half of the coverage guard, planted.
+
+    The kernel sets are at parity everywhere they compared, so without the guard
+    this dataset reads out as "VERDICT: NULL -- publish the negative result". The
+    hole is dtrsm's entire large regime on the V1 side: n=2048..8192 produced no
+    record, which is what a sweep dying inside one routine's largest working set
+    looks like. TRSM at n=8192 is the campaign's biggest allocation and the most
+    likely single place for that to happen.
+
+    The point is the arithmetic, and it is sharper than a single number. Twelve
+    (family, regime) groups exist here and three of them are not comparable, so
+    nodata_share_balanced is 3/12 = 25% -- under --max-nodata-fraction's 34%, and
+    the fraction passes. But only ONE of those three is a hole: the other two are
+    (axpy, medium) and (dot, medium), which hold a single level-1 length each
+    against --min-sizes 3 and are thin by construction, forever, on every host.
+    The real hole is 1 of 12 = 8%.
+
+    So the fraction is simultaneously too high to be about the hole and too low to
+    refuse the dataset, and no threshold fixes both: raising it to catch 8% would
+    reject every campaign dataset ever produced on the two permanent thin groups,
+    and leaving it at 34% publishes the null. A fraction can also always be diluted
+    by densifying somewhere else -- which is precisely what took dgemm's total
+    exclusion from 40% of the cross to 29% and let the verify-fail fixture publish a
+    negative result over a kernel returning wrong answers. So the guard is a COUNT
+    of dark groups, and one of them refuses a directional verdict outright.
+
+    Large is also the regime where the DDR generation and the L3 step show, which
+    makes "publish a null with TRSM-large missing" the specific wrong answer this
+    campaign is most exposed to.
+
+    Dark is measured against data, not against a verdict: this scenario's mutation
+    partner is the over-firing direction, where treating a THIN group as dark turns
+    (axpy, medium) -- one level-1 length, by construction -- into a hole and makes
+    every clean scenario INCONCLUSIVE."""
+    dark = _arms(v1_gain=flat(1.0), v2_gain=flat(1.0))
+    for a in dark:
+        if a.coretype == V1 or a.target == V1:
+            a.omit_routine_sizes = {"dtrsm": SIZES_LARGE}
+    return Scenario(
+        name="nodata-group-hole",
+        description=(
+            "Parity everywhere that compared, and dtrsm's entire large regime absent on "
+            "the V1 side. 3 of 12 groups are non-comparable (25%, under the 34% threshold) "
+            "but only one is a hole -- the other two are thin by construction."
+        ),
+        hosts=[_host()],
+        arms=dark,
+        expect=[
+            # The refusal, and the reason for it, named as the group that is dark.
+            {"kind": "verdict_code", "one_of": ["INCONCLUSIVE"]},
+            {"kind": "json_strings", "path": "verdict.dark_groups", "expect": ["trsm/large"]},
+            {"kind": "stdout_contains", "text": "trsm/large was not measured at all"},
+            # The counterfactual: the fraction alone does NOT catch this, so a guard
+            # that were only a fraction would publish the line below.
+            {
+                "kind": "json_number",
+                "path": "verdict.nodata_share_balanced",
+                "op": "<=",
+                "value": 0.34,
+            },
+            {"kind": "stdout_absent", "text": "publish the negative result"},
+            # ...and the hole is confined to where it was planted. Every other
+            # group compared, so this is not "the dataset is broken", it is
+            # "one group of the design is missing and the rest is fine".
+            {"kind": "cross_verdicts_where", "routine": "dgemm", "expect": "parity", "min_rows": 3},
+            {"kind": "cross_nodata_where", "routine": "dtrsm", "regime": "large", "min_rows": 1},
+            {"kind": "exit_bits_clear", "bits": [2, 16]},
+        ],
+    )
+
+
+def sc_medium_large_localised():
+    """An effect in medium+large that raw cell counts cannot see, because the pad
+    axis is not there.
+
+    dtrsm carries four extra lda_pads at small and medium and only one at large
+    (LDA_PADS_EXTRA vs LDA_PADS_EXTRA_LARGE -- an 8192x8192 padded DTRSM is
+    expensive and the campaign buys one pad there, not four). So dtrsm's cross rows
+    are 5 small, 5 medium, 1 large. An effect on medium+large is 6 of 11 rows =
+    55%, under the 60% majority; balanced by (family, regime) it is 2 of 3 = 67%,
+    over it.
+
+    That gap is the defect class in its subtlest form. The pad values are the same
+    hardware claim re-asked at a different alignment, so counting them as
+    independent votes lets the alignment axis decide whether a REGIME effect is
+    reportable -- and it decides against the large regime specifically, which is
+    where the DDR generation and the L3 step live. `family-swamped` plants the
+    same class on the family axis and `v1-ahead-small` plants a regime effect broad
+    enough for either weighting; neither can fail on this one, because neither has
+    an axis whose density differs BETWEEN regimes of one routine.
+
+    Deliberately not a campaign-level headline: one family of five moved, so MIXED
+    is the honest verdict and the subset is where the answer lives."""
+    return Scenario(
+        name="medium-large-localised",
+        description=(
+            "The V1 set is 22% ahead on dtrsm in medium and large only. dtrsm holds 5 "
+            "small, 5 medium and 1 large row because large buys one lda_pad, so raw "
+            "counts make the effect 55% (under threshold) and balanced weight makes it 67%."
+        ),
+        hosts=[_host()],
+        arms=_arms(
+            v1_gain={"small": 1.0, "medium": 1.22, "large": 1.22},
+            routines=("dtrsm",),
+        ),
+        expect=[
+            # Where it was planted, in both regimes, and absent from small.
+            {
+                "kind": "cross_verdicts_where",
+                "routine": "dtrsm",
+                "regime": "medium",
+                "expect": "V1-set-ahead",
+                "min_rows": 3,
+            },
+            {
+                "kind": "cross_verdicts_where",
+                "routine": "dtrsm",
+                "regime": "large",
+                "expect": "V1-set-ahead",
+                "min_rows": 1,
+            },
+            {
+                "kind": "cross_verdicts_where",
+                "routine": "dtrsm",
+                "regime": "small",
+                "expect": "parity",
+                "min_rows": 3,
+            },
+            # One family of five moved, so no directional headline.
+            {"kind": "verdict_code", "one_of": ["MIXED"]},
+            {"kind": "stdout_absent", "text": "publish the negative result"},
+            # THE discriminating assertion. Balanced, dtrsm carries 2 of its 3
+            # (family, regime) groups = 66.7% and qualifies; raw, it is 28 of 48
+            # rows = 58.3% and does not. So a raw-count coherent_subsets reports no
+            # subset at all here, the parity majority stands unopposed, and the
+            # verdict becomes NULL over a 22% effect across two whole regimes.
+            {"kind": "coherent_subsets", "expect": ["routine:dtrsm:V1"]},
+            {"kind": "stdout_contains", "text": "V1 set ahead in 28/48 cells (67% of family weight)"},
+            {"kind": "exit_bits_clear", "bits": [2, 16]},
+        ],
+    )
+
+
+def sc_transpose_lost():
+    """An arm that ran NN and never ran TN at all -- the coverage census key, and
+    why transa/transb had to be in it.
+
+    `transpose-shopping` proves the axis has to be in the COMPARISON key, so the
+    two transposes do not share a cell and let each arm be scored on its favourite.
+    This is the other key: section 7's census cell was
+    (threads, routine, regime, lda_pad, incx), with no transpose in it, so an arm
+    that produced NN and nothing at all for TN was recorded as `partial` -- "some
+    sizes of this cell are absent" -- when the truth was "this arm never ran TN".
+    Those are different claims and standing order 11 turns on the difference: a
+    partial cell reads as a truncated ladder, and a whole missing transpose is one
+    copy kernel that did not execute. A SIGILL in `dgemm_tcopy` on a cross-built
+    arm is exactly that, and it is a P2 hazard rather than a hypothetical.
+
+    So the assertion is on the STATUS, not on a count of cells: with the transpose
+    in the key the TN cells are MISSING-UNEXPLAINED and nothing is `partial`;
+    without it, the merged cell is `partial` and missing_unexplained is zero. The
+    two implementations disagree on both numbers in opposite directions, which is
+    what makes this fixture able to fail."""
+    lost = _arms()
+    for a in lost:
+        if a.coretype == V1:
+            a.omit_trans = ("TN",)
+    return Scenario(
+        name="transpose-lost",
+        description=(
+            "One arm produced NN records and no TN records whatsoever. With transa/transb "
+            "in the census cell key that is MISSING-UNEXPLAINED on the TN cells; without "
+            "them it is a `partial` cell, which reads as a truncated size ladder instead."
+        ),
+        hosts=[_host()],
+        routines=("dgemm",),
+        level1=False,
+        transposes=(("N", "N"), ("T", "N")),
+        arms=lost,
+        expect=[
+            # The whole missing transpose is a hole, and it is reported as one.
+            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": ">=", "value": 1},
+            {"kind": "stdout_contains", "text": "tr=TN"},
+            # ...and NOT as a truncated ladder. This is the assertion the old key
+            # fails: merged, the cell has NN records in it and reads `partial`.
+            {"kind": "json_number", "path": "coverage.partial", "op": "==", "value": 0},
+            {"kind": "exit_bits_set", "bits": [4]},
+            # The arm that did run TN still compares there, so the hole is a hole
+            # and not a collapse of the axis.
+            {"kind": "cross_rows_have_trans", "routine": "dgemm", "values": ["NN", "TN"]},
+        ],
+    )
+
+
 def sc_probe_inapplicable():
     """The DYNAMIC_ARCH probe did not run because the DYNAMIC build failed, so
     there was nothing to probe.
@@ -2998,6 +3235,9 @@ SCENARIOS = {
         sc_probe_unavailable,
         sc_probe_inapplicable,
         sc_topology_defaulted,
+        sc_nodata_group_hole,
+        sc_medium_large_localised,
+        sc_transpose_lost,
     )
 }
 
@@ -3161,6 +3401,20 @@ def check_one(exp, report, stdout, exit_code, root):
             hit,
             f"coherent subsets {got}, want {'exactly' if exp.get('exact', True) else 'at least'} {want}",
         )
+
+    if kind == "json_strings":
+        # A list-of-strings field, asserted as an exact sorted set. json_len would
+        # pass on a guard that fires on the wrong group, and that is the failure
+        # this is guarding: `dark_groups` refuses a directional verdict outright, so
+        # a version that over-fires converts every clean scenario into
+        # INCONCLUSIVE -- which is exactly what the first draft did, on
+        # (axpy, medium) and (dot, medium), whose single level-1 length is a
+        # property of the ladder and not a hole in the data.
+        got = dig(report, exp["path"])
+        if not isinstance(got, list) or any(not isinstance(x, str) for x in got):
+            return False, f"{exp['path']} is {got!r}, not a list of strings"
+        want = sorted(exp["expect"])
+        return sorted(got) == want, f"{exp['path']}={sorted(got)}, want exactly {want}"
 
     if kind == "json_len":
         # For the report's list-valued fields -- `inputs.files.<family>` is the

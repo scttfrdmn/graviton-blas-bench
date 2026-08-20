@@ -176,8 +176,161 @@ else
   bad "pad 0 appears in an extra-pad table ($pad0) — the base sweep emits that condition too"
 fi
 
-# ---- 3. every scenario ----------------------------------------------------
-head_ "3. planted scenarios"
+# The timing floor is a third hand-copy of a bench.c constant, and it decides
+# comparisons rather than just describing them: decompose.py keys every cell by
+# the floor it was measured under, and a record with no min_seconds field is
+# keyed as LEGACY_MIN_SECONDS. If that default stops matching the floor bench.c
+# actually uses for medium and large, a fieldless record is silently keyed APART
+# from its own siblings and quietly stops comparing -- the one failure mode a
+# default is supposed to prevent. Also asserted: the small floor is genuinely
+# different, because if it were not, the per-regime floor and the whole n=192..384
+# overlap band would be measuring nothing.
+if floors=$("$PY" - <<'EOF'
+import importlib.util, pathlib, re, sys
+
+src = pathlib.Path("src/bench.c").read_text()
+
+
+def define(name):
+    m = re.search(r"^\s*#define\s+" + re.escape(name) + r"\s+([0-9.eE+-]+)", src, re.M)
+    return float(m.group(1)) if m else None
+
+
+spec = importlib.util.spec_from_file_location("dc", pathlib.Path("analysis/decompose.py"))
+dc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dc)
+
+sspec = importlib.util.spec_from_file_location("synth", pathlib.Path("tools/synth.py"))
+synth = importlib.util.module_from_spec(sspec)
+sspec.loader.exec_module(synth)
+
+bad = []
+c_default, c_small = define("MIN_SECONDS"), define("MIN_SECONDS_SMALL")
+if c_default is None or c_small is None:
+    bad.append("could not read MIN_SECONDS / MIN_SECONDS_SMALL out of src/bench.c")
+else:
+    if dc.LEGACY_MIN_SECONDS != c_default:
+        bad.append(f"LEGACY_MIN_SECONDS={dc.LEGACY_MIN_SECONDS} but bench.c MIN_SECONDS={c_default}")
+    if (synth.MIN_SECONDS, synth.MIN_SECONDS_SMALL) != (c_default, c_small):
+        bad.append(
+            f"synth.py has ({synth.MIN_SECONDS}, {synth.MIN_SECONDS_SMALL}) "
+            f"but bench.c has ({c_default}, {c_small})"
+        )
+
+# The constants agreeing is not the same as the MAPPING agreeing, and the mapping
+# lives in bench.c's sweep() call sites, not in a table. min_seconds_for() assumes
+# SIZES_SMALL -> MIN_SECONDS_SMALL and the other two ladders -> MIN_SECONDS, so
+# that assumption is read straight back off the call sites. A future sweep() call
+# that floors SIZES_MEDIUM at the small floor would make every medium fixture
+# record claim a floor bench.c never used.
+calls = re.findall(
+    r"sweep\(\s*[^,]+,\s*(SIZES_\w+)\s*,[^,]+,[^,]+,\s*(MIN_SECONDS\w*)\s*\)", src
+)
+seen = {}
+for ladder, floor in calls:
+    seen.setdefault(ladder, set()).add(floor)
+want = {
+    "SIZES_SMALL": {"MIN_SECONDS_SMALL"},
+    "SIZES_MEDIUM": {"MIN_SECONDS"},
+    "SIZES_LARGE": {"MIN_SECONDS"},
+}
+if not calls:
+    bad.append("no sweep(ladder, ..., floor) call sites matched in src/bench.c")
+elif seen != want:
+    bad.append(f"bench.c's ladder->floor mapping is {seen}, min_seconds_for() assumes {want}")
+# Level 1 does not go through sweep(); bench.c sets the floor by hand there.
+if not re.search(r"g_min_seconds\s*=\s*MIN_SECONDS\s*;", src):
+    bad.append("bench.c's level-1 block no longer sets g_min_seconds = MIN_SECONDS")
+if c_default is not None:
+    for m, want_floor in ((8, c_small), (256, c_small), (320, c_default), (1024, c_default)):
+        if synth.min_seconds_for(m) != want_floor:
+            bad.append(f"min_seconds_for({m})={synth.min_seconds_for(m)}, want {want_floor}")
+    if c_small == c_default:
+        bad.append(f"MIN_SECONDS_SMALL == MIN_SECONDS == {c_default}: the per-regime floor is a no-op")
+    # A fieldless record and an explicit medium/large record must land on ONE key.
+    if dc.canon_floor(None) != dc.canon_floor(c_default):
+        bad.append("canon_floor(None) does not equal canon_floor(MIN_SECONDS)")
+    # ...and the two floors must land on two.
+    if dc.canon_floor(c_small) == dc.canon_floor(c_default):
+        bad.append("canon_floor collapses the two floors into one key")
+    # The key is the number as bench.c prints it (%.3f), not a float.
+    if dc.canon_floor(0.05) != "0.050" or dc.canon_floor(0.0500000001) != "0.050":
+        bad.append(f"canon_floor is not quantised to bench.c's %.3f: {dc.canon_floor(0.0500000001)!r}")
+
+print("; ".join(bad) if bad else f"default={c_default} small={c_small}, legacy default matches, keys distinct")
+sys.exit(1 if bad else 0)
+EOF
+); then
+  ok "MIN_SECONDS floors agree with src/bench.c: $floors"
+else
+  bad "the timing-floor copy drifted — $floors"
+fi
+
+# ---- 3. the majority comparison is exact ----------------------------------
+# A property of decompose.py, not of any dataset, and it has to be checked here
+# because no fixture can reach it: the default --verdict-majority of 0.60 is one
+# of the thresholds whose double rounds just UNDER, so a dataset sitting exactly
+# on it clears a float comparison by luck. 0.34 and 0.55 round just over and
+# would fail. The campaign's own --max-nodata-fraction is 0.34, so this is not a
+# hypothetical threshold.
+head_ "3. majority arithmetic is exact (no tolerance constant)"
+if exact=$("$PY" - <<'EOF'
+import importlib.util, pathlib, sys
+from fractions import Fraction
+
+spec = importlib.util.spec_from_file_location("dc", pathlib.Path("analysis/decompose.py"))
+dc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dc)
+
+bad = []
+
+# 1. The threshold is read as the decimal that was written, not as a double.
+for thr, want in ((0.60, Fraction(3, 5)), (0.55, Fraction(11, 20)), (0.34, Fraction(17, 50))):
+    got = dc.as_exact(thr)
+    if got != want:
+        bad.append(f"as_exact({thr}) = {got}, want {want}")
+
+# 2. Weight landing EXACTLY on the threshold clears it, at every threshold --
+#    including the ones a float comparison gets wrong.
+for thr in (0.34, 0.5, 0.55, 0.60, 0.7, 0.75, 0.9):
+    e = Fraction(str(thr))
+    if not dc.majority_met(e, Fraction(1), thr):
+        bad.append(f"exact {e} does not clear a threshold of {thr}")
+    # and just under must NOT clear it, or the check above is vacuous
+    if dc.majority_met(e - Fraction(1, 1000), Fraction(1), thr):
+        bad.append(f"{e} - 1/1000 wrongly clears a threshold of {thr}")
+
+# 3. Summation order cannot change the answer. Five groups, three one-sided:
+#    3/5 = exactly the default majority, assembled from reciprocals of unequal
+#    group sizes so a float sum would depend on the order.
+sizes = (24, 160, 7, 13, 96)
+one = [Fraction(1, n) for n in sizes for _ in range(n)]
+fwd = sum(one[: sizes[0] + sizes[1] + sizes[2]], Fraction(0))
+rev = sum(reversed(one[: sizes[0] + sizes[1] + sizes[2]]), Fraction(0))
+tot = sum(one, Fraction(0))
+if fwd != rev or fwd != 3 or tot != 5:
+    bad.append(f"reciprocal sums are order-dependent: fwd={fwd} rev={rev} total={tot}")
+if not (dc.majority_met(fwd, tot, 0.60) and dc.majority_met(rev, tot, 0.60)):
+    bad.append("3 of 5 balanced groups does not clear a 0.60 majority")
+
+# 4. No epsilon left behind. The point of the swap is that the constant is gone,
+#    not that it is unused: a reader who finds one will reasonably assume the
+#    comparison still needs a tolerance.
+src = pathlib.Path("analysis/decompose.py").read_text()
+if "MAJORITY_EPS" in src:
+    bad.append("MAJORITY_EPS is back in decompose.py")
+
+print("; ".join(bad) if bad else "exact on the boundary, order-independent, no epsilon")
+sys.exit(1 if bad else 0)
+EOF
+); then
+  ok "majority comparisons are exact: $exact"
+else
+  bad "majority arithmetic is not exact — $exact"
+fi
+
+# ---- 4. every scenario ----------------------------------------------------
+head_ "4. planted scenarios"
 SCENARIOS=$("$PY" tools/synth.py list | grep -v '^ ' | grep -v '^$')
 if [ -z "$SCENARIOS" ]; then
   bad "tools/synth.py list produced no scenarios"
@@ -216,12 +369,12 @@ for s in $SCENARIOS; do
   fi
 done
 
-# ---- 4. the three CLAUDE.md clauses, asserted by name ---------------------
+# ---- 5. the three CLAUDE.md clauses, asserted by name ---------------------
 # The scenario loop above already covers these, but it covers them as one line
 # among many. The gate table names them specifically, so they are restated here
 # as named requirements: a green gate should be readable against the row that
 # demanded it, not just against a pass count.
-head_ "4. CLAUDE.md's P1 row, clause by clause"
+head_ "5. CLAUDE.md's P1 row, clause by clause"
 clause() {
   local label="$1" scen="$2"
   if [ ! -f "$WORK/$scen/report.json" ]; then
@@ -265,10 +418,10 @@ EOF
   fi
 fi
 
-# ---- 5. exit-code bits are distinct --------------------------------------
+# ---- 6. exit-code bits are distinct --------------------------------------
 # The bits are the gate's only machine-readable channel. If two different
 # failures set the same bit, no downstream gate can tell them apart.
-head_ "5. exit bits are distinguishable"
+head_ "6. exit bits are distinguishable"
 bit_of() { "$PY" -c "import sys;print(int(sys.argv[1]) & int(sys.argv[2]))" "$1" "$2"; }
 declare -a BITCASES=(
   "all-arms-failed:1:nothing loaded"
