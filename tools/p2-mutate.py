@@ -70,13 +70,15 @@ def drop_arm(coretype=None, threads=None):
     for p in _bench_files():
         n += _rewrite(
             p,
-            lambda r: None
-            if (
-                _is_bench(r)
-                and (coretype is None or (r.get("coretype") or "").upper() == coretype.upper())
-                and (threads is None or r.get("threads") == threads)
-            )
-            else r,
+            lambda r: (
+                None
+                if (
+                    _is_bench(r)
+                    and (coretype is None or (r.get("coretype") or "").upper() == coretype.upper())
+                    and (threads is None or r.get("threads") == threads)
+                )
+                else r
+            ),
         )
     where = "" if threads is None else f" at threads={threads}"
     return f"dropped {n} bench records for coretype={coretype}{where}"
@@ -138,19 +140,28 @@ def truncate_arm(coretype, keep=0.8):
             if key not in seen:
                 seen.add(key)
                 cases.append(key)
-    cut = set(cases[int(len(cases) * keep):])
+    cut = set(cases[int(len(cases) * keep) :])
     n = 0
     for p in _bench_files():
         n += _rewrite(
             p,
-            lambda r: None
-            if (
-                _is_bench(r)
-                and (r.get("coretype") or "").upper() == coretype.upper()
-                and (r.get("routine"), r.get("m"), r.get("n"), r.get("k"), r.get("lda_pad"), r.get("incx"))
-                in cut
-            )
-            else r,
+            lambda r: (
+                None
+                if (
+                    _is_bench(r)
+                    and (r.get("coretype") or "").upper() == coretype.upper()
+                    and (
+                        r.get("routine"),
+                        r.get("m"),
+                        r.get("n"),
+                        r.get("k"),
+                        r.get("lda_pad"),
+                        r.get("incx"),
+                    )
+                    in cut
+                )
+                else r
+            ),
         )
     return f"cut {len(cut)} of {len(cases)} cases ({n} records) from coretype={coretype}"
 

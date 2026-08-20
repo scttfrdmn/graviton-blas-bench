@@ -17,7 +17,7 @@
 # Needs no OpenBLAS and no Graviton: a stub exporting openblas_get_corename and
 # no-op BLAS entry points is enough, because the assertion runs before the sweep.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || { printf 'FATAL: cannot cd to the repo root\n' >&2; exit 1; }
 CC="${CC:-gcc}"
 W="$(mktemp -d)"
 trap 'rm -rf "$W"' EXIT

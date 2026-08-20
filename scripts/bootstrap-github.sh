@@ -17,10 +17,13 @@ set -uo pipefail
 
 REPO="${GBB_REPO:-scttfrdmn/graviton-blas-bench}"
 OWNER="${REPO%%/*}"
-NAME="${REPO##*/}"
 DRY_RUN="${DRY_RUN:-}"
 
 log()  { printf '[bootstrap] %s\n' "$*" >&2; }
+# shellcheck disable=SC2294  # eval is load-bearing here: callers pass
+# pre-quoted arguments (label names and descriptions containing spaces are
+# wrapped in literal single quotes at the call site), so "$@" would pass the
+# quotes through to gh as data. Dropping eval changes what gets created.
 run()  { if [ -n "$DRY_RUN" ]; then printf '[dry-run] %s\n' "$*" >&2; else eval "$@"; fi; }
 
 command -v gh >/dev/null || { log "FATAL: gh not installed"; exit 1; }

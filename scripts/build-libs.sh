@@ -86,7 +86,7 @@ release_locks() {
   for d in "${LOCKS[@]:-}"; do [ -n "$d" ] && rm -rf "$d"; done
 }
 take_lock() {
-  local dir="$1" what="$2" lock="$1/.gbb-build.lock"
+  local what="$2" lock="$1/.gbb-build.lock"
   if ! mkdir "$lock" 2>/dev/null; then
     local owner
     owner="$(cat "$lock/owner" 2>/dev/null || echo 'unknown -- no owner file')"
@@ -245,26 +245,84 @@ jstr() {
 # installed artifact rather than inferred from the variables we passed, and the
 # static archive is used because it is installed unstripped by every variant.
 #   yes / no / unknown -- `unknown` means we could not look, not that it is fine.
+#
+# DO NOT rewrite the nm call as `nm ... | grep -q ...`. That was the original form
+# and it was broken in the worst available direction. `grep -q` exits on its first
+# match; nm then dies on SIGPIPE; and under this script's `set -o pipefail` (line
+# 33) the pipeline reports 141. So:
+#
+#     SVE present -> grep matches early -> nm killed 141 -> pipefail -> `no`
+#     SVE absent  -> grep reads all, exits 1             -> pipefail -> `no`
+#
+# It was a constant function returning `no` -- incapable of ever printing `yes` --
+# which made standing order 8's escalation channel a wire that was always live.
+# It fired on all four OpenBLAS builds of the first P2 pass (2026-08-20,
+# 20260820T031023Z-ip-172-31-36-19) while SVE was demonstrably present: 1092
+# matching defined symbols, `dgemm_kernel_ARMV8SVE` among them, 135312 SVE
+# instructions in the .so, and a measured GEMM_SMALL effect that cannot exist
+# without SVE kernels. A checker that cries wolf on the one condition CLAUDE.md
+# says outweighs every other question in this repo is worse than no checker,
+# because the next reader discounts it.
+#
+# So: capture nm's output whole, keep its exit status, and count with `grep -c`,
+# which consumes all of its input and cannot induce SIGPIPE in its producer.
+#
+# The answer is also logged as it is taken. The pipefail bug above survived a whole
+# P2 pass because the only place its output was ever read was decompose.py, hours
+# later and on another machine; `log` goes to stderr and workload.sh folds stderr
+# into build.log, so from here on the probe states its finding on the path every
+# build already takes.
 sve_kernels() {
-  local dest="$1" lib
-  command -v nm >/dev/null 2>&1 || { printf 'unknown'; return 0; }
-  for lib in "$dest/lib/libopenblas.a" "$dest/lib64/libopenblas.a"; do
-    [ -f "$lib" ] || continue
-    if nm --defined-only "$lib" 2>/dev/null | grep -qE '(ARMV8SVE|_sve|sve_)'; then
-      printf 'yes'
-    else
-      printf 'no'
-    fi
-    return 0
-  done
-  printf 'unknown'
+  local dest="$1" lib found out rc n ans
+  ans=unknown
+  found=
+  if ! command -v nm >/dev/null 2>&1; then
+    log "  nm is not on PATH, so SVE symbols cannot be read"
+  else
+    for lib in "$dest/lib/libopenblas.a" "$dest/lib64/libopenblas.a"; do
+      [ -f "$lib" ] || continue
+      found=$lib
+      out=""; rc=0
+      # `|| rc=$?` and not a bare assignment: `set -e` would abort the whole
+      # build on a failed nm, treating a probe failure as a build failure.
+      out="$(nm --defined-only "$lib" 2>/dev/null)" || rc=$?
+      # A failed nm, or an archive whose symbol table reads as empty, is "we
+      # could not look" -- `unknown`, not `no`. Collapsing the two is the same
+      # class of mistake as the pipefail bug above: decompose.py treats `no` as
+      # the escalation and `unknown` as a provenance gap, and those are
+      # different claims about the library. nm prints nothing and exits
+      # non-zero on a truncated or non-archive file, so without this branch a
+      # half-written archive reads as a confirmed absence of SVE.
+      if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+        log "  nm on $lib failed (rc=$rc) or read an empty symbol table"
+      else
+        n="$(printf '%s\n' "$out" | grep -cE '(ARMV8SVE|_sve|sve_)' || true)"
+        if [ "${n:-0}" -gt 0 ]; then ans=yes; else ans=no; fi
+        log "  $lib: ${n:-0} SVE-matching defined symbols"
+      fi
+      break
+    done
+    [ -n "$found" ] || log "  no libopenblas.a under $dest/lib or $dest/lib64"
+  fi
+  log "sve_kernels($(basename "$dest")) = $ans"
+  printf '%s' "$ans"
 }
 
 # arm_record <library> <target> <blas_sha> <built> <runnable> <reason>
 #            <thread_backend> <exe> <prefix> <sve_kernels>
+# `target` is what was REQUESTED of the build. `target_effective` is what the
+# built library reports at runtime, and it defaults to null -- meaning no read-back
+# was attempted -- rather than to a copy of the request. Standing order 10 is about
+# exactly this asymmetry: a request echoed back as if it were an observation is not
+# a failed measurement, it is a plausible wrong label. The BLIS arm shipped a whole
+# P2 pass as `target: "auto"` with nothing recording what `auto` resolved to, which
+# is the same defect one library over from labelling an OpenBLAS arm with
+# OPENBLAS_CORETYPE instead of openblas_get_corename().
 arm_record() {
-  printf '{"record":"arm","library":"%s","target":"%s","coretype":null,"blas_sha":"%s",' \
-    "$(jstr "$1")" "$(jstr "$2")" "$(jstr "$3")"
+  printf '{"record":"arm","library":"%s","target":"%s","target_effective":%s,' \
+    "$(jstr "$1")" "$(jstr "$2")" \
+    "$([ -n "${11:-}" ] && printf '"%s"' "$(jstr "${11}")" || printf 'null')"
+  printf '"coretype":null,"blas_sha":"%s",' "$(jstr "$3")"
   printf '"built":%s,"runnable":%s,"reason":"%s","thread_backend":"%s",' \
     "$4" "$5" "$(jstr "$6")" "$(jstr "$7")"
   printf '"exe":"%s","prefix":"%s","sve_kernels":"%s"}\n' \
@@ -404,7 +462,60 @@ git -C "$SRCDIR/blis" fetch --quiet --tags origin
 git -C "$SRCDIR/blis" checkout --quiet --detach "$BLIS_REF" 2>/dev/null \
   || git -C "$SRCDIR/blis" checkout --quiet "$BLIS_REF"
 BLIS_SHA="$(git -C "$SRCDIR/blis" rev-parse HEAD)"
-BLIS_CONF="${BLIS_CONFIG:-auto}"
+
+# The config is CHOSEN from the host, not left to `configure auto`.
+#
+# WHY, measured rather than assumed. On the first P2 pass (c8g.metal-48xl,
+# Neoverse V2) `auto` produced a library that ran large single-threaded DGEMM at
+# 6.1 GFLOP/s against OpenBLAS's 17.7 -- 0.35x, at one thread, so no threading
+# question is involved -- and then scaled perfectly linearly at a flat 1.33
+# GFLOP/s per core from t=8 to t=96. Perfect scaling at a 4.6x-bad constant is a
+# kernel deficit, not oversubscription and not a tuning gap. `auto` had almost
+# certainly landed on a generic arm64 sub-config with no Neoverse kernels, and
+# nothing in the record said which, because the config was never read back and
+# blis.buildlog was never shipped.
+#
+# A misconfigured reference arm is worse than an absent one: section 1 measures
+# every deficit against the reference, so a bad reference manufactures a deficit
+# everywhere. BLIS is on one attempt here by Scott's ruling -- fix the config, or
+# drop BLIS from P3 entirely.
+#
+# The choice is verified against the checked-out tree rather than hardcoded,
+# because a config name that BLIS renames or removes would otherwise fail the
+# whole build at configure time on a host, in a script whose job is to make five
+# hosts identical.
+blis_config_choose() {
+  local want=""
+  if [ "$HAS_SVE" = true ]; then
+    # VL-agnostic SVE kernels. Right for Graviton 3 and 4 (V1/V2) and for any
+    # future SVE part, which matters because standing order 8's whole point is
+    # that an unrecognised SVE part should still get SVE kernels.
+    want=armsve
+  else
+    case "${PART:-}" in
+      # Neoverse N1: Graviton 2. No SVE, so armsve is not merely suboptimal, it
+      # would not run. BLIS's altra config IS N1.
+      0xd0c) want=altra ;;
+      # Anything else non-SVE falls to the arm64 FAMILY config, which dispatches
+      # among its sub-configs at runtime. That is a deliberate last resort and not
+      # the same as `auto`: the read-back below records which sub-config won.
+      *)     want=arm64 ;;
+    esac
+  fi
+  if [ -d "$SRCDIR/blis/config/$want" ]; then
+    printf '%s' "$want"
+  else
+    log "WARNING: BLIS at $BLIS_SHA has no config/$want; falling back to auto"
+    printf 'auto'
+  fi
+}
+if [ -n "${BLIS_CONFIG:-}" ]; then
+  BLIS_CONF="$BLIS_CONFIG"
+  log "BLIS config overridden to '$BLIS_CONF' by BLIS_CONFIG"
+else
+  BLIS_CONF="$(blis_config_choose)"
+fi
+BLIS_ARCH=""
 BLIS_REASON=""
 immutable_ref "$BLIS_REF" || {
   BLIS_REASON="BLIS_REF='$BLIS_REF' is a mutable ref; resolved to $BLIS_SHA on this host only"
@@ -423,8 +534,45 @@ else
   BLIS_REASON="${BLIS_REASON:-build failed, see $PREFIX/blis.buildlog}"
 fi
 cd "$ROOT"
+
+# ---- read the config back off the library, at runtime ---------------------
+# Standing order 10 applied to BLIS. `bli_arch_query_id()` is the same kind of
+# question `openblas_get_corename()` answers, and the answer can legitimately
+# differ from the request: a family config like arm64 picks a sub-config at
+# runtime, so `target: arm64` with `target_effective: firestorm` is not a fault,
+# it is the fact the manifest was missing. A request that does NOT come back is
+# the fault, and it is recorded as one rather than smoothed over.
+if [ "$OK" = true ]; then
+  probe_c="$SRCDIR/blis-arch-probe.c"
+  cat > "$probe_c" <<'PROBE'
+#include <stdio.h>
+#include "blis.h"
+int main(void) { printf("%s\n", bli_arch_string(bli_arch_query_id())); return 0; }
+PROBE
+  if ${CC:-gcc} -O2 -std=c11 -I"$PREFIX/blis/include/blis" "$probe_c" \
+       -o "$SRCDIR/blis-arch-probe" -L"$PREFIX/blis/lib" -lblis -lm -lpthread \
+       >>"$PREFIX/blis.buildlog" 2>&1; then
+    BLIS_ARCH="$("$SRCDIR/blis-arch-probe" 2>>"$PREFIX/blis.buildlog" | tr -d '[:space:]')"
+  fi
+  if [ -z "$BLIS_ARCH" ]; then
+    BLIS_ARCH="unknown"
+    BLIS_REASON="${BLIS_REASON:+$BLIS_REASON; }bli_arch_query_id() read-back unavailable, so target='$BLIS_CONF' is a request and not an observation"
+    log "WARNING: BLIS arch read-back failed; target_effective=unknown"
+  else
+    log "BLIS reports arch '$BLIS_ARCH' (requested '$BLIS_CONF')"
+    if [ "$BLIS_ARCH" != "$BLIS_CONF" ] && [ "$BLIS_CONF" != auto ] \
+       && [ "$BLIS_CONF" != arm64 ]; then
+      # Not a family config, so the runtime answer should be the request. It is
+      # recorded, not silently accepted -- the same shape as run-matrix.sh
+      # refusing an OpenBLAS arm whose coretype request was ignored, except that
+      # BLIS is the reference and not the subject, so this warns.
+      BLIS_REASON="${BLIS_REASON:+$BLIS_REASON; }requested config '$BLIS_CONF' but bli_arch_query_id() reports '$BLIS_ARCH'"
+      log "WARNING: $BLIS_REASON"
+    fi
+  fi
+fi
 arm_record blis "$BLIS_CONF" "$BLIS_SHA" "$OK" true "$BLIS_REASON" pthreads \
-  gbb-blis "$PREFIX/blis" n/a >> "$MANIFEST"
+  gbb-blis "$PREFIX/blis" n/a "$BLIS_ARCH" >> "$MANIFEST"
 
 # ---- reference netlib (correctness control) -------------------------------
 # Not a performance arm. It is here so that "fast" and "correct" can be

@@ -65,7 +65,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
+cd "$ROOT" || { printf 'FATAL: cannot cd to %s\n' "$ROOT" >&2; exit 1; }
 
 PY="${PYTHON:-python3}"
 
@@ -178,6 +178,9 @@ printf 'results: %s\n' "$RESULTS"
 printf 'expect:  instance=%s az=%s fixture-mode=%s\n' "$EXPECT_INSTANCE" "$EXPECT_AZ" "$FIXTURE"
 
 head_ "1. the inputs are there"
+# shellcheck disable=SC2043  # deliberate one-element list, and the missing-file
+# branch is the point: this reports `bad` rather than `continue`, so the gate
+# cannot pass by finding nothing to check.
 for f in analysis/decompose.py; do
   if [ -f "$f" ]; then ok "$f"; else bad "$f missing"; fi
 done

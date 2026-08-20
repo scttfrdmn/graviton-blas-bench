@@ -60,6 +60,17 @@ jobs:
       - name: coreprobe compiles and links against a real BLAS
         run: make coreprobe OPENBLAS_DIR=/usr VARIANT=ci-system
 
+      - name: the correctness checks catch a wrong answer
+        # Every routine gained a corner check on 2026-08-20, closing a gap in which
+        # 31723 of 42743 cells on the first P2 pass carried `verified: null` -- and
+        # the nulls were concentrated in TRSM/TRMM/SYMM, the family the campaign's
+        # likely finding lives in. A check that never fires is `return 1;` with extra
+        # steps, which is the mistake this repo has already made once, so the fixture
+        # breaks each result deliberately and requires the check to notice. It needs
+        # a real BLAS to produce right answers to corrupt, which is why it lives in
+        # this job and not in the shell one.
+        run: bash tests/verify-corner-mutation.sh
+
       - name: OPENBLAS_CORETYPE forcing actually works
         # The whole hardware x kernel-set cross now rides on force_coretype()
         # being honoured on a DYNAMIC_ARCH build, and on us being able to detect
@@ -116,12 +127,24 @@ jobs:
         # Standing order 8 rides on capture-env.sh refusing to proceed rather
         # than noting the problem in a file nobody reads.
         run: bash tests/arch-selected-assert.sh
+      - name: the SVE probe can report yes
+        # Standing order 8's quiet trigger is build-libs.sh's sve_kernels(), and it
+        # shipped a whole P2 pass as a constant function returning "no": `nm |
+        # grep -q` under `set -o pipefail` reports 141 when grep exits early, so
+        # SVE being present made the probe say it was absent. decompose.py then
+        # raised the campaign's most outweighing escalation on four healthy builds.
+        # The suite runs under pipefail, because a bare `bash x.sh` does not
+        # inherit it and the bug is invisible without it.
+        run: bash tests/sve-probe-assert.sh
+
       - name: the payload refuses a pass before spending on it
         # workload.sh aborts a P3 pass with no ArmPL or no commit pin *before*
         # build-libs.sh, so the cost of a bad launch is minutes rather than hours.
         # The suite asserts the ordering, not just the exit code.
         run: bash tests/workload-preflight.sh
 
+  # Semantics only: lint and compilability. Deliberately does NOT include
+  # `ruff format --check` -- see python-format below for why the split exists.
   python:
     name: python
     runs-on: ubuntu-24.04
@@ -130,20 +153,47 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pipx install ruff
+      # Pinned for the same reason BLIS_REF is pinned: `pipx install ruff` is a
+      # mutable ref, so the formatter's verdict on an unchanged tree can change
+      # when ruff releases. A cosmetic tool bump must not be able to decide
+      # whether this repo's gates run.
+      - run: pipx install ruff==0.16.3
       - name: ruff check
         run: ruff check .
-      - name: ruff format --check
-        run: ruff format --check .
       - name: py_compile
         run: |
           while IFS= read -r f; do
             python -m py_compile "$f"
           done < <(find . -name '*.py' -not -path './.git/*')
 
+  # Formatting is cosmetic and is therefore its own job, so that nothing which
+  # depends on the analysis being *correct* depends on it being *pretty*.
+  #
+  # This is not hypothetical. `ruff format --check` failed from b59ae7b onwards
+  # over three whitespace sites, and because gate-p1 declared `needs: [python]`,
+  # the P1 calibration suite was SKIPPED on every push for the whole window in
+  # which 42c6369 rewrote the reference-arm scope and the denominator input set
+  # and 04f4732 retired the peak_fma cross-check. gate-p1 exists precisely to
+  # catch analysis drift "before the drift is discovered by a dataset that cost
+  # real instance-hours", and it was dark while P2 spent them. A gate that a
+  # trailing comma can silently disable is not a gate.
+  python-format:
+    name: python format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pipx install ruff==0.16.3
+      - name: ruff format --check
+        run: ruff format --check .
+
   gate-p0:
     name: gate p0
-    needs: [c, shell, python]
+    # p0's stated requirement is "CI green on a clean clone", so it does depend
+    # on formatting. That is correct for P0 and wrong for P1.
+    needs: [c, shell, python, python-format]
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4

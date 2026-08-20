@@ -209,18 +209,47 @@ def case_flops(r, m, n, k):
     return 0.0
 
 
-# bench.c's verification outcome per routine, and the note it carries. dgemm is
-# the only routine with a real corner check; the rest emit verified=null, which
-# is why section 5 prints verification coverage per routine.
+# bench.c's verification outcome per routine, and the note it carries.
+#
+# EVERY routine now carries a real corner check, so a clean arm reports
+# verified=true across the board and an empty note. Until 2026-08-20 only dgemm
+# did, and the other eight emitted verified=null with a `corner_check_absent`
+# note -- 31723 of 42743 cells on the first P2 pass, concentrated in exactly the
+# TRSM/TRMM/SYMM family the campaign's likely finding lives in. The tri-state
+# `verified` reported that gap honestly, which is not the same as closing it.
+#
+# `verified=null` is therefore no longer reachable from bench.c for a MEASURED
+# case, and section 5's coverage table is not thereby pointless: `case_skipped`
+# records still carry no verdict, archived datasets (the P2 dry run among them)
+# are full of nulls, and a routine added later starts at null again. Scenarios
+# that need a null now ask for one explicitly via Arm.verified_null_routines
+# rather than getting one for free from this table -- see sc_unverified_verdict.
 VERIFY = {
     "dgemm": (True, ""),
-    "sgemm": (None, "corner_check_absent_fp32"),
-    "dtrsm": (None, "corner_check_absent"),
-    "dtrmm": (None, "corner_check_absent"),
-    "dsyrk": (None, "corner_check_absent"),
-    "dsymm": (None, "corner_check_absent"),
-    "dgemv": (None, "corner_check_absent"),
+    "sgemm": (True, ""),
+    "dtrsm": (True, ""),
+    "dtrmm": (True, ""),
+    "dsyrk": (True, ""),
+    "dsymm": (True, ""),
+    "dgemv": (True, ""),
 }
+
+
+def pin_policy_for(threads):
+    """run-matrix.sh's PIN_DESC for this thread count, in one place.
+
+    It was written out inline at five sites -- bench records, probe records,
+    roofline records, the census and the manifest -- which is four copies too many
+    of a field the analysis cross-references BETWEEN those files. Standing order 9
+    is that the policy is recorded per arm and applied uniformly; a fixture in
+    which two files disagree about it would be testing the analysis against a
+    dataset the runner cannot produce.
+
+    Simplified from the real PIN_DESC on purpose: the real one selects membind or
+    interleave from the topology, and no assertion here reads the policy's content,
+    only that it is present and consistent. Faithful in shape, not in detail."""
+    return "taskset -c 0" if threads == 1 else f"numactl -C 0-{threads - 1}"
+
 
 # A plausible single-core ceiling per routine. Ratios roughly match what an SVE
 # Neoverse does; the absolute numbers are irrelevant to every assertion here.
@@ -345,6 +374,20 @@ class Arm:
     # swapping min for max across a run left every scenario green.
     lucky_dup: float = 0.0
     verified_false_routines: tuple = ()
+    # build-libs.sh's `target_effective`: what the built library reports about its
+    # own configuration, as opposed to what was requested of it. None means no
+    # read-back was attempted, which is the honest default and is what every arm
+    # except BLIS carries -- see manifest_records().
+    target_effective: object = None
+    # This arm's records for these routines carry `verified: null`. Since every
+    # routine in bench.c gained a corner check (2026-08-20), a null is no longer
+    # something a scenario gets for free from the VERIFY table -- but the analysis
+    # still has to handle it, because archived datasets are full of nulls and a
+    # newly added routine starts there. A scenario that wants to test the
+    # VERDICT-CAVEAT path must now say so out loud, which is the right direction:
+    # the caveat is being tested deliberately rather than as a side effect of a
+    # coverage gap that has since been closed.
+    verified_null_routines: tuple = ()
     # This arm's streams emit no `thread_prime` record -- a build whose warmup fix
     # never landed, or a runner that lost the priming call. It is not a data hole
     # (every measurement is still present), which is exactly why it needs its own
@@ -701,7 +744,7 @@ def bench_records(sc: Scenario, host: HostSpec):
                 "blas_sha": sha,
                 "coretype": arm.coretype,
                 "thread_backend": arm.thread_backend,
-                "pin_policy": "taskset -c 0" if threads == 1 else f"numactl -C 0-{threads - 1}",
+                "pin_policy": pin_policy_for(threads),
                 "arch_selected": host.dynamic_selection,
                 "role": "campaign",
                 # Matrix records, so "none". Emitted rather than left absent even
@@ -806,11 +849,22 @@ def bench_records(sc: Scenario, host: HostSpec):
                         t_min = flops / (gf * 1e9) if gf > 0 else 0.0
                         t_p50 = t_min * (1.0 + arm.spread)
                         t_p90 = t_min * (1.0 + 1.6 * arm.spread)
-                        verified, note = VERIFY.get(routine, (None, f"incx={incx}"))
+                        # daxpy/ddot fall to the default: they are checked too, and
+                        # their note stays `incx=N` because that is the axis the
+                        # case exists to probe -- bench.c appends the failure there
+                        # rather than replacing it.
+                        verified, note = VERIFY.get(routine, (True, f"incx={incx}"))
                         if routine in ("daxpy", "ddot"):
                             note = f"incx={incx}"
                         if routine in arm.verified_false_routines:
-                            verified, note = False, "corner_check_failed"
+                            verified = False
+                            note = (
+                                f"incx={incx};corner_check_failed"
+                                if routine in ("daxpy", "ddot")
+                                else "corner_check_failed"
+                            )
+                        elif routine in arm.verified_null_routines:
+                            verified, note = None, "corner_check_absent"
                     recs.append(
                         {
                             **prov,
@@ -901,14 +955,14 @@ def floor_probe_records(sc: Scenario, host: HostSpec):
             continue
         for threads in host.threads:
             for i, m in enumerate(OVERLAP_SIZES):
-                base = base_gflops("dgemm", m, threads) * arm.multiplier(
-                    "dgemm", m, 1, 0, None
-                ) * host.host_scale
+                base = (
+                    base_gflops("dgemm", m, threads)
+                    * arm.multiplier("dgemm", m, 1, 0, None)
+                    * host.host_scale
+                )
                 # Same parity rule as bench.c: even index -> short floor first.
                 short_first = i % 2 == 0
-                floors = (
-                    (MIN_SECONDS_SMALL, MIN_SECONDS) if short_first else (MIN_SECONDS, MIN_SECONDS_SMALL)
-                )
+                floors = (MIN_SECONDS_SMALL, MIN_SECONDS) if short_first else (MIN_SECONDS, MIN_SECONDS_SMALL)
                 for pos, floor in enumerate(floors):
                     is_short = floor == MIN_SECONDS_SMALL
                     if mode == "half" and not is_short:
@@ -937,9 +991,7 @@ def floor_probe_records(sc: Scenario, host: HostSpec):
                             "blas_sha": arm_sha(sc, host, arm),
                             "coretype": arm.coretype,
                             "thread_backend": arm.thread_backend,
-                            "pin_policy": "taskset -c 0"
-                            if threads == 1
-                            else f"numactl -C 0-{threads - 1}",
+                            "pin_policy": pin_policy_for(threads),
                             "arch_selected": host.dynamic_selection,
                             "role": "campaign",
                             "probe": "floor-overlap",
@@ -967,9 +1019,7 @@ def floor_probe_records(sc: Scenario, host: HostSpec):
                             # regime default -- keying it off min_seconds_for(m) would
                             # report both halves of the band costing the same, which is
                             # the opposite of what the probe demonstrates.
-                            "case_seconds": case_seconds_for(
-                                t_min, floor, case_bytes("dgemm", m, m, m)
-                            ),
+                            "case_seconds": case_seconds_for(t_min, floor, case_bytes("dgemm", m, m, m)),
                             "min_seconds": floor,
                             "timer_overhead_ns": 21.0,
                             "timer_res_ns": 1.0,
@@ -1061,6 +1111,19 @@ def roofline_records(host: HostSpec, bench):
             "instance": host.instance_type,
             "build": "synthetic",
             "role": "campaign",
+            # roofline.c gained these on 2026-08-20 and this fixture has to follow
+            # it, or the copy drifts from the producer -- which is the one failure
+            # mode that turns every scenario into a rigorous test of the wrong
+            # experiment. `pin_policy` was the provenance gap: standing order 9 says
+            # record the binding per arm, bench.c did and roofline did not, on the
+            # very instrument that shows the t>=128 per-core cliff. The place map is
+            # there to rule out threads doubling up on cores before an instance is
+            # launched to chase that cliff -- a place count below the thread count
+            # explains a pure-compute efficiency drop with no reference to NUMA.
+            "pin_policy": pin_policy_for(threads),
+            "omp_places": threads,
+            "omp_place_procs": 1,
+            "omp_place_procs_total": threads,
         }
         if threads == 1:
             recs.append(
@@ -1114,6 +1177,13 @@ def manifest_records(sc: Scenario, host: HostSpec):
                 "record": "arm",
                 "library": arm.library,
                 "target": arm.target,
+                # build-libs.sh's arm_record() gained this on 2026-08-20 and it is
+                # null for every library that does not read its own config back --
+                # which is all of them except BLIS. Deliberately NOT a copy of
+                # `target`: standing order 10's failure mode is a request echoed as
+                # if it were an observation, and defaulting the field to the request
+                # would build that mistake into the fixture.
+                "target_effective": arm.target_effective,
                 "coretype": None,
                 "blas_sha": arm_sha(sc, host, arm),
                 "built": arm.manifest_built,
@@ -1137,6 +1207,7 @@ def manifest_records(sc: Scenario, host: HostSpec):
                 "record": "arm",
                 "library": "reference",
                 "target": "native",
+                "target_effective": None,
                 "coretype": None,
                 "blas_sha": "",
                 "built": True,
@@ -1222,7 +1293,7 @@ def census_records(sc: Scenario, host: HostSpec, bench, probe=()):
                 "exit_code": 0,
                 "records": 2,
                 "thread_backend": "",
-                "pin_policy": "taskset -c 0" if threads == 1 else f"numactl -C 0-{threads - 1}",
+                "pin_policy": pin_policy_for(threads),
                 "reason": "",
             }
         )
@@ -1295,7 +1366,7 @@ def census_records(sc: Scenario, host: HostSpec, bench, probe=()):
                     "exit_code": 134 if failed else (0 if arm.census_status == "measured" else 4),
                     "records": n,
                     "thread_backend": arm.thread_backend,
-                    "pin_policy": "taskset -c 0" if threads == 1 else f"numactl -C 0-{threads - 1}",
+                    "pin_policy": pin_policy_for(threads),
                     "reason": failed or arm.census_reason,
                 }
             )
@@ -3086,13 +3157,85 @@ def sc_full_routine_set():
             },
             {"kind": "stdout_contains", "text": "CONSEQUENCE: the difference is routine-localised"},
             {"kind": "stdout_absent", "text": "publish the negative result"},
-            # 4. three of the four affected routines have no correctness check in
-            # bench.c, so this verdict rests on verified=null records and must say
-            # so. A TRSM win that nothing verified is the exact failure mode the
-            # tri-state `verified` was introduced for.
+            # 4. and this verdict is now CERTIFIED, which is the point of the
+            # 2026-08-20 change and the reason this expectation inverted. It used to
+            # assert the opposite -- VERDICT-CAVEAT plus "verified=null" -- because
+            # three of the four affected routines had no correctness check, so the
+            # campaign's flagship sentence ("worth closing, for TRSM/TRMM/SYMM")
+            # rested on records nothing had checked. That was a faithful fixture of a
+            # broken producer. Now every routine carries a corner check, so a clean
+            # arm must produce NO unverified caveat at all: if this line ever goes
+            # back to expecting the null, a check has been lost.
+            #
+            # The caveat MACHINERY is still tested -- deliberately now, by
+            # sc_unverified_verdict, rather than as a side effect of the gap.
+            {"kind": "stdout_absent", "text": "verified=null"},
+            {"kind": "json_number", "path": "verdict.unverified_cells", "op": "==", "value": 0},
+            {"kind": "exit_bits_clear", "bits": [2, 4, 8, 16]},
+        ],
+    )
+
+
+def sc_unverified_verdict():
+    """The same routine-localised N2-gap finding as `full-routine-set`, but on a
+    dataset where the three affected routines carry `verified: null`.
+
+    WHY THIS SCENARIO REPLACES A SIDE EFFECT. Until 2026-08-20, bench.c had a
+    corner check for dgemm and for nothing else, so every fixture that planted an
+    effect on TRSM/TRMM/SYMM got the VERDICT-CAVEAT for free -- `full-routine-set`
+    asserted it, and that assertion was really a fixture of the producer's gap
+    rather than a test of the analysis. Closing the gap in bench.c would then have
+    silently retired the only coverage the caveat had: the scenario would have been
+    edited to stop expecting it, the machinery would have gone untested, and the
+    next routine added to the matrix would have started life at `verified: null`
+    with nothing asserting that the report says so.
+
+    So the null is now planted deliberately. This is not a hypothetical shape: the
+    P2 dry-run dataset is exactly it -- 31723 of 42743 cells -- and it is still the
+    shape of any archived pass, any newly added routine before its check lands, and
+    any reference library whose arm ran an older binary.
+
+    The claim is narrow and is the one that matters: an unverified finding is still
+    REPORTED (the analysis must not suppress it -- that would be tuning the
+    analysis until it finds nothing) but it is never reported as certified. Both
+    halves are asserted, because each without the other is a different bug."""
+    return Scenario(
+        name="unverified-verdict",
+        description=(
+            "The N2-gap finding on records nothing checked: dtrsm/dtrmm/dsymm carry "
+            "verified=null. The verdict must still be MIXED and must still name the "
+            "routines, and it must carry the caveat that says nothing verified them."
+        ),
+        hosts=[_host()],
+        routines=BENCH_ROUTINES,
+        arms=_arms(
+            v1_gain=flat(1.22),
+            routines=N2_GAP_ROUTINES,
+            verified_null_routines=N2_GAP_ROUTINES,
+        ),
+        expect=[
+            # 1. the finding survives. A null is not a licence to drop the cell:
+            # absent and unverified are different claims, and an analysis that
+            # quietly discarded the unverified rows would report a null result on a
+            # host that had a +22% effect on three routines.
+            {"kind": "verdict_code", "one_of": ["MIXED"]},
+            {"kind": "cross_verdicts_where", "routine": "dtrsm", "expect": "V1-set-ahead", "min_rows": 4},
+            {"kind": "cross_verdicts_where", "routine": "dsymm", "expect": "V1-set-ahead", "min_rows": 4},
+            # 2. and it is never presented as certified.
             {"kind": "stdout_contains", "text": "VERDICT-CAVEAT:"},
             {"kind": "stdout_contains", "text": "verified=null"},
+            {"kind": "json_number", "path": "verdict.unverified_cells", "op": ">", "value": 0},
+            # 3. a null is NOT a failure. Exit bit 2 is for poisoned records -- a
+            # verified=false -- and conflating the two would make an honest gap
+            # indistinguishable from a wrong answer, which is the distinction the
+            # tri-state exists for.
+            {"kind": "json_number", "path": "inputs.excluded.verified_false", "op": "==", "value": 0},
             {"kind": "exit_bits_clear", "bits": [2, 4, 8, 16]},
+            # 4. section 5's coverage table names the routines with no coverage, so a
+            # reader can tell WHICH routines are uncertified rather than only how
+            # many cells are. That sentence is what made the gap visible in the first
+            # place.
+            {"kind": "stdout_contains", "text": "no check exists for this routine"},
         ],
     )
 
@@ -3321,6 +3464,84 @@ def sc_manifest_shapes():
             {"kind": "cross_verdicts_where", "routine": "dgemm", "expect": "V1-set-ahead", "min_rows": 4},
             {"kind": "verdict_code", "one_of": ["V1-SET-AHEAD"]},
             {"kind": "exit_bits_clear", "bits": [2, 8]},
+            # Every arm here has target_effective null -- no producer but BLIS reads
+            # its own config back, and this BLIS arm is the pre-2026-08-20 shape. A
+            # null must therefore say NOTHING: it means no read-back was attempted,
+            # which is the ordinary state of four of the five libraries and of every
+            # archived dataset. This is the silent half of the pair whose firing half
+            # is `target-readback`; without it, the check could be made to pass by
+            # raising an anomaly on absence, which would fire on every real run and
+            # so tell a reader nothing.
+            {"kind": "anomaly_kind_absent", "kind_name": "target_readback_failed"},
+            {"kind": "anomaly_kind_absent", "kind_name": "target_resolved_elsewhere"},
+        ],
+    )
+
+
+def sc_target_readback():
+    """Two BLIS arms whose builds answered the question `target` cannot: one where
+    the read-back failed, and one where the config it asked for resolved to a
+    different one at runtime.
+
+    WHY THIS EXISTS. `target` is a REQUEST. The first P2 pass shipped its BLIS arm
+    as `target: "auto"` with nothing recording what auto resolved to, and that arm
+    ran single-threaded large DGEMM at 0.35x OpenBLAS -- a number that means
+    misconfigured, not slow, because no threading is involved at one thread. The
+    manifest could not express that and the analysis could not see it. It is
+    standing order 10 one library over from the coretype axis: `configure auto` on
+    Neoverse V2 falling back to a generic arm64 sub-config is exactly a request
+    landing somewhere other than where the label claims, and a mislabelled arm is
+    a plausible wrong answer rather than a failed run.
+
+    The two cases are deliberately different claims and get different sentences:
+
+      - `unknown` means a read-back was ATTEMPTED and FAILED. The label is
+        unverifiable, so it is a request presented as an observation.
+      - a value that differs from `target` is NOT a fault. A family config resolving
+        to a sub-config at runtime is the normal thing and the whole reason the field
+        exists; what matters is that the resolved name reaches the report, so a
+        deficit is read against the kernel set that actually ran.
+
+    Neither is an admissibility failure -- the reference arm is not the subject of
+    the campaign -- so both sit at warning level and neither may set an exit bit.
+    That restraint is asserted, because a check that made an ordinary resolution
+    fatal would be removed within a week and then the P2 defect would be
+    undetectable again."""
+    arms = _arms(v1_gain=flat(1.22))
+    arms += [
+        # What the P2 pass shipped, plus the field it lacked: the probe compiled and
+        # ran but could not answer, so build-libs.sh writes "unknown" and a reason
+        # rather than echoing "auto".
+        Arm("blis", "auto", "unforced", target_effective="unknown"),
+        # And the benign case, which must still be legible: `arm64` is a config
+        # FAMILY, so bli_arch_query_id() naming a member of it is correct behaviour
+        # and not a mismatch.
+        Arm("blis", "arm64", "unforced", target_effective="neoversev2"),
+    ]
+    return Scenario(
+        name="target-readback",
+        description=(
+            "One BLIS arm whose config read-back failed and one whose requested family "
+            "resolved to a sub-config. Both facts must reach section 5 by name, and "
+            "neither may be treated as inadmissible."
+        ),
+        hosts=[_host()],
+        arms=arms,
+        expect=[
+            {"kind": "anomaly_kind_present", "kind_name": "target_readback_failed"},
+            {"kind": "anomaly_kind_present", "kind_name": "target_resolved_elsewhere"},
+            # Named, not counted. "one arm could not be verified" sends nobody to a
+            # build log; the library and the resolved config do.
+            {"kind": "stdout_contains", "text": "blis/auto"},
+            {"kind": "stdout_contains", "text": "neoversev2"},
+            # Not fatal, and not poison: the records are real measurements of
+            # whatever kernel set ran, so nothing is excluded and no bit is set.
+            {"kind": "json_number", "path": "inputs.excluded.verified_false", "op": "==", "value": 0},
+            {"kind": "exit_bits_clear", "bits": [2, 4, 8, 16]},
+            # Two extra reference candidates must not disturb the kernel-set cross,
+            # which is OpenBLAS against OpenBLAS and needs no reference at all.
+            {"kind": "verdict_code", "one_of": ["V1-SET-AHEAD"]},
+            {"kind": "cross_verdicts_where", "routine": "dgemm", "expect": "V1-set-ahead", "min_rows": 4},
         ],
     )
 
@@ -4625,9 +4846,11 @@ SCENARIOS = {
         sc_lucky_pass,
         sc_all_arms_failed,
         sc_full_routine_set,
+        sc_unverified_verdict,
         sc_reference_library_absent,
         sc_reference_arm_partial,
         sc_manifest_shapes,
+        sc_target_readback,
         sc_reference_regime_flip,
         sc_denominator_intersection,
         sc_denominator_thread_point_dark,
@@ -5093,8 +5316,7 @@ def check_one(exp, report, stdout, exit_code, root):
                 # "2 references" and "the small rows used the other one" are the
                 # same defect described at two different levels of use.
                 per_ref = {
-                    ref: sorted({r["regime"] for r in rows if r.get("reference_arm") == ref})
-                    for ref in refs
+                    ref: sorted({r["regime"] for r in rows if r.get("reference_arm") == ref}) for ref in refs
                 }
                 wrong.append(f"{inst}: {len(refs)} reference arms across regimes {per_ref}")
                 continue
@@ -5203,8 +5425,7 @@ def check_one(exp, report, stdout, exit_code, root):
         return not wrong, (
             f"{exp['instance']} t={exp['threads']}: basis={s.get('denom_basis')} "
             f"best_dgemm_m={s.get('best_dgemm_m')} common={s.get('denom_common_sizes')} "
-            f"cost={s.get('denom_restriction_cost')}"
-            + ("; wrong: " + "; ".join(wrong[:4]) if wrong else "")
+            f"cost={s.get('denom_restriction_cost')}" + ("; wrong: " + "; ".join(wrong[:4]) if wrong else "")
         )
 
     if kind == "deficit_absent":

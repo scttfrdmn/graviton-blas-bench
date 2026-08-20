@@ -13,6 +13,221 @@ change can be compared.
 
 ## [Unreleased]
 
+### Added — affects what the record can certify; no measured number changes
+
+- **Every routine now carries a correctness check. Eight of nine had none.** Before
+  this change only `dgemm` was verified, so `31,723 of 42,743` cells on the first P2
+  pass carried `verified: null` — and the nulls were not spread evenly. `dtrsm`,
+  `dtrmm`, `dsymm`, `dsyrk`, `sgemm`, `dgemv`, `daxpy` and `ddot` were at **0%
+  coverage**, which means TRSM/TRMM/SYMM — the family the 90-operation N2 gap lives
+  in, and the family the C11 false negative was confined to — was precisely the part
+  of the matrix the campaign could not certify had produced correct answers. The
+  likely headline was about routines with no check behind them. Standing order 4 puts
+  correctness before speed; a number whose correctness was never tested is not a
+  slower number, it is not a result.
+
+  This traces back to the original timing audit. Making `verified` tri-state and
+  emitting `null` where no check ran was the right fix for a hardcoded `verified=1`,
+  which was a lie — but reporting a gap honestly is not closing it, and the matrix
+  has since grown roughly fivefold around it.
+
+  Each check recomputes a **4×4 top-left corner** by hand, from one untimed call
+  before the timed loop, and then restores the operand so the timed loop starts from a
+  bit-identical input. The corner is not an economy for its own sake: for a
+  lower-triangular product the top-left corner closes over itself — row *i* touches
+  only columns `0..i` — so `dtrsm`/`dtrmm` verify in ≤4·4·4 flops at any *n*.
+
+  - `dtrsm` is checked as a **residual**: recompute `A·X` from the solved `X` and
+    compare against the saved `alpha·B0`. Re-solving would be both expensive and
+    self-confirming if the defect were in the solve's own dispatch.
+  - `dtrmm` verifies the product directly, same structure in reverse.
+  - `dsyrk` checks **only `i >= j`**. A correct kernel leaves the upper triangle
+    untouched, so checking it would fail a correct kernel.
+  - `dsymm` reads A **only from its lower triangle**, via a `sym_lo()` accessor,
+    because `dsymm("L","L")` does and `fill_d()` put unrelated noise in the upper one.
+  - `sgemm` accumulates its reference in FP64 but scales tolerance by `FLT_EPSILON`:
+    a *correct* fp32 kernel carries ~`k·FLT_EPSILON` of error.
+  - `ddot` is the one routine with **no corner** — the result *is* the full reduction,
+    so the reference costs a whole untimed pass. At `n=4194304` the tolerance is
+    7.4e-9 relative, which still rejects a kernel that dropped a single element
+    (~1e-4 out) or mishandled `incx`.
+
+  **The triangular tolerance is scaled by the corner's reduction length, not by `m`,
+  and that distinction is load-bearing.** `fill_tri_d` sets a unit diagonal and
+  off-diagonals of `TRI_OFFDIAG/n = 1e-9/n`, so the entire off-diagonal contribution
+  to `X[i]` is ~`1e-9/m` ≈ 4e-13 at `m=8192`. An `m`-scaled tolerance
+  (`8·8192·eps` = 1.4e-11) is **30× larger than the whole signal being checked**, so
+  it would certify a kernel that ignored the off-diagonal update path entirely. The
+  corner length (`mm ≤ 4`, tol ≈ 7e-15) puts that path two orders above tolerance.
+  This is not a hypothetical: it is what the first draft did, and the
+  `trsm-m-scaled-tolerance-is-blind` mutation exists because of it.
+
+  **No measured number moves and `matrix_id` does not move.** Operands are restored
+  before every timed loop, so the timed work is unchanged, and the design is
+  untouched: `7c371fee324b7304` over 544 cases, before and after. The P2 dry-run
+  dataset keeps its nulls — a shipped record is not edited — so `verified: null`
+  remains reachable for archived data, for `case_skipped` records, and for any newly
+  added routine before its check lands, and the report's caveat machinery stays.
+
+  Validated two ways, because the failure mode here is a check that cannot fire:
+  end-to-end against a real BLAS, where all nine routines report `verified: true` and
+  **zero false**; and by **`tests/verify-corner-mutation.sh`**, new and wired into CI
+  and `gates/p0.sh`, which breaks each routine's result deliberately and requires the
+  check to notice. Eleven mutations across three expectation kinds — `fires`,
+  `silent`, `blind_large`. `syrk-upper-triangle-garbage` is a `silent` case: garbage
+  in the untouched upper triangle must **not** fail a correct kernel, so a check that
+  over-fires is caught as well as one that under-fires. The suite fails loudly rather
+  than skipping when it can find no BLAS to link, and asserts its own baseline
+  (`91 true, 0 false, 0 null, over 9 routines`) so that a mutation "passing" against a
+  broken fixture is not possible.
+
+### Fixed — gate coverage; affects no measured number
+
+- **A whitespace failure had been silently skipping the P1 calibration gate.**
+  `ruff format --check` failed from `b59ae7b` onwards over three sites in
+  `analysis/decompose.py`, `tools/p2-mutate.py` and `tools/synth.py`. Because
+  `gate-p1` declared `needs: [python]` and the `python` job bundled
+  `ruff format --check` with `ruff check` and `py_compile`, GitHub reported
+  `gate p1: skipped` — not failed — on **every push** across the window in which
+  `42c6369` rewrote section 1's reference-arm scope and the denominator input set
+  and `04f4732` retired the `peak_fma` cross-check. `gate-p0` was skipped the same
+  way. `gate-p1`'s own comment states its purpose as catching `synth.py` drift
+  "before the drift is discovered by a dataset that cost real instance-hours"; it
+  was dark while the first P2 pass spent them. Nothing was mis-measured — the
+  reformat is AST-identical on all three files and the suite passes 65 scenarios
+  and 36 checks unchanged — but for that window the calibration was unverified
+  rather than verified.
+  - Formatting is now its own `python-format` job. `gate-p1` depends on semantics
+    (`ruff check`, `py_compile`) only; `gate-p0` still depends on formatting,
+    because its stated requirement really is "CI green on a clean clone".
+  - `ruff` is **pinned** to `0.16.3`, for the same reason `BLIS_REF` is pinned: an
+    unpinned `pipx install ruff` is a mutable ref, so a formatter release can turn
+    an unchanged tree red and take the gates down with it.
+- **`gates/check-build-flags.sh` could not fail when its probe broke.** The
+  real-compile-line half of standing order 6 ran
+  `DRYRUN="$(make -n roofline 2>/dev/null || true)"` guarded by
+  `[ -n "$DRYRUN" ]`, so any `make` failure yielded an empty string and skipped
+  both the forbidden-flag and the `-O2` check in silence, printing "harness build
+  flags conform to standing order 6". Same shape as the `sve_kernels()` bug below:
+  a probe failure collapsing into a substantive answer. An unverifiable compile
+  line is now a `FAIL`, verified against a fixture on which the old form exits 0.
+- Tree-wide `shellcheck --severity=warning` is clean, which the `shell` job has
+  been failing on: five `cd` without `|| exit` (these scripts run `set -uo
+  pipefail`, no `-e`, so a failed `cd` really did continue), two dead variables,
+  and four `ls | grep -c` quarantine counts replaced by a glob helper. The three
+  remaining warnings are suppressed individually with a stated reason.
+
+### Fixed — affects provenance, not any measured number
+
+- **`build-libs.sh`'s SVE probe could only ever answer `no`.** `sve_kernels()` ran
+  `nm --defined-only "$lib" | grep -qE '(ARMV8SVE|_sve|sve_)'` under the script's
+  `set -euo pipefail`. `grep -q` exits on its first match, `nm` then dies on
+  SIGPIPE, and `pipefail` makes the pipeline report 141 — so the `if` took the else
+  branch. Both outcomes printed `no`:
+
+  | SVE in the archive | pipeline status | printed |
+  |---|---|---|
+  | present | 141 (SIGPIPE) | `no` |
+  | absent | 1 (grep found nothing) | `no` |
+
+  It was a constant function. It could not pass and it could not fail; it could only
+  be believed. Because `no` is what `decompose.py` turns into standing order 8 —
+  *"every SVE-coretype arm on this host measures the NEON path under an SVE label.
+  Stop and escalate"* — the campaign's single most outweighing alarm was wired live
+  from the moment it was written, and it fired on all four OpenBLAS builds of the
+  first P2 pass (`20260820T031023Z-ip-172-31-36-19`) while SVE was demonstrably
+  present: 1,092 matching defined symbols including `dgemm_kernel_ARMV8SVE`, 135,312
+  SVE instructions in the `.so`, and a measured `GEMM_SMALL` effect that cannot
+  exist without SVE kernels. **The equally serious half is the converse**: on a
+  genuinely `NO_SVE` build the probe would have been just as unable to stay silent,
+  so it carried no information in either direction.
+
+  `nm`'s output is now captured whole, its exit status kept, and the count taken with
+  `grep -c`, which consumes all of its input and cannot induce SIGPIPE in its
+  producer. A failed `nm` or an empty symbol table now yields `unknown` rather than
+  `no` — `decompose.py` already treats those as different claims (provenance gap vs
+  escalation) and was correct throughout; only the producer was wrong. A truncated
+  archive previously read as a *confirmed absence* of SVE. The probe also now logs
+  its answer and the matching-symbol count via `log` (stderr, folded into
+  `build.log`), because the bug survived a whole pass for want of anyone reading its
+  output before `decompose.py` did, hours later and on another machine.
+
+  **No measured number changes and no pass needs re-running.** The libraries were
+  built correctly; one provenance field was recorded wrongly. The P2 manifest is left
+  exactly as shipped — editing a shipped record is worse than either alternative — so
+  that dataset's `sve_kernels` field is invalid by construction and carries no
+  information; SVE presence for that pass is established out-of-band by the three
+  witnesses above.
+
+  New: `tests/sve-probe-assert.sh`, wired into CI and `gates/p0.sh` §5e. It runs under
+  `set -euo pipefail`, because a bare `bash x.sh` does not inherit it and the bug is
+  invisible without it — forty standalone runs of the broken function returned `yes`
+  during the investigation, which is exactly how it survived review. It also proves
+  its own fixture: a pipeline only induces SIGPIPE while the producer is still
+  writing, so the suite asserts that the **old** form still returns `no` on that
+  archive, and fails loudly if it does not rather than reporting a green it did not
+  earn. Mutation-validated against the original implementation, which it fails on two
+  assertions.
+
+- **`roofline-*.ndjson` records now carry `pin_policy`, which standing order 9
+  requires and they did not.** `bench.c` emitted it; `roofline.c` did not, though the
+  runner sets the same `GBB_PIN_POLICY` for both. Only the `printf` was missing. That
+  gap sat on the one instrument showing the t≥128 efficiency cliff most starkly —
+  `peak_fma_allcore` per-core falls from **94.3% at t=96 to 53.1% at t=128 and 43.9%
+  at t=192** — so for those records the applied binding policy was not in the record
+  at all.
+
+- **And the OpenMP place map, to kill a whole hypothesis class before an instance is
+  launched to chase that cliff.** New: `omp_places`, `omp_place_procs`,
+  `omp_place_procs_total`, from `omp_get_num_places()` / `omp_get_place_num_procs()`.
+  `peak_fma_allcore` does no DRAM traffic, so page placement cannot explain its
+  collapse — but if `OMP_PLACES=cores` enumerates **fewer places than there are
+  threads**, threads double up on cores and per-core efficiency falls for a reason
+  with nothing to do with NUMA. Invisible without the field, obvious with it, and it
+  costs two lines. `omp_place_procs_total` is not redundant with the other two: places
+  may be heterogeneous, so the count of places and the size of place 0 together do not
+  answer "are there fewer hardware threads in the map than threads requested", and
+  that sum is the number that does. All three are JSON `null`, not `0` or `-1`, in a
+  non-OpenMP build: **zero places is a real and interesting value** — the runtime
+  exposing no place list — and must not share an encoding with "this binary cannot
+  answer".
+
+- **A BLIS arm's `target` was a request with no read-back, which is the defect class
+  standing order 10 exists for.** The first P2 pass shipped `target: "auto"` with
+  nothing recording what `auto` resolved to, and that arm ran single-threaded large
+  DGEMM at **0.35× OpenBLAS** — a figure that means misconfigured, not slow, because
+  no threading is involved at one thread. `configure auto` on Neoverse V2 falling back
+  to a generic arm64 sub-config is exactly a request landing somewhere other than
+  where the label claims, and the manifest could not express it. Three changes:
+  - `build-libs.sh` **chooses** the config from the host rather than deferring to
+    `auto`: `armsve` where HWCAP reports SVE, `altra` for PART `0xd0c`, else the
+    `arm64` family — each verified to exist as `config/<name>` in the checked-out tree
+    before it is used, with a warning and a fall back to `auto` if not. `BLIS_CONFIG`
+    overrides it explicitly and the override is logged.
+  - `arm_record()` gains **`target_effective`**, filled from an actual runtime query
+    (`bli_arch_string(bli_arch_query_id())`) by a probe compiled and run against the
+    installed library. It defaults to JSON `null` and **never to a copy of `target`**:
+    standing order 10's failure mode is a request echoed as if it were an observation,
+    so defaulting the field to the request would build the mistake into the record. A
+    probe that runs and cannot answer writes `"unknown"` plus a reason.
+  - `decompose.py` section 5 reads it. `unknown` raises `target_readback_failed` — a
+    read-back was attempted and failed, so the label is unverifiable. A value that
+    merely *differs* from `target` raises `target_resolved_elsewhere`, which is **not
+    a fault**: a family config resolving to a member is the normal thing and the whole
+    reason the field exists, so the anomaly names the resolved config and says to read
+    any deficit against that kernel set. Both are warning-level and neither sets an
+    exit bit — the reference arm is not the campaign's subject, and a check that made
+    an ordinary resolution fatal would be removed within a week, leaving the original
+    defect undetectable again.
+
+  Fixtures are a **pair**, because the interesting failure is a check that fires on
+  everything: new scenario `target-readback` plants both cases and requires both
+  anomalies by name, while `manifest-shapes` — whose BLIS arm carries `null`, the
+  pre-existing shape and the state of four of the five libraries — asserts **silence**.
+  Mutation-validated on four mutations: disabling the loop, killing either branch, and
+  dropping the null guard. That last one is what the silent half buys: without it,
+  `target_resolved_elsewhere` fires on every scenario in the suite.
+
 ### Removed — affects what the report claims
 
 - **Standing order 1's `peak_fma` headroom cross-check is retired.** Not weakened,

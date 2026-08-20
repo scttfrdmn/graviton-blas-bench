@@ -130,6 +130,18 @@ pass=0; fail=0
 chk() { if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok   %s\n' "$1";
         else fail=$((fail+1)); printf '  FAIL %s\n       want=%s\n       got =%s\n' "$1" "$3" "$2"; fi; }
 
+# nfiles <dir> <name-prefix> -- how many entries in <dir> start with <prefix>.
+# A glob rather than `ls | grep -c`, which shellcheck rejects (SC2010) and which
+# also reports 1 instead of 0 for a nonexistent directory, because `ls`'s error
+# goes to stdout on some implementations. These counts are the quarantine
+# assertions -- "no campaign-namespace records were written" -- so a count that
+# is wrong in the permissive direction is the one that must not happen.
+nfiles() {
+  local d="$1" p="$2" n=0 f
+  for f in "$d/$p"*; do [ -e "$f" ] && n=$((n + 1)); done
+  printf '%s\n' "$n"
+}
+
 mk_topo; mk_bins; mk_manifest
 
 echo "== A. capture-env exit 4 must refuse to sweep =="
@@ -422,9 +434,9 @@ rc=$(run J)
 chk "exit 0" "$rc" "0"
 chk "run_id is prefixed instr-" "$( [ -s "$RES/bench-instr-J.ndjson" ] && echo yes || echo no )" "yes"
 chk "results/ itself has no bench file" \
-  "$( ls "$W/results" | grep -c '^bench-' || true )" "0"
+  "$(nfiles "$W/results" bench-)" "0"
 chk "results/ itself has no census file" \
-  "$( ls "$W/results" | grep -c '^census-' || true )" "0"
+  "$(nfiles "$W/results" census-)" "0"
 chk "every bench record says role=instrument" \
   "$(python3 -c 'import json,sys
 print(sorted({json.loads(l)["role"] for l in open(sys.argv[1])}))' "$RES/bench-instr-J.ndjson")" \
@@ -447,7 +459,7 @@ chk "exit 3 (refused)" "$rc" "3"
 chk "says it is an assertion, not an override" \
   "$(grep -c 'assertion, not an override' "$W/results/K.stderr")" "1"
 chk "no campaign-namespace records written" \
-  "$( ls "$W/results" | grep -c '^bench-' || true )" "0"
+  "$(nfiles "$W/results" bench-)" "0"
 chk "no instrument records under the asserted role either" \
   "$( [ -e "$RES/bench-instr-K.ndjson" ] && echo some || echo none )" "none"
 
@@ -507,7 +519,7 @@ printf 'pid=4242 host=stub started=2026-08-19T00:00:00Z\n' > "$W/libs/.gbb-build
 rc=$(run N)
 chk "exit 3" "$rc" "3"
 chk "message names the lock holder" "$(grep -c 'pid=4242' "$W/results/N.stderr")" "1"
-chk "no bench records were produced" "$(ls "$RES" | grep -c '^bench-instr-N')" "0"
+chk "no bench records were produced" "$(nfiles "$RES" bench-instr-N)" "0"
 rc=$(run N2b GBB_IGNORE_BUILD_LOCK=1)
 chk "the override runs and warns" "$rc" "0"
 chk "the warning names the risk" \

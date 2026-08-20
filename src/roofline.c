@@ -165,7 +165,53 @@ int main(void) {
        running this binary by hand is not campaign data, and the analysis
        excludes anything that does not say campaign. */
     const char *role     = env_or("GBB_ROLE","unknown");
+    /* Standing order 9 says record the binding policy per arm, and until
+       2026-08-20 these records did not: bench.c emitted `pin_policy` and roofline
+       did not, so for the one instrument that showed the t>=128 efficiency cliff
+       most starkly -- peak_fma_allcore fell from 94% to 53% per core between t=96
+       and t=128 -- the applied policy was not in the record. The runner sets the
+       same GBB_PIN_POLICY for both binaries; only the printf was missing. */
+    const char *pin_policy = env_or("GBB_PIN_POLICY","none");
     int threads = atoi(env_or("GBB_THREADS","1"));
+
+    /* Shared provenance, built once. It carries the OpenMP PLACE MAP, which is
+     * here to eliminate a whole class of explanation for that cliff before an
+     * instance is launched to chase it. peak_fma_allcore does no DRAM traffic, so
+     * page placement cannot touch it -- but if OMP_PLACES enumerates fewer places
+     * than there are threads, threads double up on cores and per-core efficiency
+     * falls for a reason that has nothing to do with NUMA at all. That is invisible
+     * without the field and obvious with it.
+     *
+     * `omp_place_procs_total` is not redundant with the other two: places may be
+     * heterogeneous, so the count of places and the size of place 0 together do
+     * not answer "are there fewer hardware threads in the map than threads asked
+     * for", and that sum is the number that does.
+     *
+     * null, not -1 or 0, when the binary has no OpenMP: absent and zero are
+     * different claims, and `make roofline` already warns loudly about the build
+     * that produces the absence. Zero places is a real and interesting value --
+     * the runtime exposing no place list at all -- so it must not share an
+     * encoding with "this binary cannot answer". */
+    char prov[640];
+#ifdef _OPENMP
+    int nplaces = omp_get_num_places();
+    int p0procs = nplaces > 0 ? omp_get_place_num_procs(0) : 0;
+    int ptotal = 0;
+    for (int p = 0; p < nplaces; p++) ptotal += omp_get_place_num_procs(p);
+    snprintf(prov, sizeof prov,
+             "\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\",\"build\":\"%s\","
+             "\"role\":\"%s\",\"pin_policy\":\"%s\","
+             "\"omp_places\":%d,\"omp_place_procs\":%d,\"omp_place_procs_total\":%d",
+             run_id, host, instance, build, role, pin_policy,
+             nplaces, p0procs, ptotal);
+#else
+    snprintf(prov, sizeof prov,
+             "\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\",\"build\":\"%s\","
+             "\"role\":\"%s\",\"pin_policy\":\"%s\","
+             "\"omp_places\":null,\"omp_place_procs\":null,"
+             "\"omp_place_procs_total\":null",
+             run_id, host, instance, build, role, pin_policy);
+#endif
 
     long iters = 4000000;
 
@@ -174,11 +220,10 @@ int main(void) {
     sanity_check("peak_fma_f64", f64_1*1e-9, 1);
     sanity_check("peak_fma_f32", f32_1*1e-9, 1);
 
-    printf("{\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\",\"build\":\"%s\","
-           "\"role\":\"%s\","
+    printf("{%s,"
            "\"threads\":1,\"metric\":\"peak_fma\",\"accumulators\":%d,"
            "\"gflops_f64\":%.4f,\"gflops_f32\":%.4f}\n",
-           run_id, host, instance, build, role, ACC, f64_1*1e-9, f32_1*1e-9);
+           prov, ACC, f64_1*1e-9, f32_1*1e-9);
 
     /* All-core peak. Graviton has no SMT and no turbo, so this should be
        threads x the single-core figure. A shortfall is itself a finding
@@ -192,12 +237,10 @@ int main(void) {
         double t = now() - t0;
         double all = 2.0*(double)ACC*(double)iters*threads / t;
         sanity_check("peak_fma_f64_allcore", all*1e-9, threads);
-        printf("{\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\",\"build\":\"%s\","
-               "\"role\":\"%s\","
+        printf("{%s,"
                "\"threads\":%d,\"metric\":\"peak_fma_allcore\",\"accumulators\":%d,"
                "\"gflops_f64\":%.4f,\"scaling_efficiency\":%.4f}\n",
-               run_id, host, instance, build, role, threads, ACC,
-               all*1e-9, all / (f64_1 * threads));
+               prov, threads, ACC, all*1e-9, all / (f64_1 * threads));
     }
 #endif
 
@@ -205,11 +248,10 @@ int main(void) {
        including Graviton5's enlarged cache. */
     size_t n = (size_t)64*1024*1024;
     double bw = triad(n, 5);
-    printf("{\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\",\"build\":\"%s\","
-           "\"role\":\"%s\","
+    printf("{%s,"
            "\"threads\":%d,\"metric\":\"bandwidth\",\"array_bytes\":%zu,"
            "\"triad_gbs\":%.4f}\n",
-           run_id, host, instance, build, role, threads, n*sizeof(double), bw*1e-9);
+           prov, threads, n*sizeof(double), bw*1e-9);
 
     if (g_sink == 1234.5678) fputs("", stderr);   /* keep results live */
     return 0;

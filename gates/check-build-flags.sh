@@ -11,7 +11,7 @@
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
+cd "$ROOT" || { printf 'FATAL: cannot cd to %s\n' "$ROOT" >&2; exit 1; }
 
 RC=0
 
@@ -37,6 +37,11 @@ fi
 # the forbidden flags in prose, and a checker that trips over its own
 # documentation is a checker people delete.
 FORBIDDEN='\-march=native|\-mcpu=native|\-O3|\-Ofast'
+# shellcheck disable=SC2043  # deliberate one-element list: the Makefile is the
+# only thing that builds the harness today, and the loop is the seam for the
+# second file rather than a bad glob. A missing Makefile is already caught
+# above -- grep on an absent file leaves CFLAGS_LINE empty, which FAILs -- so
+# the `continue` here cannot make the check pass vacuously.
 for f in Makefile; do
   [ -f "$f" ] || continue
   if sed 's/#.*//' "$f" | grep -nE "$FORBIDDEN"; then
@@ -47,8 +52,23 @@ done
 
 # Verify the real compile line, not just the declared flags: a rule could
 # append -O3 after $(CFLAGS).
-DRYRUN="$(make -n roofline 2>/dev/null || true)"
-if [ -n "$DRYRUN" ]; then
+#
+# An unverifiable check must not read as a pass. The earlier form was
+# `$(make -n roofline 2>/dev/null || true)` guarded by `[ -n "$DRYRUN" ]`, so a
+# make that failed for any reason -- missing include, syntax error, no such
+# target -- produced an empty string and skipped both checks below in silence.
+# That is the same shape as the sve_kernels() bug: a probe failure collapsing
+# into a substantive answer. `roofline` is phony, so make prints the compile
+# line even when bin/gbb-roofline is already built; an empty result therefore
+# means the probe broke, never that there was nothing to inspect.
+DRYRUN="$(make -n roofline 2>&1)"; DRC=$?
+if [ "$DRC" -ne 0 ] || [ -z "$DRYRUN" ]; then
+  echo "FAIL: 'make -n roofline' produced no compile line to inspect (exit $DRC)."
+  echo "      standing order 6 cannot be verified from the declared CFLAGS alone,"
+  echo "      so this is a failure and not a skip. Output was:"
+  printf '%s\n' "$DRYRUN"
+  RC=1
+else
   if printf '%s' "$DRYRUN" | grep -qE '\-march=native|\-mcpu=native|\-O3|\-Ofast'; then
     echo "FAIL: 'make -n roofline' shows a forbidden flag in the actual compile line:"
     printf '%s\n' "$DRYRUN"

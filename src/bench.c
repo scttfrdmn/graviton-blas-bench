@@ -380,6 +380,209 @@ static int verify_gemm_corner(const double *A, int lda, const double *B, int ldb
     return 1;
 }
 
+/* ---- correctness for the routines that had none ------------------------ */
+/* Standing order 4 is correctness before speed, and the campaign's likely
+ * finding lives in TRSM/TRMM/SYMM -- the 90-operation N2 kernel gap, and the
+ * family the C11 false negative was confined to. Emitting `null` for those
+ * routines was the honest fix for a hardcoded `verified=1`, but an honest gap is
+ * still a gap: the report would have claimed a deficit in precisely the
+ * operations it could not certify had produced correct answers. 31723 of 42743
+ * cells on the first P2 pass carried an unverified record.
+ *
+ * All of these follow verify_gemm_corner's shape and its cost discipline: one
+ * untimed call before the timed loop, a 4x4 corner recomputed by hand, and the
+ * operand restored afterwards so the timed loop starts from the state it would
+ * have started from anyway. The top-left corner is chosen for a reason beyond
+ * cheapness -- for the triangular routines it is the only corner that verifies
+ * EXACTLY without touching anything outside itself, because row i of a
+ * lower-triangular product touches only columns 0..i. That bounds the
+ * triangular checks at 4*4*4 flops regardless of n.
+ *
+ * Tolerances follow the gemm check: 8 * (reduction length) * epsilon, the factor
+ * of 8 being headroom for the summation orders that blocked and SIMD-reduced
+ * kernels legitimately produce. Tightening rather than relaxing, so no sign-off
+ * is needed -- but heed the warning on verify_gemm_corner: a false positive
+ * poisons a record exactly as badly as a false negative, so these were run
+ * against a real BLAS before being committed, not merely compiled.
+ */
+#define VERIFY_CORNER 4
+static int corner_dim(int d) { return d < VERIFY_CORNER ? d : VERIFY_CORNER; }
+
+/* A[i,p] of a lower-triangular A in column-major storage; callers keep p <= i. */
+static double tri_lo(const double *A, int lda, int i, int p) {
+    return A[(size_t)p*lda + i];
+}
+
+/* A[i,p] of a symmetric A held in its LOWER triangle. dsymm("L","L") reads only
+   that triangle, so the reference must too: fill_d() put unrelated noise in the
+   upper one, and reading it would fail a correct kernel. */
+static double sym_lo(const double *A, int lda, int i, int p) {
+    int r = i > p ? i : p, c = i > p ? p : i;
+    return A[(size_t)c*lda + r];
+}
+
+static int within(double want, double got, double tol) {
+    double den = fabs(want) > 1.0 ? fabs(want) : 1.0;
+    return fabs(want - got) / den <= tol;
+}
+
+/* dtrsm("L","L","N","N") solved A*X = alpha*B in place; X is now in B.
+ * Verified as a RESIDUAL -- recompute A*X and compare against alpha*B0 -- because
+ * that is the only check the operation admits without solving it a second time,
+ * which would be both expensive and self-confirming if the bug were in the
+ * solve's own dispatch.
+ *
+ * THE REDUCTION LENGTH IS `mm`, NOT `m`, AND THAT IS THE WHOLE CHECK. Row i of
+ * the corner sums i+1 <= 4 terms, so the honest tolerance is ~4*eps and not
+ * 8*m*eps. The distinction is not pedantry: fill_tri_d sets a unit diagonal and
+ * off-diagonals of TRI_OFFDIAG/n ~ 1e-9/n, deliberately, so the off-diagonal
+ * contribution to X[i] is ~1e-9/m -- about 4e-13 at m=8192. An m-scaled
+ * tolerance would be 1.4e-11 there, thirty times LARGER than the entire
+ * off-diagonal signal, and the check would certify a kernel that ignored the
+ * off-diagonal update path completely. At 8*mm*eps ~ 7e-15 that path is two
+ * orders of magnitude above the tolerance and actually tested. */
+static int verify_trsm_corner(const double *A, int lda, const double *X, int ldb,
+                              const double *B0, int m, int n, double alpha) {
+    int mm = corner_dim(m), nn = corner_dim(n);
+    double tol = 8.0 * (double)mm * DBL_EPSILON;
+    for (int j = 0; j < nn; j++)
+        for (int i = 0; i < mm; i++) {
+            double acc = 0.0;
+            for (int p = 0; p <= i; p++)
+                acc += tri_lo(A,lda,i,p) * X[(size_t)j*ldb + p];
+            if (!within(alpha * B0[(size_t)j*ldb + i], acc, tol)) return 0;
+        }
+    return 1;
+}
+
+/* dtrmm("L","L","N","N") computed B := alpha*A*B0 in place. Same triangular
+   structure as trsm, so the same corner closes over itself and the same
+   mm-not-m tolerance argument applies verbatim; the difference is only that
+   here the product is checked directly rather than as a residual. */
+static int verify_trmm_corner(const double *A, int lda, const double *B, int ldb,
+                              const double *B0, int m, int n, double alpha) {
+    int mm = corner_dim(m), nn = corner_dim(n);
+    double tol = 8.0 * (double)mm * DBL_EPSILON;
+    for (int j = 0; j < nn; j++)
+        for (int i = 0; i < mm; i++) {
+            double acc = 0.0;
+            for (int p = 0; p <= i; p++)
+                acc += tri_lo(A,lda,i,p) * B0[(size_t)j*ldb + p];
+            if (!within(alpha * acc, B[(size_t)j*ldb + i], tol)) return 0;
+        }
+    return 1;
+}
+
+/* dsyrk("L","N") computed C := alpha*A*A' + beta*C over the LOWER triangle only.
+   A correct kernel leaves the upper triangle untouched, so checking it would
+   fail one -- hence i starts at j, not at 0. */
+static int verify_syrk_corner(const double *A, int lda, const double *C, int ldc,
+                              const double *C0, int n, int k,
+                              double alpha, double beta) {
+    int nn = corner_dim(n);
+    double tol = 8.0 * (double)k * DBL_EPSILON;
+    for (int j = 0; j < nn; j++)
+        for (int i = j; i < nn; i++) {
+            double acc = 0.0;
+            for (int p = 0; p < k; p++)
+                acc += A[(size_t)p*lda + i] * A[(size_t)p*lda + j];
+            double want = alpha*acc + beta*C0[(size_t)j*ldc + i];
+            if (!within(want, C[(size_t)j*ldc + i], tol)) return 0;
+        }
+    return 1;
+}
+
+/* dsymm("L","L") computed C := alpha*A*B + beta*C, A symmetric m x m in its
+   lower triangle. The reduction runs the full m, so this is the one check whose
+   cost the corner does not bound -- 4*4*m, the same order as the gemm check. */
+static int verify_symm_corner(const double *A, int lda, const double *B, int ldb,
+                              const double *C, int ldc, const double *C0,
+                              int m, int n, double alpha, double beta) {
+    int mm = corner_dim(m), nn = corner_dim(n);
+    double tol = 8.0 * (double)m * DBL_EPSILON;
+    for (int j = 0; j < nn; j++)
+        for (int i = 0; i < mm; i++) {
+            double acc = 0.0;
+            for (int p = 0; p < m; p++)
+                acc += sym_lo(A,lda,i,p) * B[(size_t)j*ldb + p];
+            double want = alpha*acc + beta*C0[(size_t)j*ldc + i];
+            if (!within(want, C[(size_t)j*ldc + i], tol)) return 0;
+        }
+    return 1;
+}
+
+/* dgemv("N") computed y := alpha*A*x + beta*y. */
+static int verify_gemv_corner(const double *A, int lda, const double *x,
+                              const double *y, const double *y0,
+                              int m, int n, double alpha, double beta) {
+    int mm = corner_dim(m);
+    double tol = 8.0 * (double)n * DBL_EPSILON;
+    for (int i = 0; i < mm; i++) {
+        double acc = 0.0;
+        for (int p = 0; p < n; p++)
+            acc += A[(size_t)p*lda + i] * x[p];
+        if (!within(alpha*acc + beta*y0[i], y[i], tol)) return 0;
+    }
+    return 1;
+}
+
+/* sgemm, with the reference accumulated in FP64 against an FP32 tolerance.
+ * The tolerance is FLT_EPSILON-scaled, not DBL_EPSILON-scaled, and that is the
+ * whole reason this check was deferred rather than written wrong: a correct fp32
+ * kernel accumulates in fp32 and carries ~k*FLT_EPSILON of error, so a double
+ * reference held to the double tolerance would reject every real kernel on the
+ * planet. Accumulating the reference in double is still right -- it removes the
+ * reference's own error from the comparison instead of adding to it. */
+static int verify_sgemm_corner(const float *A, int lda, const float *B, int ldb,
+                               const float *C, int ldc, const float *C0,
+                               int m, int n, int k, float alpha, float beta) {
+    int mm = corner_dim(m), nn = corner_dim(n);
+    double tol = 8.0 * (double)k * FLT_EPSILON;
+    for (int j = 0; j < nn; j++)
+        for (int i = 0; i < mm; i++) {
+            double acc = 0.0;
+            for (int p = 0; p < k; p++)
+                acc += (double)A[(size_t)p*lda + i] * (double)B[(size_t)j*ldb + p];
+            double want = (double)alpha*acc + (double)beta*(double)C0[(size_t)j*ldc + i];
+            if (!within(want, (double)C[(size_t)j*ldc + i], tol)) return 0;
+        }
+    return 1;
+}
+
+/* daxpy computed y := alpha*x + y0. One or two roundings per element, so the
+   tolerance is a small constant -- fused and unfused multiply-add differ by at
+   most an ulp of the product. x and y are strided by incx, the axis this case
+   exists to probe; y0 holds only the corner, contiguously. */
+static int verify_axpy_corner(const double *x, const double *y, const double *y0,
+                              int n, int incx, double alpha) {
+    int nn = corner_dim(n);
+    double tol = 8.0 * DBL_EPSILON;
+    for (int i = 0; i < nn; i++) {
+        size_t o = (size_t)i * (size_t)incx;
+        if (!within(alpha*x[o] + y0[i], y[o], tol)) return 0;
+    }
+    return 1;
+}
+
+/* ddot is the one routine with no corner to take: the result IS the full
+ * reduction, so the reference costs a whole pass. That pass is untimed and runs
+ * once against thousands of timed reps, so it is free in the only budget that
+ * matters. The tolerance is n-scaled like the gemm check; at n=4194304 that is
+ * 7e-9 relative, which sounds loose until you ask what it rejects -- a kernel
+ * that dropped a single element of the vector lands ~1e-4 out, five orders above
+ * it, and a kernel that mishandled incx is not close at all. The loose end is
+ * summation ORDER, which is precisely the thing a correct kernel is entitled to
+ * change. */
+static int verify_dot_result(const double *x, const double *y, int n, int incx,
+                             double got) {
+    double acc = 0.0;
+    for (int i = 0; i < n; i++) {
+        size_t o = (size_t)i * (size_t)incx;
+        acc += x[o] * y[o];
+    }
+    return within(acc, got, 8.0 * (double)n * DBL_EPSILON);
+}
+
 /* ---- record emission --------------------------------------------------- */
 
 /* Verification state is tri-state on the wire, not boolean.
@@ -850,13 +1053,19 @@ static void run_sgemm(const Case *c) {
     float *A = xalloc((size_t)lda*k*sizeof(float));
     float *B = xalloc((size_t)ldb*n*sizeof(float));
     float *C = xalloc((size_t)ldc*n*sizeof(float));
+    float *C0 = xalloc((size_t)ldc*n*sizeof(float));
     fill_s(A,(size_t)lda*k); fill_s(B,(size_t)ldb*n); fill_s(C,(size_t)ldc*n);
+    memcpy(C0, C, (size_t)ldc*n*sizeof(float));
+
+    /* one verified call before timing; C is restored afterwards */
+    sgemm_("N","N",&m,&n,&k,&alpha,A,&lda,B,&ldb,&beta,C,&ldc);
+    int ok = verify_sgemm_corner(A,lda,B,ldb,C,ldc,C0,m,n,k,alpha,beta);
+    memcpy(C, C0, (size_t)ldc*n*sizeof(float));
+
     double *samples = NULL; int nreps = 0;
     TIMED_LOOP(sgemm_("N","N",&m,&n,&k,&alpha,A,&lda,B,&ldb,&beta,C,&ldc));
-    /* sgemm correctness is checked in the dgemm arm; fp32 corner tolerance
-       would need its own analysis and is not worth poisoning records over */
-    emit("sgemm", m,n,k,c->lda_pad, samples, nreps, case_flops("sgemm",m,n,k), VERIFIED_UNCHECKED, "corner_check_absent_fp32");
-    free(samples); free(A); free(B); free(C);
+    emit("sgemm", m,n,k,c->lda_pad, samples, nreps, case_flops("sgemm",m,n,k), ok, "");
+    free(samples); free(A); free(B); free(C); free(C0);
 }
 
 static void run_dtrsm(const Case *c) {
@@ -865,17 +1074,30 @@ static void run_dtrsm(const Case *c) {
     double alpha = 1.0;
     double *A = xalloc((size_t)lda*m*sizeof(double));
     double *B = xalloc((size_t)ldb*n*sizeof(double));
+    double *B0 = xalloc((size_t)ldb*n*sizeof(double));
     fill_tri_d(A, m, lda); fill_d(B,(size_t)ldb*n);
+    memcpy(B0, B, (size_t)ldb*n*sizeof(double));
+
+    /* One verified call before timing, then B is restored, so the timed loop
+       starts from a bit-identical operand to the one it started from before this
+       check existed. The measurement is unchanged. */
+    dtrsm_("L","L","N","N",&m,&n,&alpha,A,&lda,B,&ldb);
+    int ok = verify_trsm_corner(A,lda,B,ldb,B0,m,n,alpha);
+    memcpy(B, B0, (size_t)ldb*n*sizeof(double));
+
     double *samples = NULL; int nreps = 0;
     TIMED_LOOP(dtrsm_("L","L","N","N",&m,&n,&alpha,A,&lda,B,&ldb));
     /* dtrsm is destructive and TIMED_LOOP never restores B, so every rep feeds
        on the previous rep's output. fill_tri_d bounds the per-rep gain, but the
-       bound is an argument, not a measurement -- check it. */
+       bound is an argument, not a measurement -- check it. Both verdicts are
+       required: the corner says the answer was right on entry, the finiteness
+       probe says the operand did not wander out of range over the reps. Either
+       failing poisons the record, so either failing fails it. */
     int fin = operand_finite(B, (size_t)ldb*n);
     emit("dtrsm", m,n,0,c->lda_pad, samples, nreps, case_flops("dtrsm",m,n,0),
-         fin ? VERIFIED_UNCHECKED : VERIFIED_FAIL,
-         fin ? "corner_check_absent" : "operand_left_finite_range");
-    free(samples); free(A); free(B);
+         (ok && fin) ? VERIFIED_PASS : VERIFIED_FAIL,
+         !ok ? "corner_check_failed" : (fin ? "" : "operand_left_finite_range"));
+    free(samples); free(A); free(B); free(B0);
 }
 
 static void run_dtrmm(const Case *c) {
@@ -884,15 +1106,23 @@ static void run_dtrmm(const Case *c) {
     double alpha = 1.0;
     double *A = xalloc((size_t)lda*m*sizeof(double));
     double *B = xalloc((size_t)ldb*n*sizeof(double));
+    double *B0 = xalloc((size_t)ldb*n*sizeof(double));
     fill_tri_d(A, m, lda); fill_d(B,(size_t)ldb*n);
+    memcpy(B0, B, (size_t)ldb*n*sizeof(double));
+
+    dtrmm_("L","L","N","N",&m,&n,&alpha,A,&lda,B,&ldb);
+    int ok = verify_trmm_corner(A,lda,B,ldb,B0,m,n,alpha);
+    memcpy(B, B0, (size_t)ldb*n*sizeof(double));
+
     double *samples = NULL; int nreps = 0;
     TIMED_LOOP(dtrmm_("L","L","N","N",&m,&n,&alpha,A,&lda,B,&ldb));
-    /* destructive and unrestored, exactly as dtrsm above */
+    /* destructive and unrestored, exactly as dtrsm above, and the two verdicts
+       combine for the same reason */
     int fin = operand_finite(B, (size_t)ldb*n);
     emit("dtrmm", m,n,0,c->lda_pad, samples, nreps, case_flops("dtrmm",m,n,0),
-         fin ? VERIFIED_UNCHECKED : VERIFIED_FAIL,
-         fin ? "corner_check_absent" : "operand_left_finite_range");
-    free(samples); free(A); free(B);
+         (ok && fin) ? VERIFIED_PASS : VERIFIED_FAIL,
+         !ok ? "corner_check_failed" : (fin ? "" : "operand_left_finite_range"));
+    free(samples); free(A); free(B); free(B0);
 }
 
 static void run_dsyrk(const Case *c) {
@@ -901,11 +1131,18 @@ static void run_dsyrk(const Case *c) {
     double alpha = 1.0, beta = 1.0;
     double *A = xalloc((size_t)lda*k*sizeof(double));
     double *C = xalloc((size_t)ldc*n*sizeof(double));
+    double *C0 = xalloc((size_t)ldc*n*sizeof(double));
     fill_d(A,(size_t)lda*k); fill_d(C,(size_t)ldc*n);
+    memcpy(C0, C, (size_t)ldc*n*sizeof(double));
+
+    dsyrk_("L","N",&n,&k,&alpha,A,&lda,&beta,C,&ldc);
+    int ok = verify_syrk_corner(A,lda,C,ldc,C0,n,k,alpha,beta);
+    memcpy(C, C0, (size_t)ldc*n*sizeof(double));
+
     double *samples = NULL; int nreps = 0;
     TIMED_LOOP(dsyrk_("L","N",&n,&k,&alpha,A,&lda,&beta,C,&ldc));
-    emit("dsyrk", n,n,k,c->lda_pad, samples, nreps, case_flops("dsyrk",0,n,k), VERIFIED_UNCHECKED, "corner_check_absent");
-    free(samples); free(A); free(C);
+    emit("dsyrk", n,n,k,c->lda_pad, samples, nreps, case_flops("dsyrk",0,n,k), ok, "");
+    free(samples); free(A); free(C); free(C0);
 }
 
 static void run_dsymm(const Case *c) {
@@ -915,11 +1152,18 @@ static void run_dsymm(const Case *c) {
     double *A = xalloc((size_t)lda*m*sizeof(double));
     double *B = xalloc((size_t)ldb*n*sizeof(double));
     double *C = xalloc((size_t)ldc*n*sizeof(double));
+    double *C0 = xalloc((size_t)ldc*n*sizeof(double));
     fill_d(A,(size_t)lda*m); fill_d(B,(size_t)ldb*n); fill_d(C,(size_t)ldc*n);
+    memcpy(C0, C, (size_t)ldc*n*sizeof(double));
+
+    dsymm_("L","L",&m,&n,&alpha,A,&lda,B,&ldb,&beta,C,&ldc);
+    int ok = verify_symm_corner(A,lda,B,ldb,C,ldc,C0,m,n,alpha,beta);
+    memcpy(C, C0, (size_t)ldc*n*sizeof(double));
+
     double *samples = NULL; int nreps = 0;
     TIMED_LOOP(dsymm_("L","L",&m,&n,&alpha,A,&lda,B,&ldb,&beta,C,&ldc));
-    emit("dsymm", m,n,0,c->lda_pad, samples, nreps, case_flops("dsymm",m,n,0), VERIFIED_UNCHECKED, "corner_check_absent");
-    free(samples); free(A); free(B); free(C);
+    emit("dsymm", m,n,0,c->lda_pad, samples, nreps, case_flops("dsymm",m,n,0), ok, "");
+    free(samples); free(A); free(B); free(C); free(C0);
 }
 
 static void run_dgemv(const Case *c) {
@@ -929,11 +1173,18 @@ static void run_dgemv(const Case *c) {
     double *A = xalloc((size_t)lda*n*sizeof(double));
     double *x = xalloc((size_t)n*sizeof(double));
     double *y = xalloc((size_t)m*sizeof(double));
+    double *y0 = xalloc((size_t)m*sizeof(double));
     fill_d(A,(size_t)lda*n); fill_d(x,n); fill_d(y,m);
+    memcpy(y0, y, (size_t)m*sizeof(double));
+
+    dgemv_("N",&m,&n,&alpha,A,&lda,x,&inc,&beta,y,&inc);
+    int ok = verify_gemv_corner(A,lda,x,y,y0,m,n,alpha,beta);
+    memcpy(y, y0, (size_t)m*sizeof(double));
+
     double *samples = NULL; int nreps = 0;
     TIMED_LOOP(dgemv_("N",&m,&n,&alpha,A,&lda,x,&inc,&beta,y,&inc));
-    emit("dgemv", m,n,0,c->lda_pad, samples, nreps, case_flops("dgemv",m,n,0), VERIFIED_UNCHECKED, "corner_check_absent");
-    free(samples); free(A); free(x); free(y);
+    emit("dgemv", m,n,0,c->lda_pad, samples, nreps, case_flops("dgemv",m,n,0), ok, "");
+    free(samples); free(A); free(x); free(y); free(y0);
 }
 
 /* level 1 with a stride knob: incx>1 is where the arm64 tree is weakest */
@@ -948,16 +1199,34 @@ static void run_level1(const Case *c, const char *which, int incx) {
     fill_d(x,(size_t)n*incx); fill_d(y,(size_t)n*incx);
     double *samples = NULL; int nreps = 0;
     volatile double sink = 0.0;
+    int ok;
     if (!strcmp(which, "daxpy")) {
+        /* Only the corner of y is saved and restored, not all 32 MB of it: daxpy
+           is destructive with beta implicitly 1, so the elements outside the
+           corner carry one extra accumulation into the timed loop. That is one
+           rep against the thousands the loop runs, the growth is additive rather
+           than geometric (unlike the triangular hazard above), and the values
+           stay O(1) -- so it cannot move a timing. */
+        double ysave[VERIFY_CORNER];
+        int nn = corner_dim(n);
+        for (int i = 0; i < nn; i++) ysave[i] = y[(size_t)i*(size_t)incx];
+        daxpy_(&n,&alpha,x,&incx,y,&incx);
+        ok = verify_axpy_corner(x, y, ysave, n, incx, alpha);
+        /* ysave is indexed 0..nn-1 but y is strided; restore accordingly */
+        for (int i = 0; i < nn; i++) y[(size_t)i*(size_t)incx] = ysave[i];
         TIMED_LOOP(daxpy_(&n,&alpha,x,&incx,y,&incx));
     } else {
+        /* ddot is non-destructive, so there is nothing to save or restore. */
+        ok = verify_dot_result(x, y, n, incx, ddot_(&n,x,&incx,y,&incx));
         TIMED_LOOP(sink = ddot_(&n,x,&incx,y,&incx));
     }
     (void)sink;
-    char note[32]; snprintf(note, sizeof note, "incx=%d", incx);
+    /* incx is the axis this case exists to probe, so it stays in the note; a
+       failed corner is appended rather than replacing it. */
+    char note[48];
+    snprintf(note, sizeof note, "incx=%d%s", incx, ok ? "" : ";corner_check_failed");
     g_incx = incx;
-    emit(which, n,0,0,0, samples, nreps, case_flops(which,n,0,0),
-         VERIFIED_UNCHECKED, note);
+    emit(which, n,0,0,0, samples, nreps, case_flops(which,n,0,0), ok, note);
     g_incx = 1;
     free(samples); free(x); free(y);
 }

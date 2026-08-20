@@ -8,7 +8,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
+cd "$ROOT" || { printf 'FATAL: cannot cd to %s\n' "$ROOT" >&2; exit 1; }
 
 PASS=0
 FAIL=0
@@ -126,6 +126,24 @@ if bash tests/workload-preflight.sh >/tmp/gbb-p0-workload.log 2>&1; then
 else
   bad "workload preflight suite -- see /tmp/gbb-p0-workload.log"
   grep -A2 'FAIL' /tmp/gbb-p0-workload.log | head -30
+fi
+
+# ---- 5e. standing order 8's quiet trigger can actually fire --------------
+# sve_kernels() is the only automated check for "this library has no SVE kernels",
+# which CLAUDE.md calls the condition that outweighs every other question here. It
+# spent the whole first P2 pass unable to return anything but `no` -- `nm | grep -q`
+# under pipefail -- so it raised the escalation on four healthy builds and would
+# have been equally unable to stay silent on a genuinely SVE-less one. A checker
+# with no test is a checker whose state nobody knows.
+if bash tests/sve-probe-assert.sh >/tmp/gbb-p0-sve.log 2>&1; then
+  if grep -q '^SKIP' /tmp/gbb-p0-sve.log; then
+    printf '  \033[33mSKIP\033[0m  %s\n' "$(head -1 /tmp/gbb-p0-sve.log)"
+  else
+    ok "SVE probe suite ($(grep -o 'pass=[0-9]*' /tmp/gbb-p0-sve.log | tail -1))"
+  fi
+else
+  bad "SVE probe suite -- see /tmp/gbb-p0-sve.log"
+  grep -A2 'FAIL' /tmp/gbb-p0-sve.log | head -20
 fi
 
 # ---- 6. build flags are the ones we promised -----------------------------

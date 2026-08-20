@@ -2343,6 +2343,38 @@ def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, overlap, args, o
                 f"{lib}/{tgt}: blas_sha is empty — the BLAS under test is unidentified",
             )
 
+    # The build's own read-back of its configuration, where the producer attempted
+    # one. `target` is a request; `target_effective` is what the library says about
+    # itself. This is standing order 10 one library over from the coretype axis: the
+    # BLIS arm shipped a whole P2 pass labelled `target: "auto"` with nothing
+    # recording what auto resolved to, while running large DGEMM at 0.35x OpenBLAS
+    # single-threaded — a misconfiguration the label could not express and the
+    # analysis could not see. A null here is not an alarm: it means the producer
+    # attempted no read-back, which is true of every library but BLIS. An explicit
+    # "unknown" IS an alarm, because it means one was attempted and failed.
+    for m in sorted(inp.manifest_arms, key=lambda r: skey(r.get("library"))):
+        lib, tgt, eff = m.get("library"), m.get("target"), m.get("target_effective")
+        if eff is None or not m.get("built"):
+            continue
+        if str(eff) == "unknown":
+            add(
+                "!",
+                "target_readback_failed",
+                f"{lib}/{tgt}: the build tried to read its own configuration back and could "
+                f"not, so '{tgt}' is a request and not an observation (standing order 10).",
+            )
+        elif str(eff) != str(tgt):
+            # Not automatically wrong — a family config resolves to a sub-config at
+            # runtime, which is the whole reason the field exists. Reported so the
+            # resolved kernel set is in the report rather than only in a build log
+            # that the first pass did not even ship.
+            add(
+                "!",
+                "target_resolved_elsewhere",
+                f"{lib}/{tgt}: the library reports its configuration as '{eff}'. The kernel "
+                f"set measured is {eff}'s, not {tgt}'s; read any deficit against that.",
+            )
+
     for r in inp.arm_failures:
         note = " (SIGILL: target needs ISA this host lacks)" if r.get("exit_code") == 132 else ""
         add(
@@ -3757,9 +3789,7 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
     }
 
 
-def report_verdict(
-    verdict, lda, regimes, coverage, anomalies, replicates, overlap, exit_code, args, out
-):
+def report_verdict(verdict, lda, regimes, coverage, anomalies, replicates, overlap, exit_code, args, out):
     out("\n" + "=" * 78)
     out("DECISION")
     out("=" * 78)
@@ -4023,8 +4053,7 @@ def main(argv=None):
     mids = matrix_ids(inp.bench)
     if len(mids) > 1:
         lines = [
-            f"REFUSING TO ANALYSE {args.results}: {len(mids)} different case matrices in one "
-            "directory.",
+            f"REFUSING TO ANALYSE {args.results}: {len(mids)} different case matrices in one directory.",
             "",
             "Sections 1-7 pool by median across passes and section 8 compares passes. Neither "
             "is meaningful across two case matrices: cells present in one and absent in the "
@@ -4181,9 +4210,7 @@ def main(argv=None):
         # collected rather than about every dataset ever.
         exit_code |= 32
 
-    report_verdict(
-        verdict, lda, regimes, coverage, anomalies, replicates, overlap, exit_code, args, out
-    )
+    report_verdict(verdict, lda, regimes, coverage, anomalies, replicates, overlap, exit_code, args, out)
     print("\n".join(lines))
 
     if args.json:
