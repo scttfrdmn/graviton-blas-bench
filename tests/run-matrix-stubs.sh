@@ -274,12 +274,20 @@ print(sorted({json.loads(l)["threads"] for l in open(sys.argv[1])}))' "$RES/benc
 chk "cap warning emitted" "$(grep -c 'capping the ladder' "$W/results/H.stderr")" "1"
 
 echo "== M. a DECLARED alias runs; the record carries request and reported name =="
-# This is the real 0.3.32 behaviour on Graviton 4/5: KERNEL.NEOVERSEV2 is a
-# one-line include of KERNEL.NEOVERSEN2, so a NEOVERSEV2 request reports back
-# `neoversen2`. That is the campaign's central assumption coming true, and an
-# earlier version of run-matrix.sh recorded it as `unrunnable` -- the check meant
-# to detect the aliasing was the thing suppressing it. NEOVERSEN2 requested after
-# it must then be skipped as a duplicate, not measured twice.
+# The V2-reports-N2 direction. KERNEL.NEOVERSEV2 is a one-line include of
+# KERNEL.NEOVERSEN2, so a NEOVERSEV2 request selecting N2 kernels is the campaign's
+# central assumption coming true, and an earlier version of run-matrix.sh recorded
+# it as `unrunnable` -- the check meant to detect the aliasing was the thing
+# suppressing it. NEOVERSEN2 requested after it must then be skipped as a
+# duplicate, not measured twice.
+#
+# This is NOT the direction cc3fc1e reports, and the comment here used to claim it
+# was ("the real 0.3.32 behaviour on Graviton 4/5"). `gotoblas_corename()` checks
+# V2 before N2 on what is a single pointer, so the name that comes back is
+# `neoversev2` either way -- see scenario O, which is the observed one. This
+# scenario is kept because the direction depends entirely on that check order,
+# which OpenBLAS owes nobody: if it ever swaps those two lines, this is what the
+# hardware will do and the alias entry it exercises is the one that catches it.
 cat > "$W/bin/gbb-coreprobe-DYNAMIC" <<'EOF'
 #!/usr/bin/env bash
 case "${OPENBLAS_CORETYPE:-}" in
@@ -332,6 +340,75 @@ chk "arch_selected is unprobed for a static build with no probe binary" \
   "$(python3 -c 'import json,sys
 print(sorted({json.loads(l)["arch_selected"] for l in open(sys.argv[1]) if json.loads(l)["target"]=="NEOVERSEV1"}))' "$RES/bench-instr-M.ndjson")" \
   "['unprobed']"
+mk_bins   # restore the default stubs for anything after this
+
+echo
+echo "== O. the alias direction cc3fc1e actually takes: N2 requested, neoversev2 back =="
+# Measured on c8g.metal-48xl, 2026-08-20, and the reason this scenario exists: the
+# alias list carried only M's direction, so the NEOVERSEN2 arm was refused as
+# "request NOT honoured" when the request had been honoured exactly.
+#
+# In cc3fc1e's driver/others/dynamic_arm64.c: `#define gotoblas_NEOVERSEV2
+# gotoblas_NEOVERSEN2` is unconditional and there is no `extern` for a V2 table, so
+# the two names are one pointer; `force_coretype("NEOVERSEN2")` matches
+# corename[13] and returns exactly that pointer; and `gotoblas_corename()` tests V2
+# (corename[12]) before N2, so it answers `neoversev2` for both requests and can
+# never answer `neoversen2`. Hence: V2 verifies exactly and runs, N2 is the alias
+# and is the duplicate. That is the mirror image of M, and the census must say
+# `alias_duplicate` rather than `unrunnable` -- the difference between "V2 and N2
+# are the same kernel set on this build, which is the finding" and "the forced-N2
+# arm could not be measured here", which support opposite conclusions about the
+# campaign's headline question.
+cat > "$W/bin/gbb-coreprobe-DYNAMIC" <<'EOF'
+#!/usr/bin/env bash
+case "${OPENBLAS_CORETYPE:-}" in
+  "")           echo "neoversev2|OpenBLAS 0.3.32 DYNAMIC_ARCH NEOVERSEV2" ;;
+  NEOVERSEV2)   echo "neoversev2|OpenBLAS 0.3.32 DYNAMIC_ARCH NEOVERSEV2" ;;
+  NEOVERSEN2)   echo "neoversev2|OpenBLAS 0.3.32 DYNAMIC_ARCH NEOVERSEV2" ;;
+  ARMV8SVE)     echo "armv8sve|OpenBLAS 0.3.32 DYNAMIC_ARCH ARMV8SVE" ;;
+  NEOVERSEV1)   echo "neoversev1|OpenBLAS 0.3.32 DYNAMIC_ARCH NEOVERSEV1" ;;
+  ARMV8)        echo "armv8|OpenBLAS 0.3.32 DYNAMIC_ARCH ARMV8" ;;
+  NEOVERSEN1)   echo "neoversen1|OpenBLAS 0.3.32 DYNAMIC_ARCH NEOVERSEN1" ;;
+esac
+EOF
+chmod +x "$W/bin/gbb-coreprobe-DYNAMIC"
+mk_env 0 true true available
+rc=$(GBB_LADDER_OVERRIDE="1" run O)
+chk "exit 0" "$rc" "0"
+chk "NEOVERSEV2 verified exactly and ran -- no alias record for it" \
+  "$(python3 -c 'import json,sys
+rs=[json.loads(l) for l in open(sys.argv[1])]
+print(sorted({r["status"] for r in rs if r.get("coretype")=="NEOVERSEV2"}))' "$RES/census-instr-O.ndjson")" \
+  "['measured']"
+chk "NEOVERSEN2 is an alias duplicate, NOT unrunnable" \
+  "$(python3 -c 'import json,sys
+rs=[json.loads(l) for l in open(sys.argv[1])]
+print([r["status"] for r in rs if r.get("coretype")=="NEOVERSEN2"])' "$RES/census-instr-O.ndjson")" \
+  "['alias_duplicate']"
+chk "its reason names the arm already measuring that kernel set" \
+  "$(python3 -c 'import json,sys
+rs=[json.loads(l) for l in open(sys.argv[1])]
+print([("NEOVERSEV2 arm" in r["reason"], "not a declared alias" in r["reason"]) for r in rs if r.get("coretype")=="NEOVERSEN2"])' "$RES/census-instr-O.ndjson")" \
+  "[(True, False)]"
+chk "NEOVERSEN2 produced no bench records" \
+  "$(python3 -c 'import json,sys
+print(sum(1 for l in open(sys.argv[1]) if json.loads(l).get("coretype")=="NEOVERSEN2"))' "$RES/bench-instr-O.ndjson")" \
+  "0"
+chk "the shared kernel set is measured once forced plus once unforced, not twice forced" \
+  "$(python3 -c 'import json,sys
+rs=[json.loads(l) for l in open(sys.argv[1])]
+print(sorted({r["coretype"] for r in rs if r["target"]=="DYNAMIC" and r["arch_selected"]=="neoversev2"}))' "$RES/bench-instr-O.ndjson")" \
+  "['NEOVERSEV2', 'unforced']"
+# The regression itself, stated as the string that must not appear. Asserting
+# "no coretype arm is unrunnable" would be broader than the claim and would also
+# catch the static ARMV8SVE *target* arm this fixture's manifest marks unrunnable
+# for an unrelated reason -- a check that fails for the wrong reason is not a
+# check.
+chk "no arm is written off as an undeclared surprise here" \
+  "$(python3 -c 'import json,sys
+rs=[json.loads(l) for l in open(sys.argv[1])]
+print(sum(1 for r in rs if "not a declared alias" in (r.get("reason") or "")))' "$RES/census-instr-O.ndjson")" \
+  "0"
 mk_bins   # restore the default stubs for anything after this
 
 echo

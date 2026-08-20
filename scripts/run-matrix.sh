@@ -447,9 +447,14 @@ if [ "$HAS_SVE" = true ]; then
   CORETYPES="$CORETYPES ARMV8SVE NEOVERSEV1"
 fi
 if [ "$HAS_SVE2" = true ]; then
-  # Both, deliberately. 0.3.32 maps NEOVERSEV2 onto KERNEL.NEOVERSEN2, so these
-  # two should be byte-identical kernel sets -- measuring both is how that
-  # assumption gets checked instead of assumed.
+  # Both, deliberately, and only one of them can survive. cc3fc1e `#define`s
+  # gotoblas_NEOVERSEV2 to gotoblas_NEOVERSEN2 unconditionally, so the two
+  # requests select one pointer and the second is necessarily an alias duplicate
+  # (see alias_ok below). Requesting both anyway is what turns that identity from
+  # an assumption in this comment into an `alias_duplicate` census record stating
+  # it, measured on the host -- and it is what would catch a future OpenBLAS that
+  # gave V2 kernels of its own, where suddenly both would verify exactly and both
+  # would run.
   CORETYPES="$CORETYPES NEOVERSEV2 NEOVERSEN2"
 fi
 CORETYPES="${GBB_CORETYPES:-$CORETYPES}"
@@ -496,10 +501,37 @@ VERIFIED_CORETYPES=""
 # audited tree. Declared rather than inferred: "the reported name differs from
 # the request" cannot by itself tell an alias from an ignored request, and the
 # difference decides whether an arm is a measurement or a duplicate.
+#
+# Read off cc3fc1e's driver/others/dynamic_arm64.c, not assumed. Three facts
+# there, and each one moves an entry in this list:
+#
+#   1. `#define gotoblas_NEOVERSEV2 gotoblas_NEOVERSEN2` (line 229) is
+#      UNCONDITIONAL -- outside every DYN_*/NO_SVE branch, and there is no
+#      `extern gotoblas_t gotoblas_NEOVERSEV2` anywhere in the file. So V2 has no
+#      table of its own in any arm64 DYNAMIC_ARCH build: the two names are one
+#      pointer. That is stronger than "KERNEL.NEOVERSEV2 is a one-line include of
+#      KERNEL.NEOVERSEN2", which is a makefile fact; this is a C-level identity.
+#   2. `gotoblas_corename()` tests V2 (corename[12]) BEFORE N2 (corename[13]) on
+#      that single pointer, so it can never return "neoversen2" in this tree.
+#      Both requests report back `neoversev2`. The N2:neoversev2 direction is the
+#      one real hardware takes -- and it is what c8g.metal-48xl actually did on
+#      2026-08-20, where its absence here refused the arm as "request NOT
+#      honoured" when `force_coretype("NEOVERSEN2")` had returned exactly the
+#      table asked for (found=13 -> &gotoblas_NEOVERSEN2). Both directions are
+#      declared because which one appears depends on that check order, which is
+#      not a contract OpenBLAS owes anyone.
+#   3. NEOVERSEV3 is NOT in `corename[]` at all, so `force_coretype("NEOVERSEV3")`
+#      finds nothing, warns "Core not found", and returns NULL -- whereupon
+#      `gotoblas_dynamic_init()` sets `gotoblas = &gotoblas_ARMV8` and reports
+#      `armv8`. An unknown name does not degrade to auto-detection; it degrades to
+#      generic ARMV8, which is standing order 8's escalation trigger and must stay
+#      refused. The previous `NEOVERSEV3:neoversev2|NEOVERSEV3:neoversen2` entries
+#      described a mapping that does not exist and could only ever have permitted
+#      an arm whose request was provably ignored. Removed.
 alias_ok() {
   case "$1:$2" in
-    NEOVERSEV2:neoversen2) return 0 ;;                      # KERNEL.NEOVERSEV2 includes KERNEL.NEOVERSEN2
-    NEOVERSEV3:neoversev2|NEOVERSEV3:neoversen2) return 0 ;; # 0.3.32 maps V3 onto V2, and V2 onto N2
+    NEOVERSEN2:neoversev2) return 0 ;;  # what this tree does: corename checks V2 first
+    NEOVERSEV2:neoversen2) return 0 ;;  # the same identity seen from the other side
     *) return 1 ;;
   esac
 }
@@ -539,12 +571,14 @@ for CT in $CORETYPES; do
   # Three outcomes, not two.
   #
   # A request that reports back a DIFFERENT name is not automatically a failure:
-  # on SVE2 silicon it is the campaign's central assumption coming true.
-  # KERNEL.NEOVERSEV2 is a one-line include of KERNEL.NEOVERSEN2 and 0.3.32 maps
-  # NEOVERSEV3 onto NEOVERSEV2, so a NEOVERSEV2 request reporting `neoversen2` is
-  # the expected result and is the finding. An earlier version of this loop wrote
-  # that arm off as `unrunnable`, which made the check meant to *detect* the
-  # aliasing the thing that suppressed it.
+  # on SVE2 silicon it is the campaign's central assumption coming true. V2 and N2
+  # are one pointer in this tree, and `gotoblas_corename()` checks V2 first, so a
+  # NEOVERSEN2 request reporting `neoversev2` is the expected result and is the
+  # finding. An earlier version of this loop wrote that arm off as `unrunnable`,
+  # which made the check meant to *detect* the aliasing the thing that suppressed
+  # it -- and it did exactly that on c8g.metal-48xl on 2026-08-20, because the
+  # alias list carried only the V2:neoversen2 direction and the hardware takes the
+  # other one. Both are declared now; see alias_ok.
   #
   # But a request that lands somewhere unexpected is a different thing: it means
   # force_coretype() ignored the name, and the arm is then an unlabelled

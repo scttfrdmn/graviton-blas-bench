@@ -1161,10 +1161,17 @@ def arm_effective(host: HostSpec, arm: Arm):
     """What openblas_get_corename() reports for this arm.
 
     An unforced arm gets whatever DYNAMIC_ARCH chose. A forced arm gets its own
-    request, EXCEPT where OpenBLAS resolves the request to another name -- which is
-    the campaign's own case: standing order 8 records NEOVERSEV2 -> NEOVERSEN2 on a
-    recognised V2/V3 part, so the V2 arm on a real host is an alias and is censused
-    as one. That is the expected path, not an edge case."""
+    request, EXCEPT where OpenBLAS resolves the request to another name, which
+    `coretype_aliases` expresses per host.
+
+    Which direction the campaign's own hosts take is settled by reading cc3fc1e,
+    not by standing order 8: gotoblas_NEOVERSEV2 is `#define`d to
+    gotoblas_NEOVERSEN2 unconditionally and `gotoblas_corename()` checks V2 before
+    N2 on that one pointer, so a V2 request reports back `neoversev2` -- it verifies
+    exactly, and it is the NEOVERSEN2 request that comes back under another name and
+    is declined `alias_duplicate`. `p2-host` plants that direction because it is what
+    `run-matrix.sh` will write. `aliased-coretype` plants the other one on purpose;
+    see its docstring for why that is still a scenario worth having."""
     if arm.library != "openblas":
         return "n/a"
     if arm.coretype == "unforced":
@@ -1425,6 +1432,17 @@ def _w(path, recs):
 
 V1 = "NEOVERSEV1"
 V2 = "NEOVERSEV2"
+N2 = "NEOVERSEN2"
+
+# scripts/run-matrix.sh's alias_duplicate reason, verbatim. Hand-copied like the
+# rest of the census vocabulary, because there is nothing to import from a shell
+# script -- and load-bearing beyond faithfulness: `p2-host` asserts that the reason
+# reaches the report, so a drift here is a drift in what gate P2 rehearses against.
+ALIAS_DUPLICATE_REASON = (
+    "requested NEOVERSEN2; openblas_get_corename() reports 'neoversev2', which the "
+    "NEOVERSEV2 arm is already measuring. The two requests select the same kernel set "
+    "-- that is the finding, and measuring it twice would read as two independent arms."
+)
 
 
 def _host(**kw):
@@ -2682,15 +2700,25 @@ def sc_partial_arm():
 
 
 def sc_aliased_coretype():
-    """The expected path on the campaign's own hosts, not an edge case.
+    """A status that says "about to run" must never explain a missing cell.
 
-    Standing order 8 records that OpenBLAS resolves NEOVERSEV2 -> NEOVERSEN2 on a
-    recognised V2/V3 part, so on every real c8g/c9g run the V2 coretype arm is
-    censused `aliased` and its records carry a coretype_effective that differs from
-    the request. `aliased` is written BEFORE the arm runs and the arm then runs, so
-    it can never explain a missing cell -- but it was absent from CENSUS_SUCCESS,
-    which would have let a genuine hole in the campaign's central arm be accounted
-    for by a line that says "running it"."""
+    `aliased` is written BEFORE the arm runs and the arm then runs, so it can never
+    account for an absence -- but it was absent from CENSUS_SUCCESS, which would have
+    let a genuine hole in the campaign's central arm be excused by a line that says
+    "running it". That is what this plants, and it is the whole claim.
+
+    The direction planted here -- a NEOVERSEV2 request reporting back `neoversen2` --
+    is NOT what cc3fc1e does: it `#define`s the two to one pointer and
+    `gotoblas_corename()` checks V2 first, so the V2 request reports `neoversev2` and
+    verifies exactly. `p2-host` carries the direction the real hosts take, and
+    `alias-duplicate` carries its consequence. This scenario keeps the other
+    direction because `run-matrix.sh` still declares it: corename()'s check order is
+    an implementation detail OpenBLAS owes nobody, and if it flips, this is the arm
+    that appears -- with `aliased` back on the live path and this fixture the only
+    thing standing between it and CENSUS_SUCCESS. Do not "fix" it to match the
+    hardware; the docstring that did claim this was the hardware's direction is what
+    let the runner's own alias list go one-sided until c8g.metal-48xl refused an arm
+    over it on 2026-08-20."""
     arms = _arms(v1_gain=flat(1.22))
     for a in arms:
         if a.coretype == V2:
@@ -2702,9 +2730,10 @@ def sc_aliased_coretype():
     return Scenario(
         name="aliased-coretype",
         description=(
-            "The V2 arm is censused `aliased` -- the real campaign's own case -- and is "
-            "also missing every large size. `aliased` says the arm is being run, so it "
-            "must not be accepted as the reason a cell is absent."
+            "The V2 arm is censused `aliased` and is also missing every large size. "
+            "`aliased` says the arm is being run, so it must not be accepted as the "
+            "reason a cell is absent. The reported direction is the one this OpenBLAS "
+            "does NOT take -- see the docstring for why it is kept anyway."
         ),
         hosts=[_host(coretype_aliases={V2: "NEOVERSEN2"})],
         arms=arms,
@@ -4309,7 +4338,12 @@ def sc_p2_host():
         that P3's replicate rule reads as two passes;
       - all six coretypes an SVE2 host can force (`ARMV8 NEOVERSEN1 ARMV8SVE
         NEOVERSEV1 NEOVERSEV2 NEOVERSEN2`), plus the unforced arm the wheels ship
-        and ArmPL and netlib as named references;
+        and ArmPL and netlib as named references. Six REQUESTED, five measured:
+        NEOVERSEN2 lands on the table NEOVERSEV2 is already measuring and is
+        declined `alias_duplicate` with zero records. That is not a thinning of the
+        fixture, it is the shape of the dataset -- this fixture had both measured,
+        which is a shape `run-matrix.sh` cannot emit, so the P2 self-test was
+        rehearsing against one more arm than the real pass will contain;
       - the generic ARMV8 arm at 1 thread, which is the arm the re-sequencing
         decision named as mandatory: it is the campaign's most expensive single arm
         and the one the P3 cost extrapolation is anchored on. It is planted SLOW,
@@ -4348,6 +4382,7 @@ def sc_p2_host():
                 dynamic_selection="neoversev2",
                 sve_vl=16,
                 reference_arm=True,
+                coretype_aliases={"NEOVERSEN2": "NEOVERSEV2"},
             )
         ],
         arms=[
@@ -4355,7 +4390,15 @@ def sc_p2_host():
             slow,
             Arm("openblas", "DYNAMIC", "NEOVERSEN1", gain=flat(0.71), in_manifest=False),
             Arm("openblas", "DYNAMIC", "ARMV8SVE", gain=flat(0.87), in_manifest=False),
-            Arm("openblas", "DYNAMIC", "NEOVERSEN2", gain=flat(0.88), in_manifest=False),
+            Arm(
+                "openblas",
+                "DYNAMIC",
+                "NEOVERSEN2",
+                in_manifest=False,
+                measured=False,
+                census_status="alias_duplicate",
+                census_reason=ALIAS_DUPLICATE_REASON,
+            ),
         ],
         floor_probe={"mode": "agree"},
         expect=[
@@ -4372,6 +4415,82 @@ def sc_p2_host():
             # that quietly lost it would make the P2 gate's own self-test vacuous,
             # and the self-test is what stands in for the missing dataset.
             {"kind": "stdout_contains", "text": "ARMV8"},
+            # The N2 request is declined, and the decline is accounted for. Both
+            # halves matter: the bits-clear assertion above is what would fail if
+            # `alias_duplicate` were ever read as a success status, and this is what
+            # names the reason so a reader of the report is told which arm absorbed
+            # the arm that is missing.
+            {"kind": "json_number", "path": "coverage.by_status.alias_duplicate", "op": ">", "value": 0},
+            {"kind": "stdout_contains", "text": "select the same kernel set"},
+        ],
+    )
+
+
+def sc_alias_duplicate():
+    """The direction the campaign's own SVE2 hosts take, and its consequence.
+
+    cc3fc1e makes NEOVERSEV2 and NEOVERSEN2 one kernel table and reports it as
+    `neoversev2`, so `run-matrix.sh` measures the V2 request and declines the N2 one
+    `alias_duplicate`. Three things follow, and this plants all three at once because
+    a fixture that got any one of them wrong would still look plausible:
+
+      1. `alias_duplicate` IS an explanation. The arm produced nothing on purpose and
+         the census says why, so the cells it did not fill are explained absences and
+         not holes -- the opposite of `aliased`, which `aliased-coretype` plants.
+      2. The SURVIVING arm is the one labelled NEOVERSEV2, because CORETYPES puts V2
+         first -- and that label is what the by-coretype mechanism compares on.
+      3. It is not a hole in the CROSS either. V1-vs-V2 is the campaign's central
+         comparison and its coretype half is carried entirely by the surviving arm; a
+         fixture where the decline silently emptied that half would pass (1) and still
+         be useless.
+
+    Distinct from `p2-host`, which carries the same shape among eight other arms: a
+    nine-arm gate rehearsal is where an accounting error hides, and this is the
+    minimal set where it cannot."""
+    arms = _arms(v1_gain=flat(1.22))
+    arms.append(
+        Arm(
+            "openblas",
+            "DYNAMIC",
+            N2,
+            in_manifest=False,
+            measured=False,
+            census_status="alias_duplicate",
+            census_reason=ALIAS_DUPLICATE_REASON,
+        )
+    )
+    return Scenario(
+        name="alias-duplicate",
+        description=(
+            "The NEOVERSEN2 request lands on the table the NEOVERSEV2 arm is already "
+            "measuring and is declined `alias_duplicate`. An arm that produced nothing "
+            "on purpose, with the reason stated: an explained absence, not a hole, and "
+            "the surviving V2 arm still carries the central cross."
+        ),
+        hosts=[_host(has_sve=True, has_sve2=True, coretype_aliases={N2: V2})],
+        arms=arms,
+        expect=[
+            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "coverage.by_status.alias_duplicate", "op": ">", "value": 0},
+            {"kind": "exit_bits_clear", "bits": [4]},
+            {"kind": "stdout_contains", "text": "select the same kernel set"},
+            # (2) and (3) in one structural assertion. `both_mechanisms_agree`
+            # FAILS if either mechanism produced no comparable rows, and the
+            # coretype mechanism's rows exist only if the surviving V2 coretype arm
+            # is there under that label -- so a decline that took the wrong arm, or
+            # took the cross with it, cannot pass this. V1 is planted 22% ahead, so
+            # the verdict has to be directional as well as present: a cross emptied
+            # by the decline would go INCONCLUSIVE and fail the next two.
+            {"kind": "both_mechanisms_agree"},
+            {"kind": "verdict_code", "one_of": ["V1-SET-AHEAD"]},
+            {
+                "kind": "cross_verdicts_where",
+                "regime": "large",
+                "routine": "dgemm",
+                "mechanism": "coretype",
+                "expect": "V1-set-ahead",
+                "min_rows": 2,
+            },
         ],
     )
 
@@ -4415,6 +4534,7 @@ SCENARIOS = {
         sc_role_mixed,
         sc_partial_arm,
         sc_aliased_coretype,
+        sc_alias_duplicate,
         sc_lda_penalty,
         sc_lucky_sample,
         sc_lucky_pass,

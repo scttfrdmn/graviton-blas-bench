@@ -356,6 +356,49 @@ change can be compared.
   now includes the ten probe lines, deliberately: it answers "how much did this arm
   emit", and the probe is emitted.
 
+### Fixed — census
+
+- **The coretype-alias guard refused the arm it exists to detect, on real hardware.**
+  `alias_ok()` in `scripts/run-matrix.sh` declared only `NEOVERSEV2:neoversen2`, and
+  cc3fc1e takes the other direction: `gotoblas_NEOVERSEV2` is `#define`d to
+  `gotoblas_NEOVERSEN2` unconditionally (`driver/others/dynamic_arm64.c:229`, outside
+  every `DYN_*`/`NO_SVE` branch, with no `extern` for a V2 table), and
+  `gotoblas_corename()` tests V2 (`corename[12]`) *before* N2 (`corename[13]`) on that
+  single pointer — so it can never report `neoversen2`, and a `NEOVERSEN2` request
+  reports back `neoversev2`. The guard read that as "request NOT honoured" and censused
+  the arm `unrunnable`, when `force_coretype("NEOVERSEN2")` had returned exactly the
+  table asked for (`found=13`). `c8g.metal-48xl` did this on 2026-08-20. Both
+  directions are now declared, so the N2 request is censused `alias_duplicate` —
+  standing order 11 at arm granularity, and the two statuses support opposite
+  conclusions about gate P4's question: "V2 and N2 are the same kernel set on this
+  build, which is the finding" versus "the forced-N2 arm could not be measured here".
+  **No measurement changes**: the same arms run either way, since the V2 arm was
+  already measuring that table. What changes is what the census claims about the arm
+  that did not run.
+
+  Three fixture sites carried the same inverted assumption and are corrected with it,
+  none of them moving a set or a status: `tests/run-matrix-stubs.sh` scenario M
+  asserted the N2-reporting direction as "the real 0.3.32 behaviour" and therefore
+  could not catch this; `analysis/decompose.py` justified keeping `aliased` out of
+  `CENSUS_SUCCESS` by calling it the expected path on the campaign's own hosts (the
+  exclusion is right — `aliased` is written *before* the arm runs — but the rationale
+  was false, and a later reader could have moved it on the grounds that the status is
+  now unreachable); and `tools/synth.py`'s `aliased-coretype` said the same. Both
+  directions stay declared and both stay fixtured, because corename()'s check order is
+  an implementation detail OpenBLAS owes nobody.
+
+- **`gates/p2.sh --self-test` rehearsed against one more arm than a real pass can
+  contain.** The `p2-host` fixture planted `NEOVERSEV2` *and* `NEOVERSEN2` as fully
+  measured arms — a shape `run-matrix.sh` cannot emit, since the second request is
+  declined. Six coretypes requested, five measured, and the fixture now says so. New
+  `alias-duplicate` scenario carries the claim on a minimal arm set: `alias_duplicate`
+  is an explanation (so the cells the declined arm did not fill are explained absences,
+  the opposite of `aliased`), the surviving arm is the one labelled `NEOVERSEV2`, and
+  the by-coretype half of the central V1-vs-V2 cross is still populated by it. New stub
+  scenario O covers the runner half. Both mutation-validated: adding `alias_duplicate`
+  to `CENSUS_SUCCESS` fails `alias-duplicate` and `p2-host` and nothing else; removing
+  the `NEOVERSEN2:neoversev2` alias entry fails three of scenario O's assertions.
+
 ### Fixed — gate
 
 - **`gates/p1.sh` could go green on code that was not on disk.** Section 2 loads

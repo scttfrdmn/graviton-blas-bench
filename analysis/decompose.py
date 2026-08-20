@@ -373,12 +373,26 @@ LSCPU_DEFAULTED = "lscpu produced no topology"
 # separate process, so the arm refused to measure rather than write records under
 # a label belonging to a different library. A retry reproduces it.
 #
-# `aliased` is the one that matters most in practice, because it is the EXPECTED
-# path on the campaign's own hosts: standing order 8 records that OpenBLAS
-# resolves NEOVERSEV2 -> NEOVERSEN2, so the V2 coretype arm on a recognised V2/V3
-# part is censused `aliased` on every real run. Reading it as an explanation would
-# have let a genuine hole in the campaign's central arm be accounted for by a line
-# that says "running it".
+# `aliased` and `alias_duplicate` are the pair to keep straight, because they sit
+# on opposite sides of this set and the campaign's own hosts produce one of them.
+# cc3fc1e `#define`s gotoblas_NEOVERSEV2 to gotoblas_NEOVERSEN2 unconditionally, so
+# the two names are one pointer, and `gotoblas_corename()` tests V2 (corename[12])
+# BEFORE N2 (corename[13]) on it -- so it can never report "neoversen2" in this
+# tree. On a real SVE2 host the V2 request therefore reports back `neoversev2` and
+# verifies EXACTLY (censused `measured`, no alias record at all), and it is the
+# NEOVERSEN2 request that lands second on the same table and is censused
+# `alias_duplicate`. That direction is the finding, and it explains its own absence.
+#
+# So `aliased` is contingent, not expected: it needs the reported name to differ
+# from the request while not already being claimed, which in this tree takes either
+# a different CORETYPES order or a future OpenBLAS that changes corename()'s check
+# order or gives V2 a table of its own. It stays out of CENSUS_SUCCESS regardless,
+# and NOT because it is rare -- it is written BEFORE the arm runs and the run
+# follows, so accepting it would let a genuine hole in the campaign's central arm be
+# accounted for by a line that says "running it". An earlier version of this comment
+# had the direction backwards and called `aliased` the expected path; the correction
+# does not move the set, and a later reader must not move it either on the grounds
+# that the status is now unreachable.
 CENSUS_SUCCESS = frozenset({"measured", "ok", "aliased"})
 
 # Libraries that appear in the manifest or the census but are not performance
