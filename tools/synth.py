@@ -4467,7 +4467,30 @@ def sc_alias_duplicate():
             "on purpose, with the reason stated: an explained absence, not a hole, and "
             "the surviving V2 arm still carries the central cross."
         ),
-        hosts=[_host(has_sve=True, has_sve2=True, coretype_aliases={N2: V2})],
+        # A c8g identity, not the default c7g one with sve2 switched on. The status
+        # this plants only exists on SVE2 silicon, and #9's objection is exactly that
+        # a fixture whose host label disagrees with its arm set is a rigorous test of
+        # a machine that does not exist -- so the MIDR, the core name and the
+        # DYNAMIC_ARCH selection say Graviton 4 too, and the V1/V2 static targets in
+        # `_arms()` are runnable here for the reason `requires()` gives.
+        hosts=[
+            _host(
+                instance_type="c8g.metal-48xl",
+                instance_id="i-0c8g000000000002",
+                run_id="synth-c8g-alias",
+                cores=192,
+                cpus_online=192,
+                cpus_affinity=192,
+                has_sve=True,
+                has_sve2=True,
+                midr="0x413fd4f0",
+                midr_part="0xd4f",
+                core_name="NEOVERSEV2",
+                dynamic_selection="neoversev2",
+                sve_vl=16,
+                coretype_aliases={N2: V2},
+            )
+        ],
         arms=arms,
         expect=[
             {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 0},
