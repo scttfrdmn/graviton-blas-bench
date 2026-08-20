@@ -30,6 +30,16 @@
 # headline -- and its output decides one P3 question: whether pin_for() should
 # keep deriving the policy from the thread count.
 #
+# THE CHEAPEST HYPOTHESIS COSTS NOTHING AND IS READ FIRST
+#
+# roofline.c records the OpenMP place map (`omp_places`, `omp_place_procs`,
+# `omp_place_procs_total`). If OMP_PLACES=cores enumerates fewer places than the
+# cell asked for threads, threads double up on cores and per-core efficiency falls
+# for a reason with no NUMA content whatsoever -- which would explain the allcore
+# cliff outright and dismiss the memory-policy question for that row. Three
+# integers, no extra cell, and the summary at the end of this script calls it out
+# while the instance is still up. Read it before reading anything else here.
+#
 # QUARANTINE, BY CONSTRUCTION AND NOT BY DISCIPLINE
 #
 # This runs the same binaries over the same matrix_id as the campaign, so nothing
@@ -191,14 +201,20 @@ print(json.dumps({
 
 run_roof_cell() {
   local name="$1" T="$2" cpus="$3" mem="$4" bind="$5" what="$6" rep="$7"
-  local pol="numactl --physcpubind=$cpus $mem;omp_bind=$bind"
+  local pol="numactl --physcpubind=$cpus $mem;omp_bind=$bind;diag_cell=$name"
   local before after rc t0 t1
   before=$(wc -l < "$ROOFOUT")
   t0=$(date +%s.%N)
   set +e
+  # GBB_PIN_POLICY is the whole experiment here, and until it was passed the
+  # roofline records carried `pin_policy: "none"` -- roofline.c's default -- on the
+  # one instrument whose cliff this diagnostic exists to explain. The cell name goes
+  # into the string too, so a record is attributable to a cell without counting
+  # lines in emission order: a failed cell shifts every positional attribution after
+  # it, and the whole cell table is thirteen rows that differ only in policy.
   # shellcheck disable=SC2046
   env GBB_RUN_ID="$RUN_ID" GBB_HOST="$HOST" GBB_INSTANCE="$INSTANCE" \
-      GBB_BUILD="$GBB_BUILD" GBB_ROLE=diagnostic \
+      GBB_BUILD="$GBB_BUILD" GBB_ROLE=diagnostic GBB_PIN_POLICY="$pol" \
       GBB_THREADS="$T" OMP_NUM_THREADS="$T" $(omp_env "$bind") \
       GBB_DIAG_CELL="$name" \
       numactl --physcpubind="$cpus" "$mem" "$BIN/gbb-roofline" \
@@ -217,7 +233,7 @@ run_roof_cell() {
 
 run_bench_cell() {
   local name="$1" T="$2" cpus="$3" mem="$4" bind="$5" what="$6" rep="$7"
-  local pol="numactl --physcpubind=$cpus $mem;omp_bind=$bind"
+  local pol="numactl --physcpubind=$cpus $mem;omp_bind=$bind;diag_cell=$name"
   local before after rc t0 t1
   before=$(wc -l < "$OUT")
   t0=$(date +%s.%N)
@@ -260,6 +276,68 @@ printf '%s\n' "$BENCH_CELLS" | while IFS='|' read -r name T cpus mem bind what; 
   [ -n "${name:-}" ] || continue
   run_bench_cell "$name" "$T" "$cpus" "$mem" "$bind" "$what" 1
 done
+
+# ---------------------------------------------------------------------------
+# Read the answer out loud before shipping.
+#
+# Not a substitute for the analysis -- it is so the operator learns the cheapest
+# result of this run without downloading it. The place map is the reason: if a bound
+# cell enumerates fewer places than it asked for threads, the allcore cliff has a
+# thread-placement explanation and no NUMA explanation is needed, and that is
+# readable off three integers. A bound cell reporting `omp_places: 0` or null did
+# not answer the question at all, which the operator needs to know while the
+# instance is still up.
+# ---------------------------------------------------------------------------
+python3 - "$ROOFOUT" <<'PY' >&2 || log "summary failed; the records are still on disk"
+import collections, json, statistics, sys
+
+rows = []
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if line:
+        rows.append(json.loads(line))
+
+by = collections.defaultdict(dict)
+for r in rows:
+    cell = "unknown"
+    for tok in (r.get("pin_policy") or "").split(";"):
+        if tok.startswith("diag_cell="):
+            cell = tok.split("=", 1)[1]
+    key = (cell, r.get("threads"))
+    by[key].setdefault(r.get("metric"), []).append(r)
+
+def value_of(r):
+    # One column for three metrics: GFLOP/s for the FMA rows, GB/s for triad.
+    # scaling_efficiency rides alongside because it is the number that cliffed.
+    for k in ("gflops_f64", "triad_gbs"):
+        if r.get(k) is not None:
+            return r[k]
+    return None
+
+
+print("[diag] --- summary (median over reps) ---")
+print(f"[diag] {'cell':30s} {'t':>4s} {'places':>7s} {'procs':>7s} {'metric':18s} {'value':>10s}  eff")
+for (cell, t), metrics in sorted(by.items(), key=lambda kv: (str(kv[0][0]), kv[0][1] or 0)):
+    for metric, recs in sorted(metrics.items()):
+        vals = [v for v in (value_of(r) for r in recs) if v is not None]
+        v = statistics.median(vals) if vals else None
+        effs = [r["scaling_efficiency"] for r in recs if r.get("scaling_efficiency") is not None]
+        eff = f"{statistics.median(effs):.3f}" if effs else ""
+        p = recs[0].get("omp_places")
+        pt = recs[0].get("omp_place_procs_total")
+        # A bound cell whose place map is smaller than its thread count is the
+        # non-NUMA explanation for the allcore cliff, so it is called out here
+        # rather than left to be noticed in the table.
+        flag = ""
+        if metric == "peak_fma_allcore" and isinstance(pt, int) and pt and t and pt < t:
+            flag = f"  <-- PLACE MAP UNDER-ENUMERATES: {pt} procs for {t} threads"
+        if metric == "peak_fma_allcore" and (p in (None, 0)):
+            flag = "  <-- place map absent/empty: this cell cannot answer the placement question"
+        print(
+            f"[diag] {cell:30s} {t if t is not None else '?':>4} {str(p):>7s} {str(pt):>7s} "
+            f"{metric:18s} {v if v is None else round(v, 2):>10}  {eff}{flag}"
+        )
+PY
 
 # ---------------------------------------------------------------------------
 # Ship. gbb/diagnostics/, never gbb/campaign/ -- see QUARANTINE above.

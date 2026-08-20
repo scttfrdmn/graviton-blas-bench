@@ -44,6 +44,10 @@ EOF
 #!/usr/bin/env bash
 touch "$W/work/SWEEP-RAN"
 EOF
+  cat > "$W/repo/scripts/diag-numa.sh" <<EOF
+#!/usr/bin/env bash
+touch "$W/work/DIAG-RAN"
+EOF
   cat > "$W/repo/scripts/install-armpl.sh" <<EOF
 #!/usr/bin/env bash
 touch "$W/work/ARMPL-RAN"
@@ -146,6 +150,34 @@ chk "p3 satisfied built"           "$([ -f "$W/work/BUILD-RAN" ] && echo ran || 
 chk "p3 satisfied swept"           "$([ -f "$W/work/SWEEP-RAN" ] && echo ran || echo no)" ran
 chk "p3 satisfied records the status" "$(cat "$W/work/armpl-status" 2>/dev/null)" installed
 chk "completion signalled" "$([ -f "$W/work/COMPLETE" ] && echo yes || echo no)" yes
+teardown
+
+# ---- 7. GBB_WORKLOAD=diag-numa: the diagnostic runs and the sweep does NOT --
+# The failure this guards is the expensive one in the other direction: a diagnostic
+# launch that also ran the sweep would charge ~6 hours for an hour's question, and
+# would do it silently, since both produce records and both ship.
+setup
+rc="$(run_case GBB_PHASE=p2 GBB_WORKLOAD=diag-numa)"
+chk "diag-numa exits zero"          "$rc" 0
+chk "diag-numa built"               "$([ -f "$W/work/BUILD-RAN" ] && echo ran || echo no)" ran
+chk "diag-numa ran the diagnostic"  "$([ -f "$W/work/DIAG-RAN" ] && echo ran || echo no)" ran
+chk "diag-numa did NOT sweep"       "$([ -f "$W/work/SWEEP-RAN" ] && echo ran || echo no)" no
+teardown
+
+# ---- 8. an unknown GBB_WORKLOAD: refuse, and spend nothing ------------------
+# Two properties, and the second is the one worth the test: it must not default to
+# the sweep, and it must be caught BEFORE the build. A name validated at the
+# dispatch point instead would exit non-zero having already paid for build-libs.sh,
+# which passes an exit-code-only test while costing what this file exists to avoid.
+setup
+rc="$(run_case GBB_PHASE=p2 GBB_WORKLOAD=diag-nuna)"
+chk "unknown workload exits non-zero" "$([ "$rc" != 0 ] && echo yes || echo no)" yes
+chk "unknown workload did not build"  "$([ -f "$W/work/BUILD-RAN" ] && echo ran || echo no)" no
+chk "unknown workload did not sweep"  "$([ -f "$W/work/SWEEP-RAN" ] && echo ran || echo no)" no
+chk "unknown workload did not run the diagnostic" \
+  "$([ -f "$W/work/DIAG-RAN" ] && echo ran || echo no)" no
+chk "abort message names the accepted values" \
+  "$(grep -q "sweep, diag-numa" "$W/out" && echo yes || echo no)" yes
 teardown
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

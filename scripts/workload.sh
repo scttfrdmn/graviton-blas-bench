@@ -46,6 +46,11 @@
 #   GBB_ARMPL_MIRROR=s3://gbb-results-942542972736-us-east-1/gbb/vendor \
 #     bash scripts/workload.sh
 #
+# GBB_WORKLOAD selects what runs after the build: `sweep` (default, run-matrix.sh,
+# hours) or `diag-numa` (scripts/diag-numa.sh, minutes, role=diagnostic, output
+# quarantined under gbb/diagnostics/). The two are mutually exclusive and an
+# unknown name is refused in the preflight rather than defaulted.
+#
 # GBB_PHASE governs two things, both about reference arms. (1) Whether a missing ArmPL
 # is fatal: p2 -> no (recorded as an explained absence, which is what P2 pass 1 did),
 # p3 -> yes. (2) Whether BLIS is built at all: p3 -> no, dropped 2026-08-20 after its
@@ -126,6 +131,20 @@ else
      be the same harness, and 'it was main at the time' is not a pin."
 fi
 
+# ---- 3. the workload name, before anything expensive ----------------------
+# Validated HERE and dispatched much further down, deliberately. An unknown name
+# caught at the dispatch would already have paid for ArmPL and the build, and this
+# file's whole premise is that a launch which cannot produce what was asked for
+# aborts in seconds. A typo must not cost a build, and defaulting a typo to the
+# sweep must not cost a pass.
+WORKLOAD="${GBB_WORKLOAD:-sweep}"
+case "$WORKLOAD" in
+  sweep|diag-numa) say "workload=$WORKLOAD" ;;
+  *) die "GBB_WORKLOAD='$WORKLOAD' is not a workload this payload knows (sweep, diag-numa).
+     Refusing rather than defaulting to the sweep: defaulting would charge a full
+     pass for a typo, and the typo would be discovered in the bill." ;;
+esac
+
 # ---- 1. ArmPL, before anything expensive ---------------------------------
 # Three outcomes, and the third one is the point of putting this first:
 #   installed          -> ARMPL_DIR exported, build-libs.sh links the reference arm
@@ -176,14 +195,39 @@ say "build-libs exit=$BUILD_RC"
 [ "$BUILD_RC" -eq 0 ] || say "build-libs.sh returned $BUILD_RC -- continuing; the
      manifest records which arms built and which did not"
 
-# ---- sweep ----------------------------------------------------------------
+# ---- sweep, or the diagnostic in its place --------------------------------
+# GBB_WORKLOAD=diag-numa runs scripts/diag-numa.sh INSTEAD of the sweep. It is a
+# mode of this script rather than a second payload for the reason the header gives:
+# a hand-written /tmp payload drifts between launches, and the diagnostic launch
+# shares the whole expensive prefix with a pass -- same tree, same commit
+# assertion, same build, same log shipping. What it must NOT share is the sweep,
+# and the two are mutually exclusive here so a launch cannot accidentally do both
+# and charge six hours for an hour's question.
 date -u +%Y-%m-%dT%H:%M:%SZ > "$WORK/t-sweep-start"
-say "run-matrix.sh (hours; ships per arm to $GBB_S3_URI as it goes)"
-bash "$ROOT/scripts/run-matrix.sh" > "$WORK/run.log" 2>&1
-SWEEP_RC=$?
+case "$WORKLOAD" in
+  sweep)
+    say "run-matrix.sh (hours; ships per arm to $GBB_S3_URI as it goes)"
+    bash "$ROOT/scripts/run-matrix.sh" > "$WORK/run.log" 2>&1
+    SWEEP_RC=$?
+    ;;
+  diag-numa)
+    # role=diagnostic is asserted by diag-numa.sh itself, and it must be: this host
+    # IS a campaign host, so nothing it can read about itself would produce the
+    # quarantine. The records land under gbb/diagnostics/, never gbb/campaign/.
+    say "diag-numa.sh (minutes, not hours; diagnostic role, quarantined output)"
+    bash "$ROOT/scripts/diag-numa.sh" > "$WORK/run.log" 2>&1
+    SWEEP_RC=$?
+    ;;
+  *)
+    # Unreachable: the name was validated in the preflight above. Kept so that a
+    # future workload added in one place and not the other fails loudly here rather
+    # than falling through the case and reporting success having run nothing.
+    die "GBB_WORKLOAD='$WORKLOAD' passed the preflight and has no dispatch branch"
+    ;;
+esac
 echo "run-matrix exit=$SWEEP_RC" >> "$WORK/run.log"
 date -u +%Y-%m-%dT%H:%M:%SZ > "$WORK/t-sweep-end"
-say "run-matrix exit=$SWEEP_RC"
+say "$WORKLOAD exit=$SWEEP_RC"
 
 # ---- logs, then hand back to the on-complete hook -------------------------
 # Records are NOT copied here. run-matrix.sh's ship() already put them under
@@ -191,5 +235,5 @@ say "run-matrix exit=$SWEEP_RC"
 # prefix would double every measurement the moment someone syncs the bucket into
 # one directory.
 ship_logs
-say "done (armpl=$ARMPL_STATUS build=$BUILD_RC sweep=$SWEEP_RC); signalling completion"
+say "done (armpl=$ARMPL_STATUS build=$BUILD_RC $WORKLOAD=$SWEEP_RC); signalling completion"
 touch "$COMPLETE_MARKER"

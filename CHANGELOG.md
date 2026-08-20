@@ -13,6 +13,47 @@ change can be compared.
 
 ## [Unreleased]
 
+### Fixed — the pinning diagnostic could not attribute its own records; no measured number changes
+
+- **`diag-numa.sh`'s roofline cells never passed `GBB_PIN_POLICY`, so every record in
+  the experiment carried `pin_policy: "none"`.** The whole diagnostic is thirteen
+  cells that differ *only* in the memory policy and the CPU set, and roofline.c
+  defaults that field to `"none"` when the env var is absent — so the independent
+  variable was missing from the records it was varied in, on the one instrument
+  (`peak_fma_allcore`, 94% → 53% per core across t=96 → t=128) whose cliff the
+  diagnostic exists to explain. Attribution would have fallen back to counting lines
+  in emission order, which a single failed cell shifts. Both paths now pass the
+  policy string, and it carries `diag_cell=<name>` so a record names its own cell.
+  Same defect class as the two provenance gaps fixed in `26317de`: a field that
+  reads as recorded because the producer has a default.
+
+### Added — the diagnostic launches from the payload, not from a hand-written script
+
+- **`GBB_WORKLOAD=diag-numa` runs `scripts/diag-numa.sh` in place of the sweep.** The
+  diagnostic shares the whole expensive prefix with a pass — same tree, same commit
+  assertion, same build, same log shipping — and the only thing it must not share is
+  the sweep. Making it a mode of `workload.sh` rather than a second payload is the
+  same argument that put the payload in-tree: P2 pass 1 ran from a hand-written
+  script in `/tmp`, and a hand-driven payload drifts between launches.
+
+  **The name is validated in the preflight and dispatched after the build,
+  deliberately.** An unknown `GBB_WORKLOAD` caught at the dispatch would already have
+  paid for ArmPL and `build-libs.sh`, and defaulting an unrecognised name to `sweep`
+  would charge a full pass for a typo — discovered in the bill. Two new
+  `tests/workload-preflight.sh` cases, both mutation-validated: `diag-numa` runs the
+  diagnostic and **not** the sweep (a launch that ran both would charge ~6 hours for
+  an hour's question, silently, since both produce records and both ship), and an
+  unknown name exits non-zero having reached neither the build nor either workload.
+
+- **`diag-numa.sh` reads its cheapest answer out loud before shipping.** A summary
+  table per cell — threads, `omp_places`, `omp_place_procs_total`, each metric, and
+  `scaling_efficiency` — with an explicit callout when a bound cell's place map
+  enumerates fewer procs than the cell asked for threads. That case is the non-NUMA
+  explanation for the allcore cliff: threads doubling up on cores drops per-core
+  efficiency with no page placement involved, which would dismiss the memory-policy
+  question for that row outright. It is three integers already in the record, and the
+  operator now learns it while the instance is still up rather than after a download.
+
 ### Changed — affects how the timing-floor band is measured and read; no matrix number changes
 
 - **The overlap band is replicated four times per size, because at two pairs a cell it
