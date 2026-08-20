@@ -103,6 +103,21 @@ jobs:
         # between arms.
         run: bash gates/check-build-flags.sh
 
+  # Lint only, and its OWN job for the same reason python-format is: steps inside a
+  # job are sequential, so a failing lint step skips every substantive step after it.
+  # That is not hypothetical here either -- shellcheck failed on this job from b59ae7b,
+  # and the four suites below it therefore did not run for the whole window. One of
+  # them (arch-selected-assert.sh) was broken on ELF the entire time and CI could not
+  # say so. Exactly the shape of the ruff-format/gate-p1 defect, one language over.
+  shell-lint:
+    name: shell lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+
   shell:
     name: shell
     runs-on: ubuntu-24.04
@@ -115,19 +130,20 @@ jobs:
             bash -n "$f" || { echo "::error file=$f::bash -n failed"; fail=1; }
           done < <(find . -name '*.sh' -not -path './.git/*')
           exit $fail
-      - uses: ludeeus/action-shellcheck@master
-        with:
-          severity: warning
       - name: run-matrix decision logic (stub suite)
         # The runner decides whether to spend instance-hours and what to call
         # each arm. A defect there yields a plausible wrong answer rather than a
         # failed run, so it is tested on every push, against stubs, on any arch.
         run: bash tests/run-matrix-stubs.sh
       - name: arch_selected is asserted, not reported
+        # Runs even if an earlier suite failed -- see the shell-lint comment.
+        if: ${{ !cancelled() }}
         # Standing order 8 rides on capture-env.sh refusing to proceed rather
         # than noting the problem in a file nobody reads.
         run: bash tests/arch-selected-assert.sh
       - name: the SVE probe can report yes
+        # Runs even if an earlier suite failed -- see the shell-lint comment.
+        if: ${{ !cancelled() }}
         # Standing order 8's quiet trigger is build-libs.sh's sve_kernels(), and it
         # shipped a whole P2 pass as a constant function returning "no": `nm |
         # grep -q` under `set -o pipefail` reports 141 when grep exits early, so
@@ -138,6 +154,8 @@ jobs:
         run: bash tests/sve-probe-assert.sh
 
       - name: the payload refuses a pass before spending on it
+        # Runs even if an earlier suite failed -- see the shell-lint comment.
+        if: ${{ !cancelled() }}
         # workload.sh aborts a P3 pass with no ArmPL or no commit pin *before*
         # build-libs.sh, so the cost of a bad launch is minutes rather than hours.
         # The suite asserts the ordering, not just the exit code.
@@ -193,7 +211,7 @@ jobs:
     name: gate p0
     # p0's stated requirement is "CI green on a clean clone", so it does depend
     # on formatting. That is correct for P0 and wrong for P1.
-    needs: [c, shell, python, python-format]
+    needs: [c, shell, shell-lint, python, python-format]
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4

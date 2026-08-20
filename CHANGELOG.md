@@ -111,6 +111,47 @@ change can be compared.
   flags conform to standing order 6". Same shape as the `sve_kernels()` bug below:
   a probe failure collapsing into a substantive answer. An unverifiable compile
   line is now a `FAIL`, verified against a fixture on which the old form exits 0.
+- **`tests/arch-selected-assert.sh` was vacuous on ELF — the platform the campaign
+  runs on — and green on the dev host.** It linked its stub `openblas_get_corename`
+  into the *executable*. `bench.c` finds that symbol with
+  `dlsym(RTLD_DEFAULT, ...)`, and on ELF an executable-resident symbol is absent
+  from `.dynsym` unless the link passes `-rdynamic`, so the lookup returned NULL.
+  `bench.c` then behaved perfectly correctly — no OpenBLAS in the image, label the
+  arm `n/a` — and every assertion about **refusing a disagreeing label passed
+  without exercising the refusal**. Measured on aarch64 Linux against the old form:
+  `openblas_get_corename` in `.dynsym` = **0**, `arch_selected` recorded as
+  `unprobed` rather than `neoversen2`, and a deliberately disagreeing label exited
+  **0 instead of 4**. Mach-O exports executable globals by default, which is why it
+  passed locally. The suite that guards standing order 10's fatal check — *"a
+  mislabelled arm is not a failed run, it is a plausible wrong answer"* — could not
+  fail on the only platform that matters.
+
+  Fixed by putting the stub where the real symbol lives: a **shared library**, linked
+  with an rpath. `-rdynamic` would have fixed the symptom while leaving the fixture
+  testing a topology that does not exist — in the campaign the corename comes out of
+  `libopenblas.so`. Same rule as P1's "the fixture must stay faithful to the
+  producers", applied to link topology rather than to size ladders.
+
+  The suite now **proves it is non-vacuous before asserting anything**: it reads back
+  `arch_selected` from the stub-linked binary and aborts if it is not `neoversen2`,
+  rather than reporting a green it has not earned. And a build failure is now a
+  `FAIL`, not a `SKIP` — only a wholly absent compiler skips. `SKIP` on a broken build
+  is the same vacuous-pass shape as `check-build-flags.sh` above: a renamed source or
+  a new dependency in `bench.c` would have printed SKIP and passed, which is how the
+  broken-build case was found. Verified on aarch64 Linux (10/10, and 10/10 on Mach-O),
+  and mutation-validated on two mutations — a stub that answers nothing trips the
+  vacuity guard, and an unbuildable source exits 1.
+
+- **The `shell` job's shellcheck step had been hiding four test suites, which is how
+  the above survived.** Steps within a job are sequential, so shellcheck failing from
+  `b59ae7b` meant `run-matrix-stubs.sh`, `arch-selected-assert.sh`,
+  `sve-probe-assert.sh` and `workload-preflight.sh` **did not run at all** for that
+  whole window — the identical defect to `ruff format` taking down `gate-p1`, one
+  language over, and it was live at the same time. Lint is now its own `shell-lint`
+  job, and the remaining suites carry `if: ${{ !cancelled() }}` so that four
+  independent questions get four answers instead of stopping at the first no.
+  `gate-p0` requires both jobs, since its bar is "CI green on a clean clone".
+
 - Tree-wide `shellcheck --severity=warning` is clean, which the `shell` job has
   been failing on: five `cd` without `|| exit` (these scripts run `set -uo
   pipefail`, no `-e`, so a failed `cd` really did continue), two dead variables,
