@@ -387,6 +387,25 @@ change can be compared.
   directions stay declared and both stay fixtured, because corename()'s check order is
   an implementation detail OpenBLAS owes nobody.
 
+- **The first P2 pass predates the fix above, and carries a dataset note saying so.**
+  `docs/dataset-notes/20260820T031023Z-ip-172-31-36-19-census.md`, uploaded to that
+  run's S3 prefix as `NOTE-census-…md` and **required in any release artifact that
+  publishes the run**. Run `20260820T031023Z-ip-172-31-36-19` was already sweeping on
+  `9048a2b` when the guard was fixed, so its census carries `unrunnable` for the
+  `NEOVERSEN2` arm with a reason string asserting that `force_coretype()` ignored the
+  request — a status the code can no longer emit for that arm, and a mechanism claim
+  that is simply false. The pass was **not** re-run (~10 instance-hours, ~$80, and no
+  measurement would change) and the shipped census was **not** edited: rewriting a
+  record after it shipped destroys the only evidence of what the harness did. The note
+  quotes both records verbatim, gives the cc3fc1e mechanism, and states what does not
+  move — `NEOVERSEN2` produced zero bench records under either status, and both
+  statuses sit outside `CENSUS_SUCCESS` carrying a reason, so the arm is an *explained*
+  absence in both vocabularies and `gates/p2.sh`'s zero-`MISSING-UNEXPLAINED`
+  requirement is met as shipped (verified: `coverage.by_arm` buckets all 110 of that
+  arm's cells under `unrunnable`). What differs is the `by_status` bucket, so a reader
+  diffing this pass's census against a P3 pass's will see one arm move, and that move
+  is this note.
+
 - **`gates/p2.sh --self-test` rehearsed against one more arm than a real pass can
   contain.** The `p2-host` fixture planted `NEOVERSEV2` *and* `NEOVERSEN2` as fully
   measured arms — a shape `run-matrix.sh` cannot emit, since the second request is
