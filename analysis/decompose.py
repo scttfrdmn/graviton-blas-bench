@@ -125,10 +125,32 @@ DEFAULT_MIN_EFFECT = 0.05
 # neighbour. 25% on a no-turbo, no-SMT host is not thermal or frequency drift.
 DEFAULT_NOISY_SPREAD = 0.25
 
-# peak_fma has to exceed the best observed GEMM by this factor before standing
-# order 1's "every arm is leaving headroom" flag fires. 1.15 leaves room for the
-# ordinary gap between an FMA-chain microbenchmark and a real blocked GEMM.
-DEFAULT_HEADROOM_FACTOR = 1.15
+# There is no DEFAULT_HEADROOM_FACTOR, and there must not be one again.
+#
+# Standing order 1's `peak_fma` cross-check is RETIRED (Scott, 2026-08-20). It was
+# meant to catch the one case the empirical denominator cannot see by construction:
+# every arm on a host being bad, which moves the ceiling down with the arms and so
+# leaves the efficiency figures looking fine. It cannot catch it. `src/roofline.c`
+# declares `peak_fma` a LOWER bound on purpose -- whether its accumulator array
+# vectorises into NEON or SVE is the compiler's decision, and standing order 6
+# forbids `-march=native` on the harness -- so only the peak > GEMM direction was
+# ever meaningful. Measured on `c8g.metal-48xl` at t=1: peak_fma 4.22 GFLOP/s
+# against a best large DGEMM of 18.16, a ratio of 0.232. A bound 4.3x under the
+# measurement it is supposed to bound cannot fire at any threshold, so the flag was
+# not passing, it was absent while reading as protection.
+#
+# The alternative was to build roofline.c alone with `-O3 -march=native` so the
+# accumulators actually vectorise. Rejected: it breaks "the harness is compiled
+# identically across arms" and makes the campaign's only independent floor a number
+# whose value depends on gcc's vectoriser. Better no floor than that floor.
+#
+# So the empirical ceiling stands ALONE, with no independent floor, and section 6
+# prints `peak_fma` as provenance only. What survives in `src/roofline.c` is
+# `IMPLAUSIBLE_GFLOPS_PER_CORE` and `sanity_check()`'s hard abort: those guard
+# against the optimizer folding the FMA chain away (standing order 2, 927 TFLOP/s
+# on one core), which is still worth guarding even though the number it protects
+# has no analytic use here. Do not reintroduce a threshold on `peak_fma / best
+# GEMM` without first making `peak_fma` a bound tight enough to be exceeded.
 
 # Sizes that must be comparable at identical (m,n,k,lda_pad,transa,transb) before
 # a regime may carry a directional verdict. A verdict from one or two sizes is a
@@ -404,8 +426,8 @@ CENSUS_SUCCESS = frozenset({"measured", "ok", "aliased"})
 # flag saying "you have a coverage hole" would have been the one flag guaranteed
 # to be lying.
 #
-#   roofline   run-matrix.sh censuses the peak_fma cross-check as an arm, because
-#              an absent denominator is a gap needing a stated reason like any
+#   roofline   run-matrix.sh censuses the peak_fma instrument as an arm, because a
+#              missing provenance record is a gap needing a stated reason like any
 #              other. It writes roofline-*.ndjson, not bench-*.ndjson.
 #   reference  netlib libblas. build-libs.sh builds it as a correctness control
 #              and records it built:true/runnable:true; run-matrix.sh skips it
@@ -431,8 +453,11 @@ NON_BENCH_LIBRARIES = frozenset({"roofline", "reference", "host"})
 # campaign". Until now the analysis did no such thing: it never read the field.
 # One `aws s3 sync` of a bucket holding both prefixes, or one tarball unpacked
 # into the wrong directory, and GB10 numbers pool into the Graviton dataset in
-# silence -- and because the pool feeds the measured-peak denominator, a faster
-# instrument host also silently defeats standing order 1's headroom check.
+# silence -- and because the pool feeds standing order 1's measured-peak
+# denominator, a faster instrument host would deflate every efficiency figure on
+# the host it contaminated. Nothing else checks that denominator: the `peak_fma`
+# cross-check that once nominally did is retired, so this filter is the only thing
+# standing between a stray instrument record and the published ceiling.
 # A record with no role at all predates the field and is taken at its word.
 DEFAULT_ROLE = "campaign"
 
@@ -2386,6 +2411,13 @@ def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, overlap, args, o
             f"... and {len(noisy) - args.max_listed} more above {100 * args.noisy_spread:.0f}% spread",
         )
 
+    # No `peak_fma` anomaly of any kind, in either direction, and that is the only
+    # thing this loop does NOT look at. The cross-check is retired (see
+    # DEFAULT_HEADROOM_FACTOR's absence above), so a `peak_fma` exceeding the best
+    # GEMM is not a finding and a `peak_fma` missing is not a failed check -- there is
+    # no check to fail. Section 6 prints the number, and prints `absent` where there is
+    # none, as provenance. Flagging its absence here would keep advertising protection
+    # that was withdrawn.
     for s in scaling:
         # The denominator policy's own failure mode, and it has to be loud: an
         # efficiency figure divided by a per-rung max looks exactly like one divided
@@ -2399,21 +2431,6 @@ def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, overlap, args, o
                 f"thread point on this host, so standing order 1's denominator fell back to "
                 f"this thread point's own max — efficiency here is NOT comparable to other "
                 f"thread counts on the same host",
-            )
-        if s["peak_fma"] is None:
-            add(
-                ".",
-                "peak_fma_absent",
-                f"{s['instance']} t={s['threads']}: no peak_fma record — standing order 1's "
-                f"cross-check was NOT performed here (absent, not passed)",
-            )
-        elif s["headroom_ratio"] is not None and s["headroom_ratio"] > args.headroom_factor:
-            add(
-                "!",
-                "headroom",
-                f"{s['instance']} t={s['threads']}: peak_fma {s['peak_fma']:.1f} exceeds best GEMM "
-                f"{s['best_dgemm']:.1f} by {100 * (s['headroom_ratio'] - 1):.0f}% — every arm on this "
-                f"host may be leaving headroom, and that gap is the headline",
             )
 
     # Verification coverage, per routine. dtrsm/dtrmm/dsymm have no check at all,
@@ -2447,7 +2464,7 @@ def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, overlap, args, o
 # ---- 6. scaling ------------------------------------------------------------
 
 
-def compute_scaling(cells, roof, args):
+def compute_scaling(cells, roof):
     """Primary denominator: the best GFLOP/s any arm achieved on that host at
     that thread count over large dgemm (standing order 1 -- changing this needs
     Scott). max() over arms is the policy here and only here; it is computed
@@ -2526,15 +2543,9 @@ def compute_scaling(cells, roof, args):
         # What the restriction cost, signed and relative. Zero is the expected
         # answer on DGEMM above n=2048 and is reported rather than assumed.
         cost = None if (emp is None or not emp or emp_u is None) else (emp_u - emp) / emp
-        # An empty peak list must stay None. It used to collapse to 0, so the
-        # cross-check printed `nan` and vanished instead of announcing itself.
+        # An empty peak list must stay None. It used to collapse to 0, so the number
+        # printed `nan` and vanished instead of announcing itself.
         pk = max(peaks[key]) if peaks.get(key) else None
-        # The cross-check divides by the SAME denominator the efficiency figures
-        # use. Against the unrestricted max the ratio would be smaller, so standing
-        # order 1's headroom flag would fire less often than the published ceiling
-        # warrants -- the wrong direction for a check whose whole job is to notice
-        # that every arm is leaving performance on the floor.
-        ratio = None if (emp is None or not emp or pk is None) else pk / emp
         rows.append(
             {
                 "instance": inst,
@@ -2547,15 +2558,12 @@ def compute_scaling(cells, roof, args):
                 "best_dgemm_unrestricted": emp_u,
                 "best_dgemm_unrestricted_m": top_u[1] if top_u else None,
                 "denom_restriction_cost": cost,
+                # Provenance only. There is deliberately no `headroom_ratio` and no
+                # `peak_fma_status`: a status field with an `ok` value implies a check
+                # ran, and none does. A consumer wanting the ratio can divide, and
+                # will then have to decide for itself what a LOWER bound 4x under the
+                # measurement means -- which is the decision that retired the check.
                 "peak_fma": pk,
-                "headroom_ratio": ratio,
-                "peak_fma_status": (
-                    "absent"
-                    if pk is None
-                    else "headroom"
-                    if (ratio is not None and ratio > args.headroom_factor)
-                    else "ok"
-                ),
             }
         )
     return rows
@@ -2568,10 +2576,13 @@ def report_scaling(rows, out):
     out("Denominator = best large dgemm over the sizes this host ran at EVERY thread")
     out("count, so efficiency is comparable along the thread axis. The per-rung max is")
     out("shown where it differs; it is provenance, not the denominator.")
+    out("peak_fma is provenance too, and NOT a cross-check: roofline.c's FMA chain is a")
+    out("lower bound at -O2 (no -march=native, standing order 6) and measures ~4x under")
+    out("the best GEMM on Graviton 4, so the empirical ceiling stands alone with no")
+    out("independent floor. Retired 2026-08-20; do not read it as a check that passed.")
     for s in rows:
-        pk = "absent (cross-check NOT performed)" if s["peak_fma"] is None else f"{s['peak_fma']:9.2f}"
+        pk = "absent" if s["peak_fma"] is None else f"{s['peak_fma']:9.2f}"
         emp = "absent" if s["best_dgemm"] is None else f"{s['best_dgemm']:9.2f}"
-        flag = "  <-- headroom, see section 5" if s["peak_fma_status"] == "headroom" else ""
         # Which size won, and out of how many this thread point had. Kept from the
         # annotate-only version of this policy because it is good provenance either
         # way: a denominator sitting at the top of a truncated ladder is the case to
@@ -2582,7 +2593,7 @@ def report_scaling(rows, out):
             if s["best_dgemm_m"] is None
             else f" at n={s['best_dgemm_m']} of {s['large_sizes_available']} size(s)"
         )
-        out(f"  {s['instance']!s:14s} t={s['threads']!s:<4} best_large_dgemm={emp}{at} peak_fma={pk}{flag}")
+        out(f"  {s['instance']!s:14s} t={s['threads']!s:<4} best_large_dgemm={emp}{at} peak_fma={pk}")
         # Second line only when there is something to say. Printing "cost 0.0%" on
         # every row would train a reader to skip the line that matters.
         if s.get("denom_basis") == "per-rung-fallback":
@@ -3943,13 +3954,6 @@ def parse_args(argv=None):
         default=DEFAULT_NOISY_SPREAD,
         help=f"(t_p50-t_min)/t_min above which a record is named as noisy (default {DEFAULT_NOISY_SPREAD})",
     )
-    ap.add_argument(
-        "--headroom-factor",
-        type=float,
-        default=DEFAULT_HEADROOM_FACTOR,
-        help=f"peak_fma / best GEMM above which standing order 1's headroom flag fires "
-        f"(default {DEFAULT_HEADROOM_FACTOR})",
-    )
     ap.add_argument("--v1-set", default=DEFAULT_V1_SET, help=f"kernel set A (default {DEFAULT_V1_SET})")
     ap.add_argument("--v2-set", default=DEFAULT_V2_SET, help=f"kernel set B (default {DEFAULT_V2_SET})")
     ap.add_argument(
@@ -4117,7 +4121,7 @@ def main(argv=None):
     cross = report_target_cross(cells, groups, hosts, explain, pass_explain, inp, args, out)
     lda = report_lda_penalty(cells, hosts, args, out)
     regimes = report_regime_profile(deficits, cross, args, out)
-    scaling = compute_scaling(cells, inp.roof, args)
+    scaling = compute_scaling(cells, inp.roof)
     anomalies, coverage_table, unver_cells = report_anomalies(
         inp, cells, hosts, exc, scaling, overlap, args, out
     )
@@ -4194,7 +4198,6 @@ def main(argv=None):
                 "verdict_majority": args.verdict_majority,
                 "max_nodata_fraction": args.max_nodata_fraction,
                 "noisy_spread": args.noisy_spread,
-                "headroom_factor": args.headroom_factor,
                 "v1_set": args.v1_set,
                 "v2_set": args.v2_set,
                 "max_listed": args.max_listed,

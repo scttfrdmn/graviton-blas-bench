@@ -13,6 +13,60 @@ change can be compared.
 
 ## [Unreleased]
 
+### Removed — affects what the report claims
+
+- **Standing order 1's `peak_fma` headroom cross-check is retired.** Not weakened,
+  not rethresholded: removed, and the report now says the empirical ceiling stands
+  alone with no independent floor. The check existed for the one case the measured
+  peak cannot see by construction — *every* arm on a host being bad, which moves the
+  ceiling down with the arms and leaves both efficiency columns looking healthy — and
+  on this hardware it cannot detect that case. `src/roofline.c` declares `peak_fma` a
+  **lower** bound on purpose, because whether its accumulator array vectorises into
+  NEON or SVE is the compiler's decision and standing order 6 forbids `-march=native`
+  anywhere in the harness. Measured on `c8g.metal-48xl` at t=1: **4.22 GFLOP/s against
+  a best large DGEMM of 18.16**, a ratio of 0.232. The flag fires above 1.15, so it
+  could not fire at any plausible threshold — it was not a check that kept passing, it
+  was an absent check reading as protection, and the case it was justified on was
+  passing silently.
+
+  **The alternative was considered and rejected.** Building `roofline.c` alone with
+  `-O3 -march=native` would let the accumulators vectorise into SVE and make the bound
+  tight enough to be exceeded. That breaks "the harness is compiled identically across
+  every arm" (standing order 6, enforced by `gates/check-build-flags.sh`) and makes the
+  campaign's only independent floor a function of gcc's vectoriser, in a campaign that
+  has spent considerable effort removing exactly that class of dependency. Better no
+  floor than that floor — and better a retirement stated in the output than a check
+  quietly incapable of firing.
+
+  Gone: `DEFAULT_HEADROOM_FACTOR`, `--headroom-factor`, `params.headroom_factor`, the
+  `headroom` and `peak_fma_absent` anomalies, the section-6 `<-- headroom` flag, and
+  the `headroom_ratio` / `peak_fma_status` fields — a `peak_fma_status` of `ok` asserts
+  a check ran. Kept: `peak_fma` and `peak_fma_allcore` are still measured, still
+  shipped in `roofline-*.ndjson`, still required as a file family by `gates/p2.sh`, and
+  still printed in section 6 — now under a header saying they are provenance and **not**
+  a cross-check, so a reader cannot mistake the surviving number for a surviving check.
+  Also kept, and explicitly not retired with it: `IMPLAUSIBLE_GFLOPS_PER_CORE` and
+  `sanity_check()`'s hard abort. Those guard standing order 2's optimizer hazard (927
+  TFLOP/s on one core from a folded FMA chain), which is a different question from
+  whether the number bounds anything. `roofline.c` was rebuilt and re-run after the
+  comment change per standing order 2: 25.13 GFLOP/s f64 single-core at `-O2` on an
+  Apple M-series host, plausible and far below the abort bound.
+
+  Fixtures: `headroom` is replaced by **`peak-fma-retired`**, which plants the case
+  that used to be the headline (`peak_fma` 1.5× the best GEMM, which no Graviton host
+  at `-O2` produces) and asserts the report stays silent about it — no anomaly, no
+  published `headroom_factor`, and `peak_fma` still printed and still labelled. A
+  retirement can only be fixtured negatively, so the assertion *is* the silence.
+  `peak-absent` is inverted the same way: absence is a provenance gap section 6 prints,
+  not a check reported as "not performed". Both mutation-validated — reinstating the
+  constant, the two anomalies and the payload field fails 3 of `peak-fma-retired`'s 6
+  assertions and 2 of `peak-absent`'s 3, and nothing else in the suite. `HostSpec`'s
+  `peak_factor` default moves from `1.06` to `0.23`, the measured value, so no fixture
+  keeps implying `peak_fma ≈ best GEMM` is what real hardware does; the
+  `denominator-intersection` scenario drops its now-vacuous `headroom` assertion rather
+  than keep an off-topic expectation. Gates after: P0 50/0, P1 65 scenarios + 36
+  checks / 0, `gates/p2.sh --self-test` 17/0, stubs 73/0.
+
 ### Changed — affects how a number is produced
 
 - **`BLIS_REF` is pinned to a SHA instead of tracking `master`.**

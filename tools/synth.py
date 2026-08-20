@@ -409,7 +409,13 @@ class HostSpec:
     forcing: str = "available"
     sve_vl: int = 32
     env_present: bool = True
-    peak_factor: float = 1.06  # peak_fma / best large dgemm
+    # peak_fma / best large dgemm. 0.23 because that is what real hardware does:
+    # measured 4.22 / 18.16 on c8g.metal-48xl at t=1, which is why standing order 1's
+    # cross-check was retired (a LOWER bound 4x under the thing it bounds). It used to
+    # default to 1.06, and a fixture defaulting to "peak_fma is about the best GEMM"
+    # would keep suggesting the check could fire. Only `peak-fma-retired` raises it
+    # above 1, and that scenario exists to assert nothing happens when it does.
+    peak_factor: float = 0.23
     host_scale: float = 1.0  # multiplies every arm on this host
     warnings: tuple = ()
     # Three per-host knobs that would otherwise need editing the files back after
@@ -999,10 +1005,11 @@ def honest_records(bench):
     planted a lucky duplicate.
 
     roofline.c measures peak_fma with its own FMA chain, so a re-run appended into
-    bench-*.ndjson cannot move it. Deriving peak_fma from the duplicate would fire
-    the standing-order-1 headroom flag on a fixture that is not about headroom, and
-    a scenario whose stated claim is 'the cross stays a null' must not also be
-    quietly asserting an anomaly it never mentions."""
+    bench-*.ndjson cannot move it, and deriving peak_fma from the duplicate would make
+    the fixture's own provenance disagree with its measurements. That used to matter
+    more: it would also have fired standing order 1's headroom flag on a fixture whose
+    stated claim is 'the cross stays a null'. The flag is retired, so what is left is
+    the faithfulness argument, which stands on its own."""
     best = {}
     for r in measurements(bench):
         key = (
@@ -1028,9 +1035,15 @@ def honest_records(bench):
 
 def roofline_records(host: HostSpec, bench):
     """src/roofline.c. peak_fma is derived from the best large dgemm actually
-    generated, times host.peak_factor -- so a scenario controls whether standing
-    order 1's headroom flag fires by setting one number, and the fixture cannot
-    drift into firing it by accident when the surface changes."""
+    generated, times host.peak_factor, so a scenario sets the relationship between the
+    two with one number.
+
+    Nothing in the report reads that relationship any more -- standing order 1's
+    cross-check is retired and section 6 prints peak_fma as provenance -- so the knob
+    is kept for exactly one purpose: `peak-fma-retired` sets it above 1 and asserts the
+    report stays silent. Keep emitting these records regardless. They are provenance,
+    `gates/p2.sh` requires the file family, and roofline.c's own optimizer-hazard abort
+    (standing order 2) is what they came from."""
     recs = []
     for threads in host.threads:
         best = max(
@@ -1364,8 +1377,10 @@ def write_scenario(sc: Scenario, root: pathlib.Path):
             # An instrument-check host's records sitting in a campaign directory,
             # which is what one `aws s3 sync` of a bucket holding both prefixes
             # produces. Faster than the campaign host on purpose: if the analysis
-            # pools them, it pools them into the measured-peak denominator too and
-            # standing order 1's headroom check goes quiet.
+            # pools them, it pools them into standing order 1's measured-peak
+            # denominator too and every efficiency figure on this host deflates. The
+            # role filter is the only thing checking that denominator now -- the
+            # `peak_fma` cross-check that once nominally did is retired.
             leaked = []
             for r in bench:
                 q = dict(r)
@@ -2066,34 +2081,77 @@ def sc_forcing_unavailable():
     )
 
 
-def sc_headroom():
+def sc_peak_fma_retired():
+    """The negative fixture for a retired check, which is the only kind of fixture a
+    retirement can have.
+
+    Standing order 1's `peak_fma` cross-check was retired 2026-08-20 (Scott's call).
+    It was justified on one case the empirical denominator cannot see -- every arm on a
+    host being bad, which moves the ceiling down with the arms -- and it cannot detect
+    that case: `roofline.c` declares `peak_fma` a LOWER bound because vectorising its
+    accumulators is the compiler's decision and standing order 6 forbids
+    `-march=native`, and on `c8g.metal-48xl` at t=1 it measured 4.22 GFLOP/s against a
+    best large DGEMM of 18.16. A bound 4.3x under its own subject fires at no
+    threshold, so the flag was absent while reading as protection. Building roofline.c
+    alone with `-O3 -march=native` was the alternative and was rejected: it would make
+    the campaign's only independent floor a function of gcc's vectoriser.
+
+    So this scenario plants the case that USED to be the headline -- peak_fma 1.5x the
+    best GEMM, which no Graviton host at `-O2` produces -- and asserts the report says
+    nothing about it. Retiring a check means the report stops implying a floor exists,
+    and the only way to hold that is to assert the silence. Re-adding the threshold
+    fails this scenario; re-adding the CLI knob fails it separately, because a
+    published `params.headroom_factor` tells a reader a check ran whether or not it
+    fired. `peak_fma` itself must still print: it is provenance, and the report must
+    label it as provenance rather than as a check that passed.
+
+    What must NOT be retired with it: `IMPLAUSIBLE_GFLOPS_PER_CORE` and
+    `sanity_check()`'s hard abort in `src/roofline.c`. Those guard standing order 2's
+    optimizer hazard (927 TFLOP/s on one core from a folded FMA chain), which is worth
+    guarding even though the number it protects now has no analytic use."""
     return Scenario(
-        name="headroom",
+        name="peak-fma-retired",
         description=(
-            "peak_fma is 1.5x the best GEMM any arm reached. Standing order 1 makes that "
-            "gap the headline, ahead of any kernel-set comparison."
+            "peak_fma is 1.5x the best GEMM any arm reached -- what standing order 1 once "
+            "made the headline. The cross-check is retired, so the report must raise no "
+            "anomaly, publish no headroom_factor, and label peak_fma as provenance."
         ),
         hosts=[_host(peak_factor=1.5)],
         arms=_arms(),
         expect=[
-            {"kind": "anomaly_kind_present", "kind_name": "headroom"},
-            {"kind": "stdout_contains", "text": "that gap is the headline"},
+            {"kind": "anomaly_kind_absent", "kind_name": "headroom"},
+            {"kind": "stdout_absent", "text": "that gap is the headline"},
+            {"kind": "stdout_absent", "text": "see section 5"},
+            {"kind": "json_absent", "path": "params.headroom_factor"},
+            # Provenance survives, and says what it is. Without these two the scenario
+            # would also pass against a version that dropped peak_fma altogether.
+            {"kind": "stdout_contains", "text": "NOT a cross-check"},
+            {"kind": "stdout_contains", "text": "peak_fma="},
         ],
     )
 
 
 def sc_peak_absent():
+    """The other half of the retirement: absence is a provenance gap, not a finding.
+
+    This scenario asserted the opposite until 2026-08-20 -- `peak_fma_absent` raised as
+    an anomaly reading "the cross-check was NOT performed here" -- which was the right
+    claim while there was a cross-check to perform. There is not. An anomaly is a call
+    to action and there is no action, so the absence is printed in section 6 and
+    nowhere else. See `peak-fma-retired` for why the check went."""
     return Scenario(
         name="peak-absent",
         description=(
-            "No peak_fma record at all. Absent must read as 'the cross-check was NOT "
-            "performed', never as 'it passed'."
+            "No peak_fma record at all. With the cross-check retired this is a provenance "
+            "gap that section 6 prints and section 5 does not flag -- there is no check "
+            "left to report as 'not performed'."
         ),
         hosts=[_host(roofline_present=False)],
         arms=_arms(),
         expect=[
-            {"kind": "anomaly_kind_present", "kind_name": "peak_fma_absent"},
-            {"kind": "stdout_contains", "text": "cross-check was NOT performed"},
+            {"kind": "anomaly_kind_absent", "kind_name": "peak_fma_absent"},
+            {"kind": "stdout_absent", "text": "cross-check was NOT performed"},
+            {"kind": "stdout_contains", "text": "peak_fma=absent"},
         ],
     )
 
@@ -2642,8 +2700,9 @@ def sc_role_mixed():
     "the analysis excludes anything that does not say campaign". The analysis did
     not read the field at all. One `aws s3 sync` of a bucket holding both prefixes
     and GB10 numbers pool into the Graviton dataset silently; because the pool also
-    feeds the measured-peak denominator, a faster instrument host would defeat
-    standing order 1's headroom check at the same time.
+    feeds standing order 1's measured-peak denominator, a faster instrument host
+    deflates every efficiency figure on the host it contaminated. Nothing else guards
+    that denominator -- the `peak_fma` cross-check that once nominally did is retired.
 
     The leaked records are 3x faster on purpose, so a fixture that pooled them
     could not possibly still read as a null."""
@@ -3410,11 +3469,11 @@ def sc_denominator_intersection():
     which is asserted, and it also silently raises that row's ceiling by ~8% while
     leaving the 1-thread row alone, which is the harm.
 
-    peak_factor is 1.0 so that the headroom cross-check is quiet: the restriction
-    raises `peak_fma / best_dgemm` by construction (the ratio's denominator got
-    smaller), and that direction is deliberate -- standing order 1's flag should fire
-    on the published ceiling, not on a ceiling nothing divides by -- but it is a
-    different claim from this one and `headroom` has its own scenario."""
+    peak_factor is left at the host default. It used to be pinned to 1.0 here to keep
+    the headroom cross-check quiet, since the restriction raises `peak_fma /
+    best_dgemm` by construction (the ratio's denominator got smaller). That check is
+    retired -- see `peak-fma-retired` -- so there is nothing left for the restriction to
+    trip, and pinning the factor would only imply otherwise."""
     arms = _arms(v1_gain=flat(1.0), v2_gain=flat(1.0))
     for a in arms:
         if a.library == "armpl":
@@ -3426,7 +3485,7 @@ def sc_denominator_intersection():
             "Standing order 1's denominator must come from the sizes common to both "
             "thread points (n=4096), not from each thread point's own best rung."
         ),
-        hosts=[_host(peak_factor=1.0)],
+        hosts=[_host()],
         arms=arms,
         expect=[
             # 64 threads: five rungs available, three shared, and the denominator is
@@ -3459,10 +3518,13 @@ def sc_denominator_intersection():
             {"kind": "stdout_contains", "text": "not used: that size is absent at some thread point"},
             {"kind": "stdout_contains", "text": "at n=4096 of 5 size(s)"},
             {"kind": "stdout_contains", "text": "at n=4096 of 3 size(s)"},
-            # Both failure flags stay down: the intersection is non-empty, so nothing
-            # fell back, and peak_factor keeps the cross-check inside its threshold.
+            # The failure flag this scenario is about stays down: the intersection is
+            # non-empty, so nothing fell back. The `headroom` assertion that used to sit
+            # beside it has moved to `peak-fma-retired`, where the host actually plants a
+            # peak_fma above the best GEMM and the absence of a flag is the claim. Here
+            # it would assert nothing -- this host's peak_factor is below 1 -- and an
+            # off-topic assertion is how a scenario stops owning its own expectations.
             {"kind": "anomaly_kind_absent", "kind_name": "denominator_not_comparable"},
-            {"kind": "anomaly_kind_absent", "kind_name": "headroom"},
             {"kind": "verdict_code", "one_of": ["NULL"]},
             # Nothing is missing here -- the restriction is policy operating on a
             # complete dataset, and it must not read as a coverage problem.
@@ -4539,7 +4601,7 @@ SCENARIOS = {
         sc_generic_armv8_on_sve,
         sc_heterogeneous,
         sc_forcing_unavailable,
-        sc_headroom,
+        sc_peak_fma_retired,
         sc_peak_absent,
         sc_replicate_reproduces,
         sc_replicate_diverges,
@@ -4860,9 +4922,10 @@ def check_one(exp, report, stdout, exit_code, root):
         # The structural claim, asserted structurally. A verdict-level assertion is
         # not enough here: the leaked records scale every arm by the same factor, so
         # the cross ratios survive pooling unchanged and the verdict stays NULL --
-        # while the measured-peak denominator is silently inflated, which is how
-        # standing order 1's headroom check goes quiet. What must be true is that
-        # the foreign run_id never entered the analysis at all.
+        # while standing order 1's measured-peak denominator is silently inflated, and
+        # every efficiency figure printed against it is silently wrong. Nothing
+        # downstream would flag that. What must be true is that the foreign run_id
+        # never entered the analysis at all.
         got = [r for r in (dig(report, "inputs.run_ids") or []) if str(r).startswith(exp["prefix"])]
         return not got, (
             f"{len(got)} run_ids start with {exp['prefix']!r}"

@@ -39,15 +39,39 @@ until it finds something.
    It costs a little headroom wherever the unrestricted max sat above the common
    set; `decompose.py` prints that cost per row and never uses it. A thread point
    with **no** large dgemm drops out of the intersection rather than emptying it,
-   and carries no denominator of its own. `peak_fma` is a cross-check only, and
-   against the **same restricted** denominator: if it materially exceeds the best
-   observed GEMM, every arm on that host is leaving headroom and *that gap* is
-   the headline. Changing any of this requires asking Scott first.
+   and carries no denominator of its own. **The empirical ceiling stands alone, with
+   no independent floor.** `peak_fma` was that floor and is **retired as a
+   cross-check** (Scott, 2026-08-20). It was justified on the one case the measured
+   peak cannot see by construction — every arm on a host being bad, which moves the
+   ceiling down with the arms and leaves the efficiency columns looking fine — and it
+   cannot detect that case. `roofline.c` declares `peak_fma` a *lower* bound on
+   purpose, because whether its accumulator array vectorises into NEON or SVE is the
+   compiler's decision and standing order 6 forbids `-march=native`; measured on
+   `c8g.metal-48xl` at t=1 it is **4.22 GFLOP/s against a best large DGEMM of 18.16**,
+   4.3× under the quantity it was bounding, so the flag could not fire at any
+   threshold. It was not passing, it was absent while reading as protection. Building
+   `roofline.c` alone at `-O3 -march=native` so the accumulators actually vectorise
+   would make it discriminating and was **rejected**: it breaks standing order 6 and
+   makes the campaign's only independent floor a function of gcc's vectoriser. Better
+   no floor than that floor — and the retirement is stated in the report rather than
+   left implicit, which is the whole point of taking this option. `peak_fma` is still
+   measured and still printed in section 6 **as provenance, labelled not a
+   cross-check**; the report raises no anomaly on it in either direction, and
+   `peak-fma-retired` is the fixture that holds that silence. What is *not* retired is
+   `IMPLAUSIBLE_GFLOPS_PER_CORE` and `sanity_check()`'s hard abort — see standing
+   order 2; those guard the optimizer folding the chain away, which is worth guarding
+   even when the number has no analytic use. Do not reintroduce a threshold on
+   `peak_fma / best GEMM` without first making `peak_fma` a bound tight enough to be
+   exceeded. Changing any of this requires asking Scott first.
 2. **Do not reintroduce the optimizer hazard.** The first draft of
    `src/roofline.c` reported 927 TFLOP/s on one core because the FMA chain was
    folded away. Constants are read from volatile storage and `sanity_check()`
    hard-aborts above `IMPLAUSIBLE_GFLOPS_PER_CORE`. If you touch that file,
-   re-verify the number is plausible before trusting anything downstream.
+   re-verify the number is plausible before trusting anything downstream. **This
+   survives `peak_fma`'s retirement as a cross-check** (standing order 1) and must
+   not be removed alongside it: the abort guards against the chain being folded
+   away, which is a different question from whether the resulting number bounds
+   anything.
 3. **Never claim a number you did not measure.** No filling gaps from vendor
    datasheets, and none from the published ArmPL comparisons. If an arm did not
    run, it did not run — it is a gap in the table, not an estimate.
@@ -303,8 +327,12 @@ summed per stream), the six DYNAMIC coretype arms come out:
 | `unforced` | 7.09 | | `NEOVERSEN1` | 7.00 |
 
 `ARMV8SVE` is the slowest, generic `ARMV8` is tied for third, and the whole spread
-is **8.4%**. So instrument the slowest arm because it is the slowest, not because
-picking it changes the answer much — and do not assume which arm that is. On this
+is **8.4%**. Scott's reading of that, and it is the right one: at fixed thread count
+wall clock is essentially **flat** across arms, which is the *opposite* of the model
+the P3 extrapolation was built on — so the falsification is more useful than the
+prediction was. The residual instruction survives for a different reason than it was
+written for: instrument the slowest arm because you cannot tell in advance which arm
+that is, not because picking it moves the estimate much. Do not assume. On this
 host the two SVE-kernel arms are the expensive ones, because at 1 thread they are
 the *slower* arms in the large regime (see §The expensive end): that is where
 `ABS_MIN_SAMPLES = 3` binds, so per-call time passes straight through to wall clock.

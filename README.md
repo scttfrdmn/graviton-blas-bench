@@ -178,9 +178,11 @@ support opposite conclusions.
   test, and pthreads is what the wheels ship.
 - **One memory policy for the denominator and the measurement.** `bench.c`
   first-touches its matrices serially and `roofline.c` in parallel, so on a
-  multi-node host the two used to land their pages on different nodes — making
-  the standing-order-1 cross-check compare different machines. A single explicit
-  `--membind`/`--interleave` policy for both removes that.
+  multi-node host the two used to land their pages on different nodes — making the
+  two standing-order-1 numbers describe different machines. A single explicit
+  `--membind`/`--interleave` policy for both removes that. It matters less now that
+  the cross-check between them is retired, but the policy is still the right one:
+  both numbers are published side by side.
 - **Every arm the runner declines to run is recorded with a reason.** Build
   failure, ISA the host lacks, a coretype the library ignored: each writes a
   census record. An unexplained gap in the results is then a detectable defect
@@ -198,9 +200,23 @@ support opposite conclusions.
   `null` records is marked unverified.
 - **Measured peak, not theoretical.** The primary denominator is the best
   GFLOP/s any arm achieved on that host — an empirical ceiling no compiler
-  decision can inflate. `peak_fma` from the microbenchmark is a cross-check: if
-  it materially exceeds the best observed GEMM, every arm on that host is
-  leaving headroom, and *that gap* is the headline.
+  decision can inflate. It stands **alone, with no independent floor**, and the
+  report says so. `peak_fma` from the microbenchmark was meant to be the floor: if
+  it materially exceeded the best observed GEMM, every arm on that host was leaving
+  headroom and *that gap* was the headline. Retired 2026-08-20, because it cannot
+  detect that case. `roofline.c` declares `peak_fma` a **lower** bound on purpose —
+  whether its accumulators vectorise into NEON or SVE is the compiler's decision,
+  and the harness is built at `-O2` with no `-march=native` on every arm — and on
+  `c8g.metal-48xl` it measured 4.22 GFLOP/s against a best DGEMM of 18.16, 4.3×
+  under the thing it was bounding. A threshold that can never be crossed is not a
+  check that passes, it is an absent check that reads as protection. Building
+  `roofline.c` alone at `-O3 -march=native` would make it discriminating and was
+  rejected: the campaign's only independent floor would then be a function of gcc's
+  vectoriser. So `peak_fma` is still measured, still recorded, and printed in
+  section 6 as provenance labelled *not a cross-check*. What it still does is guard
+  the optimizer hazard it was born from — `sanity_check()` hard-aborts above
+  `IMPLAUSIBLE_GFLOPS_PER_CORE`, because the first draft of `roofline.c` reported
+  927 TFLOP/s on one core when the FMA chain was folded away.
 - **…and it is taken over the sizes that host ran at every thread count.** The
   large ladder is capped below 8 threads, so a per-thread-point maximum would draw
   the 1-thread ceiling from a 3-rung ladder and the 192-thread ceiling from a

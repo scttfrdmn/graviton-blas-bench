@@ -5,9 +5,10 @@
  *   peak_fma_allcore  : same chain on every thread (scaling check)
  *   bandwidth         : achieved triad bandwidth at a footprint that defeats L3
  *
- * These are the denominators. Theoretical peak from clock x lanes x FMA is not
- * used anywhere in the analysis: it silently rescales every efficiency number
- * whenever the effective all-core clock differs from the datasheet value.
+ * These are the instrument-side numbers. Theoretical peak from clock x lanes x FMA
+ * is not used anywhere in the analysis: it silently rescales every efficiency
+ * number whenever the effective all-core clock differs from the datasheet value.
+ * Nor is peak_fma the denominator -- see WHAT THIS NUMBER IS, AND IS NOT below.
  *
  * OPTIMIZER HAZARD (load-bearing):
  *   The obvious formulation -- a[i] = a[i]*b + c with b,c compile-time
@@ -27,13 +28,29 @@
  * WHAT THIS NUMBER IS, AND IS NOT:
  *   Whether the accumulator array vectorises into NEON or SVE is entirely the
  *   compiler's decision, and it varies by -O level, -march, and gcc version.
- *   So peak_fma is a LOWER BOUND and a cross-check, not the denominator.
- *   The analysis uses max-observed-GFLOP/s across every (library, target) arm
- *   on that host as the primary denominator -- an empirical ceiling that no
- *   compiler decision can inflate. peak_fma exists to catch the case where
- *   every arm on a host is bad and the empirical ceiling is therefore too low
- *   to notice. If peak_fma materially exceeds the best GEMM result, that gap
- *   is the finding. See analysis/decompose.py:denominator().
+ *   So peak_fma is a LOWER BOUND, never the denominator. The analysis uses
+ *   max-observed-GFLOP/s across every (library, target) arm on that host as the
+ *   primary denominator -- an empirical ceiling that no compiler decision can
+ *   inflate. See analysis/decompose.py:compute_scaling().
+ *
+ *   peak_fma was ALSO a cross-check on that ceiling, and that role is RETIRED
+ *   (2026-08-20, Scott's call). It was justified on the one case the empirical
+ *   ceiling cannot see -- every arm on a host being bad, which moves the ceiling
+ *   down with the arms -- and on this hardware it cannot detect that case. At -O2
+ *   with no -march=native (standing order 6 applies to the whole harness,
+ *   including this file) the chain does not vectorise into SVE, and on
+ *   c8g.metal-48xl at one thread it measures 4.22 GFLOP/s against a best large
+ *   DGEMM of 18.16 -- 4.3x under the quantity it was bounding. A bound that can
+ *   never be exceeded is not a check that passes; it is an absent check reading as
+ *   protection, so decompose.py now raises no anomaly on peak_fma in either
+ *   direction and prints it in section 6 as provenance, labelled as such.
+ *   Compiling this file alone at -O3 -march=native would make the check
+ *   discriminating and was rejected: it breaks the identical-harness rule and
+ *   makes the campaign's only independent floor a function of gcc's vectoriser.
+ *
+ *   The OPTIMIZER HAZARD block above is NOT retired with it. sanity_check()'s
+ *   abort guards against the chain being folded away, which is a different
+ *   question from whether the resulting number bounds anything, and it stays.
  */
 
 #define _GNU_SOURCE
