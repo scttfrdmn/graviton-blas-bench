@@ -681,6 +681,18 @@ run_arm() {
       "bench.c's in-process openblas_get_corename() disagrees with the probe's
        '${cteff:-unknown}'; the arm would have been measured under a label
        belonging to a different library or environment (standing order 10)"
+  elif [ $rc -eq 5 ]; then
+    # bench.c's dry pass found a routine in a sweep list with no driver, and
+    # refused before measuring anything. Not a host condition and not a flake: it
+    # is the same on every arm and on every host, because it is a property of the
+    # binary. Censused distinctly so the record does not carry the SIGILL hint,
+    # which would send someone looking at the ISA of a host that is fine.
+    log "  REFUSED: bench.c has a routine with no driver -- see $STDERRLOG. Every arm will fail."
+    census "$lib" "$tgt" "$ct" "$cteff" "$T" harness_invalid "$rc" "$((after - before))" \
+      "$backend" "${PIN_DESC[$T]}" \
+      "bench.c refused in its matrix-id dry pass: a sweep list names a routine
+       sweep() cannot dispatch, so the matrix id would count cases nothing
+       measures. A build-time defect in the harness, identical on every arm"
   elif [ $rc -ne 0 ]; then
     log "  exited $rc (SIGILL=132 means this kernel set needs ISA the host lacks)"
     census "$lib" "$tgt" "$ct" "$cteff" "$T" runtime_failed "$rc" "$((after - before))" \

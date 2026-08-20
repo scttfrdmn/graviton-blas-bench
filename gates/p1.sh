@@ -391,6 +391,154 @@ else
   bad "the overlap band is neutered — $band"
 fi
 
+# ---- 2c. the matrix stamp is computed from the matrix ----------------------
+# `matrix_id` exists so a pre-expansion P2 pass can never be pooled with a
+# post-expansion P3 pass. The whole guarantee rests on the id being derived from
+# the case tables by a walk of those same tables, so the ways it can go quiet are
+# all ways the derivation stops being a derivation:
+#
+#   - A case producer stops folding. sweep() and run_level1() are two separate
+#     enumerations; if only one folds, the id is stable across a change to the
+#     other and the refusal never fires on the pass that differs.
+#   - The dry pass and the real pass disagree about the case set. A routine in a
+#     sweep list that sweep() cannot dispatch is the reachable version of this,
+#     and it is fatal on purpose: the id would claim cases nothing measured.
+#   - The two fields drift out of printf position, which relabels every field
+#     after them (standing order 10 through a typo).
+#   - `unstamped` starts behaving as a wildcard, at which point a dataset whose
+#     two halves are silent about their case sets is analysed as if they agreed.
+if stamp=$("$PY" - <<'EOF'
+import importlib.util, pathlib, re, sys
+
+src = pathlib.Path("src/bench.c").read_text()
+spec = importlib.util.spec_from_file_location("dc", pathlib.Path("analysis/decompose.py"))
+dc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dc)
+sspec = importlib.util.spec_from_file_location("synth", pathlib.Path("tools/synth.py"))
+synth = importlib.util.module_from_spec(sspec)
+sspec.loader.exec_module(synth)
+
+bad = []
+
+# -- the producer prints both fields, in position.
+for key in (r'\"matrix_id\":\"%s\"', r'\"matrix_cases\":%ld'):
+    if key not in src:
+        bad.append(f"src/bench.c's emit() no longer prints {key}")
+stmt = re.search(r'printf\("\{\\"run_id.*?\);', src, re.S)
+if not stmt:
+    bad.append("src/bench.c's emit() no longer has the record printf")
+else:
+    fmt, _, argv = stmt.group(0).partition(r'\n",')
+    for a, b, c, where in ((r'\"probe\"', r'\"matrix_id\"', r'\"threads\"', "format string"),
+                           ("g_probe", "g_matrix_id", "g_threads", "argument list")):
+        text = fmt if where == "format string" else argv
+        if not (0 <= text.find(a) < text.find(b) < text.find(c)):
+            bad.append(
+                f"src/bench.c's emit() {where} no longer has matrix_id between probe and threads"
+            )
+
+# -- both case producers fold. Read out of the function bodies, so a fold in one
+# cannot satisfy the check for the other.
+for fn in ("sweep", "run_level1"):
+    body = re.search(r"static void " + fn + r"\(.*?\n\}", src, re.S)
+    if not body:
+        bad.append(f"{fn}() not found in src/bench.c")
+    elif "fold_case(" not in body.group(0):
+        bad.append(
+            f"src/bench.c's {fn}() no longer folds its cases into the matrix id, so the id is "
+            f"blind to every change in the cases it enumerates"
+        )
+
+# -- the dry pass runs first and does not measure, and the id is stamped between
+# the two passes. `g_dry` gating the fold is what makes the id independent of the
+# argv routine filter, which is the property that lets one arm's --routine run
+# carry the same id as the full sweep.
+if "g_dry = (pass == 0)" not in src:
+    bad.append("src/bench.c no longer runs a dry pass before the measured one")
+if not re.search(r"if \(!g_dry\).*?g_matrix_id.*?%016llx", src, re.S):
+    bad.append("src/bench.c no longer formats g_matrix_id between the dry pass and the real one")
+# -- and the driverless-routine refusal is still fatal. Found by mutation: without
+# it the dry pass folded 31 cases the real pass skipped.
+if "exit(5)" not in src:
+    bad.append(
+        "src/bench.c no longer aborts on a routine with no driver, so the matrix id can count "
+        "cases nothing measures"
+    )
+rm = pathlib.Path("scripts/run-matrix.sh").read_text()
+if "rc -eq 5" not in rm or "harness_invalid" not in rm:
+    bad.append(
+        "scripts/run-matrix.sh no longer censuses bench.c's rc=5 as harness_invalid, so a "
+        "harness defect would be recorded with runtime_failed's SIGILL hint"
+    )
+
+# -- the consumer. Absence is one group, not a wildcard, and behaviourally so.
+if dc.canon_matrix_id(None) != dc.UNSTAMPED_MATRIX or dc.canon_matrix_id("") != dc.UNSTAMPED_MATRIX:
+    bad.append("decompose.py's canon_matrix_id no longer defaults absence to UNSTAMPED_MATRIX")
+mixed = dc.matrix_ids([{"matrix_id": "abc"}, {}])
+if len(mixed) != 2:
+    bad.append(
+        f"decompose.py groups a stamped and an unstamped record into {len(mixed)} matrix, so "
+        f"`unstamped` is matching anything"
+    )
+same = dc.matrix_ids([{}, {"matrix_id": ""}, {"matrix_id": "  "}])
+if len(same) != 1:
+    bad.append(f"decompose.py splits three unstamped records into {len(same)} matrices")
+
+# -- synth's namespace. A fixture id must not be able to pass for a measured one,
+# in a report or in a bucket: bench.c writes 16 bare hex digits and synth prefixes.
+# Checked against the snprintf and not against the whole file, because bench.c
+# names the namespace in a comment explaining why it does not use it.
+fmtline = re.search(r"snprintf\(g_matrix_id[^;]*;", src)
+if not fmtline:
+    bad.append("src/bench.c no longer formats g_matrix_id with snprintf")
+elif '"%016llx"' not in fmtline.group(0):
+    bad.append(f"src/bench.c's matrix id is no longer bare hex: {fmtline.group(0)}")
+if not synth.MATRIX_NAMESPACE or (fmtline and synth.MATRIX_NAMESPACE in fmtline.group(0)):
+    bad.append(
+        f"synth's MATRIX_NAMESPACE {synth.MATRIX_NAMESPACE!r} is what src/bench.c emits, so a "
+        f"synthetic matrix id is indistinguishable from a measured one"
+    )
+
+# -- and the PROPERTY the analysis depends on, checked by moving the case set
+# rather than by reading the code: the id follows the cases, and nothing else.
+sc = synth.SCENARIOS["null"]()
+base_id, base_n = synth.matrix_stamp(sc)
+if not base_id.startswith(synth.MATRIX_NAMESPACE):
+    bad.append(f"synth.matrix_stamp produced an unnamespaced id {base_id!r}")
+wider = synth.Scenario(
+    name="probe", description="", hosts=sc.hosts, arms=sc.arms,
+    routines=(*sc.routines, "dsyrk"), level1=sc.level1,
+)
+wide_id, wide_n = synth.matrix_stamp(wider)
+if wide_id == base_id or wide_n <= base_n:
+    bad.append(
+        f"adding a routine left the matrix id at {base_id} ({base_n} -> {wide_n} cases): the id "
+        f"is not derived from the case set"
+    )
+no_l1 = synth.Scenario(
+    name="probe", description="", hosts=sc.hosts, arms=sc.arms,
+    routines=sc.routines, level1=False,
+)
+l1_id, l1_n = synth.matrix_stamp(no_l1)
+if l1_id == base_id or l1_n >= base_n:
+    bad.append(
+        f"dropping the level-1 ladder left the matrix id at {base_id}: the level-1 cases are "
+        f"not folded, so the id is blind to half the sweep"
+    )
+
+print(
+    "; ".join(bad)
+    if bad
+    else f"stamp derived from {base_n} cases, moves with the case set, namespaced {synth.MATRIX_NAMESPACE!r}"
+)
+sys.exit(1 if bad else 0)
+EOF
+); then
+  ok "the matrix stamp is derived from the matrix: $stamp"
+else
+  bad "the matrix stamp does not follow the matrix — $stamp"
+fi
+
 # ---- 3. the majority comparison is exact ----------------------------------
 # A property of decompose.py, not of any dataset, and it has to be checked here
 # because no fixture can reach it: the default --verdict-majority of 0.60 is one
@@ -555,6 +703,7 @@ declare -a BITCASES=(
   "no-provenance:8:provenance incomplete"
   "replicate-diverges:16:headline does not reproduce"
   "floor-band-disagrees:32:timing-floor band unconfirmed"
+  "matrix-mixed:64:more than one case matrix"
 )
 for case in "${BITCASES[@]}"; do
   scen="${case%%:*}"; rest="${case#*:}"; bit="${rest%%:*}"; what="${rest#*:}"
@@ -565,6 +714,22 @@ for case in "${BITCASES[@]}"; do
     ok "bit $bit set by '$scen' ($what); exit=$got"
   else
     bad "bit $bit NOT set by '$scen' ($what); exit=$got"
+  fi
+done
+
+# Bits 1 and 64 are returned ALONE, and that is a property of the code rather than
+# of a dataset: both mean "nothing downstream was computed", so a companion bit
+# would be a claim about an analysis that never ran. 64 is the one worth asserting
+# here — a mixed directory is otherwise a perfectly analysable dataset, so a version
+# that refused and then went on to aggregate would look right in every other way.
+for scen in matrix-mixed matrix-mixed-unstamped; do
+  f="$WORK/$scen/report.json"
+  if [ ! -f "$f" ]; then bad "bit 64 exclusivity: scenario '$scen' produced no report"; continue; fi
+  got=$("$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['exit_code'])" "$f")
+  if [ "$got" = "64" ]; then
+    ok "bit 64 is returned alone by '$scen' (exit=$got, no companion bits)"
+  else
+    bad "'$scen' returned exit $got — 64 must be exclusive, nothing else was computed"
   fi
 done
 

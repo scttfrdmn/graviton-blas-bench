@@ -481,6 +481,30 @@ support opposite conclusions.
   consistent bias large enough to move a verdict. `ABSENT` deliberately does not
   set bit 32: every result set produced before the probe existed is `ABSENT`, and
   requiring the probe to be *present* is `gates/p2.sh`'s job.
+- **The campaign will put two different case matrices in one bucket, and the way
+  it happens is one `aws s3 sync`.** P2 runs pre-expansion and P3 runs after items
+  3–5 land, so the two passes sweep different case sets; pooled, cells present in
+  one and absent in the other drop out of every intersection silently and what
+  survives is whatever the two matrices happen to share — a number that looks like
+  every other number in the report. `bench.c` therefore stamps every record with
+  `matrix_id`, a digest folded over the same size/pad/incx/routine/floor tables the
+  sweep itself walks, in a **dry pass that runs before any measurement**, plus the
+  `matrix_cases` count beside it. A digest and not a version number because a
+  version number records what someone remembered to bump; the digest moves whether
+  or not anyone noticed, and two of the five case-set changes tested during
+  development left `matrix_cases` unchanged while moving the id. Four consequences
+  worth knowing. The dry pass **ignores the `--routine` filter**, so one arm's
+  partial run carries the same id as the full sweep — the id describes the matrix
+  the binary sweeps, not what this invocation measured. A routine in a sweep list
+  that `sweep()` cannot dispatch is **fatal** (`exit(5)`, censused
+  `harness_invalid`), because the dry pass would otherwise fold cases the real pass
+  skips and the id would claim measurements never taken. More than one id in a
+  results directory is **exit bit 64, returned alone**: `decompose.py` refuses
+  before section 0 and computes nothing, because a refusal that still printed a
+  cross would hand over the pooled table it exists to prevent. And a record with no
+  `matrix_id` is one group, `unstamped`, not a wildcard — an old dataset still
+  analyses, but mixing stamped and unstamped records is refused, since whether the
+  two swept the same cases is precisely what no record says.
 - **A penalty is a property of the stride, so the pad axis has to be attributed
   per pad.** With one extra pad value, "tight versus padded" was one comparison
   and pooling was unobservable. With `LDA_PADS_EXTRA = {1, 4, 8, 64}` a section 3
@@ -594,3 +618,9 @@ bit 2: generic `ARMV8` selected on a host that *has* SVE, or `NO_SVE` in the
 build. Either means the measurement apparatus, not the kernel set, is what the
 run discovered. An unrecognised part landing on `ARMV8SVE` is **not** in that
 class — read it against the `ARMV8SVE` arm.
+
+One outcome bypasses the report entirely, via exit bit 64: more than one
+`matrix_id` in the directory. Nothing is aggregated and no section is printed —
+`decompose.py` prints the breakdown by id, with each id's run and instance ids, on
+stderr and stops. Separate the directory by `matrix_id` and analyse each on its
+own; do not merge the reports, because two matrices are two experiments.

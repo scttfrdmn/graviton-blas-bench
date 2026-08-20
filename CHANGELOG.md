@@ -75,6 +75,64 @@ change can be compared.
 
 ### Added — affects how a number is produced
 
+- **Every bench record now carries `matrix_id` and `matrix_cases`, and more than
+  one `matrix_id` in a results directory refuses the analysis outright.** P2 runs
+  pre-expansion and P3 runs after items 3–5 of #2 land, so the two passes sweep
+  different case sets — and the way they end up in one directory is one
+  `aws s3 sync` of a bucket holding both prefixes, which is an operation this
+  campaign will actually perform. Pooled, cells present in one matrix and absent
+  from the other drop out of every intersection silently, and what survives is
+  whatever the two happen to share: a number that looks like every other number in
+  the report and means something else. This is the pass-intersection rule's blind
+  spot, because that rule reasons about *arms* within a comparison and has no way to
+  notice that the comparison's own case set moved.
+
+  `src/bench.c` computes the id in a **dry pass over the same tables the sweep
+  walks**, before any measurement: `sweep()` and `run_level1()` each fold their
+  cases, and the id is the sum of per-case FNV-1a digests. Decisions worth keeping:
+
+  - **A digest, not a version number.** A version number records what someone
+    remembered to bump. Five case-set changes were checked during development — one
+    extra size, one extra pad, one extra routine, a floor change, an `incx` change —
+    and *two of them left `matrix_cases` unchanged while moving the id*, which is
+    why the count sits beside the digest as a legible cross-check rather than being
+    the mechanism.
+  - **Summed, not XOR-ed.** Two identical cases XOR to nothing, so a duplicated
+    case would be erased by the field whose job includes exposing it.
+  - **The dry pass ignores the `--routine` filter**, so one arm's partial run
+    carries the same id as the full sweep. The id describes the matrix the binary
+    sweeps, not what this invocation measured.
+  - **A routine in a sweep list that `sweep()` cannot dispatch is now fatal**
+    (`exit(5)`, censused `harness_invalid` by `run-matrix.sh` with its own reason
+    rather than `runtime_failed`'s SIGILL hint, which would send someone auditing
+    the ISA of a host that is fine). Found by mutation: the dry pass folded 31 cases
+    the real pass silently skipped, so the id would have claimed measurements that
+    were never taken. That is worse than no id at all.
+  - **Exit bit 64 is returned alone.** `decompose.py` refuses before section 0 and
+    computes nothing, printing the breakdown by id with each id's run and instance
+    ids on stderr. A refusal that still emitted a cross would hand over exactly the
+    pooled table it exists to prevent, behind a non-zero exit nobody reads.
+  - **`unstamped` is one group, not a wildcard.** A dataset written before the field
+    existed still analyses, because all of its records agree with each other. A
+    dataset *mixing* stamped and unstamped records is refused, because whether the
+    two swept the same cases is precisely what no record says.
+  - **`tools/synth.py` deliberately does not reproduce the digest.** Its ids live in
+    a `synth-` namespace, so a fixture id cannot pass for a measured one in a report
+    or in a bucket, and no fixture asserts a hand-copied C hash — a drift between
+    the ladders would otherwise surface as fifty scenarios failing on an opaque hex
+    value instead of as the `ladder_check`s naming the ladder that moved. What the
+    gate asserts instead is the *property*: the id follows the case set and nothing
+    else, checked by moving the case set.
+
+  Four fixtures, each mutation-validated: `matrix-stamped`, `matrix-mixed`,
+  `matrix-unstamped`, `matrix-mixed-unstamped`. Removing the refusal kills the two
+  mixed ones; treating `unstamped` as a wildcard kills the two unstamped ones. Nine
+  gate mutations — a producer that stops folding, either enumeration; the dry pass
+  removed; the abort downgraded; the printf order drifted, format or arguments; the
+  stamp never formatted; the namespace removed; the `rc=5` census lost — each fail
+  `gates/p1.sh` with its own message. Not comparability-affecting: no measured value
+  changes. The pre-expansion matrix stamps as `7c371fee324b7304` over 544 cases.
+
 - **A timing-floor overlap band, because the per-regime `MIN_SECONDS` put a change
   of instrument at the size where the answer is expected to be.** The floor steps
   from 0.05 s to 0.30 s at n=256, and n=256 is also where `GEMM_SMALL_*` is

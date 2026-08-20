@@ -57,8 +57,8 @@ number. Everything else was renumbered around them.
   VERDICT             one machine-greppable line computed from the data.
 
 EXIT CODES -- load-bearing, because gates/p1.sh has to be able to assert on
-something. 2, 4, 8, 16 and 32 are bit flags and are OR-ed together; 1 is returned
-alone.
+something. 2, 4, 8, 16 and 32 are bit flags and are OR-ed together; 1 and 64 are
+returned alone.
 
   0  clean
   1  nothing usable was loaded (no bench records at all)
@@ -87,6 +87,13 @@ alone.
      across n=256 in any of those states. The band being ABSENT does NOT set this
      -- pre-probe datasets have to keep analysing -- so requiring it is a gate's
      job and not this bit's
+ 64  more than one case matrix in one results directory. Returned ALONE and
+     nothing else is computed, because sections 1-7 pool and section 8 compares:
+     across two case matrices neither operation means anything, and the number it
+     would produce looks like every other number in the report. The realistic way
+     to get here is one `aws s3 sync` of a bucket holding a pre-expansion pass and
+     a post-expansion one. bench.c stamps `matrix_id` by walking the same tables
+     the sweep walks, so this fires on a one-line ladder change nobody announced
 
 Usage:
     python3 decompose.py results/ [--min-effect 0.05] [--json out.json]
@@ -336,7 +343,7 @@ UNRECOGNISED = "UNRECOGNISED"
 LSCPU_DEFAULTED = "lscpu produced no topology"
 
 # Census statuses that mean the arm ran, and therefore explain NOTHING about a
-# cell it failed to produce. run-matrix.sh emits nine:
+# cell it failed to produce. run-matrix.sh emits ten:
 #
 #   measured             the arm ran                       -- not an explanation
 #   aliased              the arm is ABOUT TO run under a coretype the library
@@ -349,6 +356,17 @@ LSCPU_DEFAULTED = "lscpu produced no topology"
 #   mislabelled          explanation
 #   alias_duplicate      explanation (the kernel set is already being measured)
 #   forced_invalid_host  explanation, host-level not arm-level
+#   harness_invalid      explanation, BINARY-level: bench.c's dry pass found a
+#                        routine in a sweep list that sweep() cannot dispatch and
+#                        refused (rc=5). Identical on every arm and every host, so
+#                        a dataset carrying it is not a host with a hole -- it is
+#                        a build that must not be believed at all
+#
+# `harness_invalid` is the one that must not be read as a per-arm condition. It is
+# a property of the binary, so it appears on the FIRST arm and would appear on all
+# of them; seeing one and concluding "that arm is unlucky" is the wrong read. It
+# exists as its own status only so the record does not carry `runtime_failed`'s
+# SIGILL hint, which would send someone auditing the ISA of a host that is fine.
 #
 # `mislabelled` is the one that must never be read as a flake: bench.c's
 # in-process openblas_get_corename() disagreed with the probe the runner ran in a
@@ -490,6 +508,69 @@ def canon_probe(v):
     out are ones that positively asked to be."""
     s = str(v).strip() if isinstance(v, str) else ""
     return s if s else NO_PROBE
+
+
+UNSTAMPED_MATRIX = "unstamped"
+
+
+def canon_matrix_id(v):
+    """Which case matrix a record came from, defaulting to UNSTAMPED_MATRIX.
+
+    bench.c computes this by walking the same tables the sweep walks, so it changes
+    whenever the case set changes -- a size, a pad, an incx, a routine, or a regime
+    floor -- and it changes whether or not anyone remembered it should. See
+    `matrix_ids()` for what is done with it, and g_matrix_id in src/bench.c for why
+    it is a digest and not a version number.
+
+    Absent means a record written before the field existed. Defaulting to a single
+    shared sentinel is what lets an old dataset keep analysing: every one of its
+    records agrees with every other, so it is one matrix as far as the pooling rule
+    is concerned. It is NOT treated as "matches anything" -- a dataset mixing
+    stamped and unstamped records is refused, because whether they are the same
+    matrix is precisely what is unknown."""
+    s = str(v).strip() if isinstance(v, str) else ""
+    return s if s else UNSTAMPED_MATRIX
+
+
+def matrix_ids(bench):
+    """matrix_id -> {"records": n, "cases": {...}, "runs": {...}, "instances": {...}}.
+
+    WHY MORE THAN ONE IS A REFUSAL RATHER THAN A WARNING. Sections 1-7 pool by
+    median across passes, and a comparison restricted to two different case matrices
+    is not a comparison: cells present in one and absent in the other silently drop
+    out of the intersection, and the ones that survive are whatever the two matrices
+    happen to share. The result is a number that looks like every other number in
+    the report and means something else. The realistic way to get there is one
+    `aws s3 sync` of a bucket holding a pre-expansion P2 pass and a post-expansion
+    P3 pass -- which is a directory a careful operator produces on purpose.
+
+    So a mixed directory stops the analysis. Not by excluding a minority, which
+    would pick a winner without being asked, and not by warning, which puts a
+    correct-looking report in front of someone who now has to notice a line. The
+    breakdown is printed by id with its run and instance ids, because "which pass
+    is the odd one out" is the next question and nothing else in the tree can
+    answer it.
+
+    This also subsumes the replicate rule: a pass cannot be counted as a replicate
+    of a differently-stamped pass, because the two never reach section 8 together."""
+    out = defaultdict(lambda: {"records": 0, "cases": set(), "runs": set(), "instances": set()})
+    for r in bench:
+        e = out[canon_matrix_id(r.get("matrix_id"))]
+        e["records"] += 1
+        c = r.get("matrix_cases")
+        if isinstance(c, int) and not isinstance(c, bool):
+            e["cases"].add(c)
+        e["runs"].add(r.get("run_id"))
+        e["instances"].add(r.get("instance"))
+    return {
+        k: {
+            "records": v["records"],
+            "cases": sorted(v["cases"]),
+            "runs": sorted(x for x in v["runs"] if x),
+            "instances": sorted(x for x in v["instances"] if x),
+        }
+        for k, v in out.items()
+    }
 
 
 # Routine families for verdict weighting. The family is the routine name minus
@@ -1498,10 +1579,17 @@ def build_absence(inp: Inputs):
 # ---- 0. hosts --------------------------------------------------------------
 
 
-def report_hosts(hosts, bench_instances, out):
+def report_hosts(hosts, bench_instances, mids, out):
     out("\n" + "=" * 78)
     out("0. HOSTS  — provenance and admissibility (standing order 5)")
     out("=" * 78)
+    # One line, always, even though more than one id is impossible here -- main()
+    # refuses before this runs. A report that does not say which case matrix it
+    # describes is a report whose numbers cannot be compared to another report's,
+    # and the campaign's output is three passes that get compared.
+    for mid, e in sorted(mids.items(), key=lambda kv: -kv[1]["records"]):
+        cases = ", ".join(str(c) for c in e["cases"]) or "unrecorded"
+        out(f"  matrix_id={mid} cases={cases} ({e['records']} records)")
     payload = []
     for inst in sorted(set(hosts) | set(bench_instances), key=str):
         h = hosts.get(inst) or Host(instance=inst)
@@ -3560,7 +3648,8 @@ def report_verdict(
             )
     out(
         f"  EXIT: {exit_code} (0 clean; 2 poisoned/inadmissible, 4 coverage hole, "
-        f"8 provenance, 16 does-not-reproduce, 32 floor-band unconfirmed, OR-ed)"
+        f"8 provenance, 16 does-not-reproduce, 32 floor-band unconfirmed, OR-ed. "
+        f"64 mixed case matrices is exclusive: nothing else is computed)"
     )
 
 
@@ -3687,6 +3776,68 @@ def main(argv=None):
             )
         return 1
 
+    # Before anything is aggregated, and before section 0, because a mixed-matrix
+    # directory makes every subsequent number a pooled comparison across two
+    # different case sets. See matrix_ids() for why this refuses instead of warning.
+    mids = matrix_ids(inp.bench)
+    if len(mids) > 1:
+        lines = [
+            f"REFUSING TO ANALYSE {args.results}: {len(mids)} different case matrices in one "
+            "directory.",
+            "",
+            "Sections 1-7 pool by median across passes and section 8 compares passes. Neither "
+            "is meaningful across two case matrices: cells present in one and absent in the "
+            "other drop out of every intersection silently, and what survives is whatever the "
+            "two matrices happen to share. That number would look like every other number in "
+            "this report.",
+            "",
+            "matrix_id                records   cases  instances / runs",
+        ]
+        for mid in sorted(mids, key=lambda k: -mids[k]["records"]):
+            e = mids[mid]
+            lines.append(
+                f"  {mid:23s} {e['records']:7d}  {','.join(str(c) for c in e['cases']) or '?':>6} "
+                f"  {' '.join(e['instances'])} / {' '.join(e['runs'])}"
+            )
+        lines += [
+            "",
+            "Separate the directory by matrix_id and analyse each on its own. Do not merge the "
+            "reports: two matrices are two experiments.",
+        ]
+        for ln in lines:
+            print(ln, file=sys.stderr)
+        if args.json:
+            args.json.write_text(
+                json.dumps(
+                    {
+                        "schema": "gbb-decompose/1",
+                        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "results_dir": str(args.results),
+                        "inputs": {
+                            "files": dict(sorted(inp.files.items())),
+                            "missing_file_families": inp.missing_families,
+                            "bench_records": len(inp.bench),
+                            # Same path as the clean report's, deliberately. A
+                            # consumer that reads inputs.matrix_ids must not have to
+                            # know which exit code moved the field.
+                            "matrix_ids": mids,
+                            "unparseable_lines": inp.bad_lines,
+                            "foreign_roles": dict(inp.foreign_roles),
+                        },
+                        "verdict": {
+                            "code": "MIXED-MATRIX",
+                            "why": f"{len(mids)} case matrices in one results directory; "
+                            "pooling across them is not a comparison",
+                        },
+                        "exit_code": 64,
+                    },
+                    indent=2,
+                    default=str,
+                )
+                + "\n"
+            )
+        return 64
+
     hosts = build_hosts(inp)
     for inst in {r.get("instance") for r in inp.bench}:
         hosts.setdefault(inst, Host(instance=inst))
@@ -3723,7 +3874,7 @@ def main(argv=None):
     )
     out(f"run_ids: {', '.join(map(str, run_ids))}")
 
-    host_payload = report_hosts(hosts, {r.get("instance") for r in inp.bench}, out)
+    host_payload = report_hosts(hosts, {r.get("instance") for r in inp.bench}, mids, out)
     groups = cell_groups(cells)
     deficits = report_deficit_by_routine(cells, groups, hosts, explain, pass_explain, args, out)
     cross = report_target_cross(cells, groups, hosts, explain, pass_explain, inp, args, out)
@@ -3815,6 +3966,10 @@ def main(argv=None):
                 "files": dict(sorted(inp.files.items())),
                 "missing_file_families": inp.missing_families,
                 "bench_records": len(inp.bench),
+                # One key by construction -- more than one is the exclusive exit-64
+                # refusal above, so this is here to say WHICH matrix produced the
+                # report rather than to be checked for length.
+                "matrix_ids": mids,
                 "cells": len(cells),
                 "run_ids": run_ids,
                 "unparseable_lines": inp.bad_lines,

@@ -400,6 +400,77 @@ static int g_threads;
  * before this field existed read as matrix records, which they are. */
 static const char *g_probe = "none";
 
+/* Which MATRIX these records came from, so that a dataset measured before the #2
+ * expansion can never be pooled with one measured after it.
+ *
+ * WHY A DIGEST AND NOT A VERSION NUMBER. The requirement is that a P2 dataset be
+ * stamped pre-expansion "by construction, not by discipline". A hand-maintained
+ * `#define MATRIX_VERSION 1` fails that on its own terms: adding a size to a
+ * ladder and forgetting to bump it produces records that CLAIM to be the old
+ * matrix, and a claim that is wrong in the direction of "safe to pool" is exactly
+ * the failure being guarded against. The bump would be remembered on the big
+ * obvious change -- transposes, complex -- and forgotten on the one-line one.
+ *
+ * So the id is computed by walking the same tables the sweep walks, in a DRY pass
+ * that runs before any measurement. run_matrix() is called twice: once with
+ * g_dry set, which folds every (routine, m, n, k, lda_pad, incx, min_seconds) it
+ * would measure into a hash and measures nothing, and once for real. Adding a
+ * size, a pad, a routine, an incx or a regime floor therefore changes the id
+ * whether or not anyone remembers it should, because the thing that changed is
+ * the thing that is hashed. Removing a case changes it too, which a monotone
+ * counter cannot express at all.
+ *
+ * WHY THE CASE COUNT SITS NEXT TO IT. A hex digest tells a reader "not the same
+ * matrix" and nothing else. g_matrix_cases comes free from the same walk and
+ * cannot drift from it, and "1005 cases" against "156" tells them WHICH matrix
+ * they are holding. Neither field is a human label on purpose: a label in the
+ * record can disagree with the record, and these two cannot.
+ *
+ * The dry pass ignores the argv routine filter deliberately. The id is a property
+ * of the BINARY's matrix, not of one invocation of it, so `gbb-bench dtrsm` -- a
+ * debugging invocation -- stamps the same id as a campaign arm rather than
+ * inventing a third matrix that no campaign ever ran.
+ *
+ * FNV-1a, not a cryptographic hash. Nothing here is adversarial; the requirement
+ * is that an accidental change be visible, and there is no linkable digest
+ * library that would not violate standing order 6's identical-harness rule.
+ *
+ * tools/synth.py deliberately does NOT reproduce this digest. A fixture holding the
+ * expected hex would be a hand-copy of a value, which is the drift CLAUDE.md warns
+ * about in the ladders, and computing it in the gate would mean linking a BLAS to
+ * run the dry pass. synth stamps its own ids in a `synth-` namespace instead: the
+ * fixtures' claim is about what decompose.py does with two different ids, not about
+ * which hex string bench.c produces. */
+static int g_dry = 0;
+static unsigned long long g_matrix_hash = 0;
+static long g_matrix_cases = 0;
+static char g_matrix_id[17] = "unstamped";
+
+/* ORDER-INDEPENDENT, and that is a decision rather than a convenience: the id
+ * describes the case SET, and the order the cases are emitted in is not part of
+ * what was measured. Reordering the sweep loops -- for cache reasons, or to put a
+ * cheap regime first -- does not change the experiment, and it must not make two
+ * datasets refuse to pool. So each case is hashed on its own and the per-case
+ * hashes are SUMMED. Summed and not XOR-ed: two identical cases XOR to nothing,
+ * and a duplicated case is a bug this field should expose rather than erase. */
+static void fold_case(const char *routine, int m, int n, int k, int lda_pad,
+                      int incx, double min_seconds) {
+    char b[128];
+    /* The floor is part of what was measured, not just of how long it took: the
+       same case at 0.05 s and 0.30 s is two measurements and the comparison key
+       already treats it that way. Quantised to the milli-second the record's %.3f
+       carries, so the id cannot turn on a difference the wire format drops. */
+    snprintf(b, sizeof b, "%s:%d|%d|%d|%d|%d|%ld;", routine, m, n, k, lda_pad,
+             incx, (long)(min_seconds * 1000.0 + 0.5));
+    unsigned long long h = 1469598103934665603ULL; /* FNV-1a 64 offset basis */
+    for (const char *p = b; *p; p++) {
+        h ^= (unsigned char)*p;
+        h *= 1099511628211ULL;
+    }
+    g_matrix_hash += h;
+    g_matrix_cases++;
+}
+
 /* Looked up at runtime rather than linked, for two reasons.
  *
  * One: bench.c is compiled with identical flags for every arm -- standing order 6
@@ -482,6 +553,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"blas_sha\":\"%s\",\"coretype\":\"%s\","
            "\"thread_backend\":\"%s\",\"pin_policy\":\"%s\","
            "\"arch_selected\":\"%s\",\"role\":\"%s\",\"probe\":\"%s\","
+           "\"matrix_id\":\"%s\",\"matrix_cases\":%ld,"
            "\"threads\":%d,"
            "\"routine\":\"%s\",\"m\":%d,\"n\":%d,\"k\":%d,\"lda_pad\":%d,"
            "\"incx\":%d,"
@@ -492,7 +564,8 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"gflops\":%.6f,\"gflops_p50\":%.6f,\"verified\":%s,\"note\":\"%s\"}\n",
            g_run_id, g_host, g_instance, g_library, g_target, g_build,
            g_blas_sha, g_coretype, g_thread_backend, g_pin_policy,
-           g_arch_selected, g_role, g_probe, g_threads,
+           g_arch_selected, g_role, g_probe,
+           g_matrix_id, g_matrix_cases, g_threads,
            routine, m, n, k, lda_pad,
            g_incx,
            reps, g_batch, (long)reps * g_batch,
@@ -665,6 +738,9 @@ static void run_dgemv(const Case *c) {
 /* level 1 with a stride knob: incx>1 is where the arm64 tree is weakest */
 static void run_level1(const Case *c, const char *which, int incx) {
     int n = c->m;
+    /* Before the allocation, so the dry pass costs nothing and cannot fail on a
+       host that would not have fitted the 4194304-element vectors. */
+    if (g_dry) { fold_case(which, n, 0, 0, 0, incx, g_min_seconds); return; }
     double alpha = 1.000001;
     double *x = xalloc((size_t)n*incx*sizeof(double));
     double *y = xalloc((size_t)n*incx*sizeof(double));
@@ -727,16 +803,41 @@ static const char *PADDED_ROUTINES[] = { "dgemm", "dtrsm", "dsymm" };
 
 static void sweep(const char *routine, const int *sizes, int nsizes, int lda_pad,
                   double min_seconds) {
+    /* Resolved once, before the loop and before the dry-pass fold, because the two
+       must agree about what this sweep contains. A routine with no driver used to
+       fall off the end of an if/else chain and measure nothing, silently. That was
+       survivable while the only consequence was a smaller table than intended; it
+       stops being survivable now the matrix id is computed from this same loop,
+       because the dry pass would fold cases the real pass skips and the id would
+       claim measurements that were never taken -- standing order 3 arriving through
+       the back door. So: fatal, and fatal in the DRY pass, which is why the lookup
+       happens before the `if (g_dry)`. A multi-hour sweep should not be how you find
+       out that a routine name was misspelled. */
+    void (*driver)(const Case *) = NULL;
+    if      (!strcmp(routine,"dgemm")) driver = run_dgemm;
+    else if (!strcmp(routine,"sgemm")) driver = run_sgemm;
+    else if (!strcmp(routine,"dtrsm")) driver = run_dtrsm;
+    else if (!strcmp(routine,"dtrmm")) driver = run_dtrmm;
+    else if (!strcmp(routine,"dsyrk")) driver = run_dsyrk;
+    else if (!strcmp(routine,"dsymm")) driver = run_dsymm;
+    else if (!strcmp(routine,"dgemv")) driver = run_dgemv;
+    if (!driver) {
+        fprintf(stderr, "gbb: FATAL: no driver for routine '%s'. It is in a sweep list "
+                        "but not in sweep()'s dispatch, so the matrix id would count %d "
+                        "cases that nothing measures.\n", routine, nsizes);
+        exit(5);
+    }
+
     g_min_seconds = min_seconds;
     for (int i = 0; i < nsizes; i++) {
         Case c = { routine, sizes[i], sizes[i], sizes[i], lda_pad };
-        if      (!strcmp(routine,"dgemm")) run_dgemm(&c);
-        else if (!strcmp(routine,"sgemm")) run_sgemm(&c);
-        else if (!strcmp(routine,"dtrsm")) run_dtrsm(&c);
-        else if (!strcmp(routine,"dtrmm")) run_dtrmm(&c);
-        else if (!strcmp(routine,"dsyrk")) run_dsyrk(&c);
-        else if (!strcmp(routine,"dsymm")) run_dsymm(&c);
-        else if (!strcmp(routine,"dgemv")) run_dgemv(&c);
+        /* The dry pass folds from the same loop that dispatches, on purpose: a
+           separate enumeration of "what the matrix contains" is a second copy of the
+           truth, and the copy is what drifts. incx is 1 for level 3 -- the field
+           exists for the level-1 stride axis and every sweep() case is unit-stride
+           by construction. */
+        if (g_dry) fold_case(routine, c.m, c.n, c.k, lda_pad, 1, min_seconds);
+        else driver(&c);
     }
 }
 
@@ -861,11 +962,28 @@ int main(int argc, char **argv) {
     calibrate_timer();
 
     const char *only = (argc > 1) ? argv[1] : "all";
-    #define WANT(r) (!strcmp(only,"all") || !strcmp(only,(r)))
+    /* The dry pass ignores the filter: see g_matrix_id. The id describes the
+       binary's matrix, and a debugging `gbb-bench dtrsm` must stamp the matrix the
+       campaign runs rather than invent one nobody measured. */
+    #define WANT(r) (g_dry || !strcmp(only,"all") || !strcmp(only,(r)))
 
     #define NSMALL  (int)(sizeof SIZES_SMALL /sizeof(int))
     #define NMEDIUM (int)(sizeof SIZES_MEDIUM/sizeof(int))
     #define NLARGE  (int)(sizeof SIZES_LARGE /sizeof(int))
+
+    /* Two passes over one body, which is the whole point -- see g_matrix_id. The
+       first folds every case it would measure into the id and measures nothing; the
+       second measures. A second enumeration of the matrix would be a second copy of
+       the truth, and it is the copy that drifts. */
+    for (int pass = 0; pass < 2; pass++) {
+    g_dry = (pass == 0);
+    if (!g_dry) {
+        snprintf(g_matrix_id, sizeof g_matrix_id, "%016llx", g_matrix_hash);
+        /* Stderr, not a record: it is one line per arm and the records carry it
+           anyway. Useful when a sweep is watched live and the operator wants to
+           know which matrix is running before the first result lands. */
+        fprintf(stderr, "gbb: matrix_id=%s over %ld cases\n", g_matrix_id, g_matrix_cases);
+    }
 
     /* Level 3 across all three regimes, tight leading dimension. */
     const char *l3[] = { "dgemm","sgemm","dtrsm","dtrmm","dsyrk","dsymm" };
@@ -914,6 +1032,12 @@ int main(int argc, char **argv) {
        matrix sweeps run against. Gated on dgemm because it measures dgemm; an arm
        invoked as `gbb-bench dtrsm` is a debugging invocation, not a campaign arm,
        and giving it a dgemm probe would be a record it did not ask for. */
-    if (WANT("dgemm")) run_floor_overlap();
+    /* Outside the id, and deliberately. The probe is not part of the matrix: it
+       validates the instrument the matrix was measured with, so changing the band
+       does not change what the matrix measured and must not make two datasets
+       unpoolable. The probe records still CARRY the matrix id, because the matrix
+       is what they are validating. */
+    if (!g_dry && WANT("dgemm")) run_floor_overlap();
+    }
     return 0;
 }
