@@ -455,6 +455,23 @@ support opposite conclusions.
   generic `ARMV8` arm at 1 thread will be the single most expensive arm in the
   campaign. Instrument the *slowest* arm of the first P2 iteration, not a
   representative one, or the extrapolation lands low.
+- **"Instrument the slowest arm" was an instruction with nothing to read.** The
+  cost model's one remaining unknown is the wall-clock multiplier of the expanded
+  matrix, and no record carried wall clock: `reps`, `batch` and `calls` describe
+  the timing loop, not the case, and the sum over an arm was recoverable only from
+  a log timestamp that the S3 shipping path does not preserve. Every record now
+  carries **`case_seconds`**, the interval from the previous record's emission to
+  this one's, so summing an arm's records reconstructs its sweep wall clock
+  exactly — allocation, fill, verification, `TIMED_LOOP` calibration and samples
+  all included, because all of them are cost the campaign pays. Three choices in
+  it are load-bearing. The clock is read **before** the `printf`, not after the
+  `fflush`: `run-matrix.sh` consumes stdout through a pipe, and a value taken
+  after the flush charges the consumer's backpressure to the case, which would
+  make the cost model track how fast S3 was that day. The accounting starts
+  **after** the dry pass and the timer calibration, so the first case is a case
+  and not this process's launch. And the field is per *record*, not per *arm*,
+  which is what makes it answer the question the spend policy actually asks —
+  which sizes cost the multiplier, not just what the total was.
 - **The per-regime floor put a change of instrument at n=256, which is where the
   effect is expected to be.** `GEMM_SMALL_*`'s crossover is hypothesised to sit at
   about the same size as the 0.05/0.30 transition, so a step in the section 4

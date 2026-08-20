@@ -75,6 +75,45 @@ change can be compared.
 
 ### Added — affects how a number is produced
 
+- **Every bench record now carries `case_seconds`, the wall clock that case cost.**
+  The spend policy's remaining unknown is the expanded matrix's wall-clock
+  multiplier, `MIN_SECONDS` being per-regime moved it again, and the README's
+  standing instruction — *instrument the slowest arm of the first P2 iteration,
+  never a representative one* — had nothing in the record to read. `reps`, `batch`
+  and `calls` describe the timing loop, not the case: they omit allocation, fill,
+  verification and calibration, and the per-arm total was recoverable only from log
+  timestamps that the per-arm S3 shipping path does not preserve. `case_seconds` is
+  the interval from the previous record's emission to this one's, so a sum over an
+  arm's records reconstructs its sweep wall clock exactly, and a sum over a subset
+  answers which *sizes* cost the multiplier rather than only what the total was.
+
+  Three choices in it are load-bearing:
+
+  - **The clock is read before the `printf`, not after the `fflush`.**
+    `run-matrix.sh` consumes stdout through a pipe, so a value taken after the
+    flush charges the consumer's backpressure to the case and the cost model starts
+    tracking how fast S3 was that day rather than how slow the arm was.
+  - **The interval starts after the dry pass and the timer calibration**, inside
+    the same `if (!g_dry)` block that stamps `matrix_id`. Starting it at process
+    start would put a fixed launch cost into a per-case number that then gets
+    multiplied by the case count. `gates/p1.sh` scopes its assertion to that block
+    rather than searching the file, because a `g_last_emit = now()` at the top of
+    `main()` satisfies a whole-file search and is exactly the defect.
+  - **`tools/synth.py` models it, and the model is declared as one.** Reproducing
+    `TIMED_LOOP` in Python would be a second copy of the timing policy, and the
+    copy is what drifts. What the model does reproduce is the one property the cost
+    plan turns on: below `min_seconds / MIN_SAMPLES` per call a case costs the
+    floor and no more, above it the case cannot finish before `MIN_SAMPLES` samples
+    of one call each, so the **slower** arm costs strictly more wall clock for the
+    same measurement. Gate section 2d checks that property on the fixtures
+    themselves — 227 arm pairs in the `null` scenario ordered by speed, zero
+    inverted — because a fixture set in which every arm cost the same would be
+    passed by a cost analysis that took the *first* arm instead of the slowest,
+    which is the single mistake the instrumentation exists to prevent. The
+    floor-overlap probe is priced against the floor each pair member ran under
+    rather than the size's regime default; both members are the same size, so the
+    regime default would report the two halves of the band costing the same.
+
 - **Every bench record now carries `matrix_id` and `matrix_cases`, and more than
   one `matrix_id` in a results directory refuses the analysis outright.** P2 runs
   pre-expansion and P3 runs after items 3–5 of #2 land, so the two passes sweep

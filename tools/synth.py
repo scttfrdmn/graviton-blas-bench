@@ -84,6 +84,51 @@ def min_seconds_for(m):
     return MIN_SECONDS_SMALL if m in SIZES_SMALL else MIN_SECONDS
 
 
+# bench.c's MIN_SAMPLES and MAX_MEASURE_SECONDS, hand-copied and asserted in
+# gates/p1.sh section 2 like the ladders, because case_seconds below is a MODEL of
+# TIMED_LOOP and these two constants are what give the model its shape.
+MIN_SAMPLES = 8
+MAX_MEASURE_SECONDS = 3.0
+
+
+def case_seconds_for(t_min, min_seconds, bytes_touched):
+    """A plausible value for bench.c's case_seconds.
+
+    DECLARED A MODEL, not a reproduction. TIMED_LOOP's real cost comes out of a
+    two-stage calibration this file does not reproduce and should not: the fixtures
+    assert nothing about the timing loop, and synth already writes fixed reps/batch/
+    calls. What the model does have to get right is the ONE property the cost plan
+    turns on -- that wall-clock is anti-correlated with arm quality. Below t_call ~
+    min_seconds/MIN_SAMPLES a case costs the floor and no more, because the batch
+    absorbs the difference; above it the case cannot stop before MIN_SAMPLES samples
+    of one call each, so a SLOWER arm costs strictly more wall clock for the same
+    measurement. That is why CLAUDE.md says to instrument the slowest arm rather
+    than a representative one, and a fixture in which every arm cost the same could
+    not tell a cost analysis that found the slowest arm from one that took the
+    first. MAX_MEASURE_SECONDS is the cap that stops the largest cases running away.
+    The allocate-and-fill term is a flat 20 GB/s, which is the right order for a
+    Graviton and is not asserted anywhere."""
+    measure = min(MAX_MEASURE_SECONDS, max(min_seconds, MIN_SAMPLES * t_min))
+    return round(measure + bytes_touched / 2.0e10, 6)
+
+
+def case_bytes(r, m, n, k):
+    """Roughly what a case allocates and fills, for case_seconds_for()'s alloc term.
+
+    Approximate on purpose and asserted nowhere: it is not bench.c's allocator, and
+    the only thing it has to do is make a large case's fixed overhead larger than a
+    small one's so that the floor dominates at the small end and does not at the
+    large end. Single precision is 4 bytes, everything else 8."""
+    elt = 4 if r == "sgemm" else 8
+    if r in ("daxpy", "ddot"):
+        return 2.0 * m * elt
+    if r == "dgemv":
+        return (m * n + m + n) * elt
+    if r in ("dgemm", "sgemm"):
+        return (m * k + k * n + m * n) * elt
+    return (m * m + m * n) * elt
+
+
 # bench.c's regime boundaries, likewise.
 def regime(n):
     if n <= 256:
@@ -650,6 +695,13 @@ def bench_records(sc: Scenario, host: HostSpec):
                             "reps": 15,
                             "batch": 1,
                             "calls": 15,
+                            # Modelled, in bench.c's printf position. Unlike reps/
+                            # batch/calls above -- fixed placeholders no fixture reads
+                            # -- this one carries a property the cost analysis reads,
+                            # so it varies with the arm. See case_seconds_for().
+                            "case_seconds": case_seconds_for(
+                                t_min, min_seconds_for(m), case_bytes(routine, m, n, k)
+                            ),
                             # Part of the comparison key, so it is emitted per
                             # regime the way bench.c does rather than left absent.
                             "min_seconds": min_seconds_for(m),
@@ -771,6 +823,15 @@ def floor_probe_records(sc: Scenario, host: HostSpec):
                             "reps": 15,
                             "batch": 1,
                             "calls": 15,
+                            # The probe's whole point is that the same size ran under
+                            # two floors, so this is the one place case_seconds must
+                            # be modelled against `floor` rather than the size's
+                            # regime default -- keying it off min_seconds_for(m) would
+                            # report both halves of the band costing the same, which is
+                            # the opposite of what the probe demonstrates.
+                            "case_seconds": case_seconds_for(
+                                t_min, floor, case_bytes("dgemm", m, m, m)
+                            ),
                             "min_seconds": floor,
                             "timer_overhead_ns": 21.0,
                             "timer_res_ns": 1.0,

@@ -519,6 +519,32 @@ static double g_min_seconds = MIN_SECONDS;
    g_batch. */
 static int g_incx = 1;
 
+/* WALL-CLOCK ACCOUNTING, and it is a cost instrument rather than a measurement.
+ *
+ * The spend policy's planning basis is $500-650 for three P3 passes and it says in
+ * as many words that the figure is "to be replaced by a measured number, not
+ * defended". The thing that has to be measured is how long one arm's sweep takes on
+ * the arm where it takes longest -- CLAUDE.md's own note that wall-clock is
+ * ANTI-correlated with arm quality means a representative arm extrapolates low, and
+ * nothing in a record said how long the record took to produce.
+ *
+ * Defined as the interval between the previous record's emission and this one's,
+ * not as "the time this case spent measuring". That choice makes the field ADDITIVE:
+ * summing it over an arm's records reconstructs that arm's sweep wall-clock exactly,
+ * with nothing double-counted and nothing dropped. The alternative -- bracket the
+ * driver -- attributes cleanly to a case but silently omits whatever happens between
+ * cases, and the frees are not free at n=8192. What each interval therefore contains
+ * is: the previous case's frees, this case's allocation and fill, its verification
+ * call, TIMED_LOOP's calibration, and its samples. Process startup and the timer
+ * calibration are deliberately NOT in the first interval -- g_last_emit is set after
+ * them -- because they are a fixed per-arm cost and this field is extrapolated per
+ * case. The arm's startup shows up in the difference between the sum of the field and
+ * the runner's own per-arm elapsed time, which is where a fixed cost belongs.
+ *
+ * It cannot perturb what it accounts for: two now() calls per record, both outside
+ * every timed region, and nothing reads the field inside this process. */
+static double g_last_emit = 0.0;
+
 static void emit(const char *routine, int m, int n, int k, int lda_pad,
                  double *samples, int reps, double flops, int verified,
                  const char *note) {
@@ -548,6 +574,14 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
 
     const char *vstr = verified > 0 ? "true" : verified == 0 ? "false" : "null";
 
+    /* Closed here, and the next interval starts here too, so the record that ends an
+       interval is the one that carries it. Read before the printf: fflush() below can
+       block on a pipe, and charging the consumer's backpressure to this case would
+       make the cost model track how fast S3 was that day. */
+    double now_s = now();
+    double case_seconds = (g_last_emit > 0.0) ? now_s - g_last_emit : 0.0;
+    g_last_emit = now_s;
+
     printf("{\"run_id\":\"%s\",\"host\":\"%s\",\"instance\":\"%s\","
            "\"library\":\"%s\",\"target\":\"%s\",\"build\":\"%s\","
            "\"blas_sha\":\"%s\",\"coretype\":\"%s\","
@@ -558,6 +592,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"routine\":\"%s\",\"m\":%d,\"n\":%d,\"k\":%d,\"lda_pad\":%d,"
            "\"incx\":%d,"
            "\"reps\":%d,\"batch\":%ld,\"calls\":%ld,"
+           "\"case_seconds\":%.6f,"
            "\"min_seconds\":%.3f,"
            "\"timer_overhead_ns\":%.3f,\"timer_res_ns\":%.3f,"
            "\"t_min\":%.9g,\"t_p50\":%.9g,\"t_p90\":%.9g,"
@@ -569,6 +604,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            routine, m, n, k, lda_pad,
            g_incx,
            reps, g_batch, (long)reps * g_batch,
+           case_seconds,
            g_min_seconds,
            g_timer_overhead * 1e9, g_timer_res * 1e9,
            tmin, p50, p90,
@@ -983,6 +1019,12 @@ int main(int argc, char **argv) {
            anyway. Useful when a sweep is watched live and the operator wants to
            know which matrix is running before the first result lands. */
         fprintf(stderr, "gbb: matrix_id=%s over %ld cases\n", g_matrix_id, g_matrix_cases);
+        /* Start the wall-clock accounting here, after startup and after the timer
+           calibration, so the first record's case_seconds describes a case and not
+           this process's launch. The dry pass is deliberately outside it: it emits
+           nothing and takes microseconds, and charging it to the first case would put
+           a fixed cost into a per-case number used to extrapolate. */
+        g_last_emit = now();
     }
 
     /* Level 3 across all three regimes, tight leading dimension. */

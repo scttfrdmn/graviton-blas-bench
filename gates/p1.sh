@@ -539,6 +539,175 @@ else
   bad "the matrix stamp does not follow the matrix — $stamp"
 fi
 
+# ---- 2d. per-case wall clock is recorded, and is a cost signal ------------
+# `case_seconds` exists for one reason: it is the only measured input to the P3
+# cost estimate, and CLAUDE.md's §"Wall-clock is anti-correlated with arm quality"
+# says it must be read off the SLOWEST arm because a representative arm
+# extrapolates low. That instruction is only actionable if the field actually
+# varies with arm speed, so the ways it can go quiet are:
+#
+#   - It stops being read before the printf. fflush() can block on the pipe to
+#     run-matrix.sh, so a value taken after the write charges the consumer's
+#     backpressure to the case and the cost model starts tracking how fast S3 was
+#     that day.
+#   - The interval starts at process start rather than after calibration, putting a
+#     fixed startup cost into a per-case number that gets multiplied by 1005.
+#   - It drifts out of printf position, relabelling every field after it.
+#   - synth models it as a constant. Then every arm costs the same in every fixture,
+#     and an analysis that took the FIRST arm instead of the slowest one would pass
+#     the gate -- the single mistake this instrumentation exists to prevent.
+if wall=$("$PY" - <<'EOF'
+import importlib.util, pathlib, re, sys
+from collections import defaultdict
+
+src = pathlib.Path("src/bench.c").read_text()
+sspec = importlib.util.spec_from_file_location("synth", pathlib.Path("tools/synth.py"))
+synth = importlib.util.module_from_spec(sspec)
+sspec.loader.exec_module(synth)
+
+
+def define(name):
+    m = re.search(r"^\s*#define\s+" + re.escape(name) + r"\s+([0-9.eE+-]+)", src, re.M)
+    return float(m.group(1)) if m else None
+
+
+bad = []
+
+# -- the producer prints it, between calls and min_seconds, in both lists.
+stmt = re.search(r'printf\("\{\\"run_id.*?\);', src, re.S)
+if not stmt:
+    bad.append("src/bench.c's emit() no longer has the record printf")
+else:
+    fmt, _, argv = stmt.group(0).partition(r'\n",')
+    for a, b, c, where in ((r'\"calls\":%ld', r'\"case_seconds\":%.6f', r'\"min_seconds\":%.3f', "format string"),
+                           ("g_batch", "case_seconds,", "g_min_seconds", "argument list")):
+        text = fmt if where == "format string" else argv
+        if not (0 <= text.find(a) < text.find(b) < text.find(c)):
+            bad.append(
+                f"src/bench.c's emit() {where} no longer has case_seconds between calls and "
+                f"min_seconds"
+            )
+    # -- and reads the clock BEFORE it, not after the fflush.
+    read = src.find("g_last_emit = now_s;")
+    if read < 0:
+        bad.append("src/bench.c's emit() no longer closes the interval into g_last_emit")
+    elif not 0 <= read < src.find(stmt.group(0)):
+        bad.append(
+            "src/bench.c reads the clock after the record printf, so a blocked fflush is "
+            "charged to the case"
+        )
+
+# -- the interval starts after calibration, inside the same !g_dry block that
+# stamps the matrix id. Scoped to that block rather than searched for globally: a
+# g_last_emit = now() at the top of main() would satisfy a whole-file search and
+# would put process startup into the first case.
+block = re.search(r"if \(!g_dry\) \{(.*?)\n    \}", src, re.S)
+if not block:
+    bad.append("src/bench.c's main() no longer has the post-dry-pass !g_dry block")
+elif "g_last_emit = now();" not in block.group(1):
+    bad.append(
+        "src/bench.c does not start the wall-clock accounting in the !g_dry block, so the "
+        "first case_seconds includes process startup and timer calibration"
+    )
+
+# -- synth's two model constants agree with the producer's #defines. They are what
+# give the model its anti-correlation, so a drift makes the fixtures assert the
+# wrong shape rather than nothing.
+for name, have in (("MIN_SAMPLES", synth.MIN_SAMPLES), ("MAX_MEASURE_SECONDS", synth.MAX_MEASURE_SECONDS)):
+    want = define(name)
+    if want is None:
+        bad.append(f"could not read {name} out of src/bench.c")
+    elif float(have) != want:
+        bad.append(f"synth.{name}={have} but bench.c {name}={want}")
+
+# -- the model's shape, as three properties rather than as a formula. Floor-clamped
+# at the cheap end, MIN_SAMPLES-clamped at the expensive end, capped at the top.
+floor = synth.MIN_SECONDS
+cheap = synth.case_seconds_for(floor / synth.MIN_SAMPLES / 100, floor, 0.0)
+if abs(cheap - floor) > 1e-9:
+    bad.append(f"a fast case costs {cheap}, not the {floor} floor: the floor no longer binds")
+slow = synth.case_seconds_for(floor, floor, 0.0)
+if slow <= cheap:
+    bad.append(
+        f"an arm {synth.MIN_SAMPLES * 100}x slower on the same case costs {slow} against {cheap}: "
+        f"the model has no anti-correlation and no fixture can distinguish the slowest arm"
+    )
+capped = synth.case_seconds_for(1e6, floor, 0.0)
+if capped > synth.MAX_MEASURE_SECONDS + 1e-9:
+    bad.append(f"case_seconds_for is unbounded: {capped} > MAX_MEASURE_SECONDS")
+
+# -- and the property in the fixtures themselves, which is what an analysis reads.
+# Within one condition the arms differ only in speed, so case_seconds must be
+# monotone non-increasing in gflops, and must do so STRICTLY somewhere: all-equal
+# would satisfy monotonicity while carrying no signal at all.
+sc = synth.SCENARIOS["null"]()
+recs = synth.bench_records(sc, sc.hosts[0])
+missing = [r for r in recs if "case_seconds" not in r]
+if missing:
+    bad.append(f"{len(missing)} of {len(recs)} synth bench records carry no case_seconds")
+conds = defaultdict(list)
+# Guarded, so a dropped field reports itself rather than dying in a KeyError below:
+# the traceback goes to stderr, the check's own message comes back empty, and the
+# gate FAILs with nothing to read. Found by mutation.
+for r in recs if not missing else ():
+    conds[(r["threads"], r["routine"], r["m"], r["n"], r["k"], r["lda_pad"], r["incx"])].append(
+        (r["gflops"], r["case_seconds"])
+    )
+strict = inverted = 0
+for arms in conds.values():
+    ordered = sorted(arms)
+    for lo, hi in zip(ordered, ordered[1:]):
+        if hi[1] > lo[1] + 1e-9:
+            inverted += 1
+        elif lo[1] > hi[1] + 1e-9:
+            strict += 1
+if inverted:
+    bad.append(
+        f"{inverted} arm pairs where the FASTER arm's case costs more wall clock: the fixtures "
+        f"model wall-clock as correlated with arm quality, not anti-correlated"
+    )
+if not strict and not missing:
+    bad.append(
+        "no arm pair in the null scenario differs in case_seconds, so every fixture costs the "
+        "same on every arm and a cost analysis that picked the first arm would pass"
+    )
+
+# -- and on the probe records, where it must be keyed off the floor the pair member
+# actually ran under rather than off the size's regime default. Both halves of a
+# pair are the SAME size, so a model that read min_seconds_for(m) would report them
+# costing the same -- and the cheaper floor being cheaper is the only reason the
+# per-regime floor was adopted. Nothing else in the fixtures would notice.
+fp = synth.SCENARIOS["floor-band-agrees"]()
+probe = synth.floor_probe_records(fp, fp.hosts[0])
+if not probe:
+    bad.append("the floor-band scenario produced no probe records")
+elif any("case_seconds" not in r for r in probe):
+    bad.append("floor-overlap probe records carry no case_seconds, so the band's cost is unaccounted")
+else:
+    by_floor = defaultdict(set)
+    for r in probe:
+        by_floor[r["m"]].add((round(r["min_seconds"], 3), r["case_seconds"]))
+    flat = [m for m, pairs in by_floor.items() if len({cs for _, cs in pairs}) < 2]
+    if len(by_floor) < 2 or flat:
+        bad.append(
+            f"{len(flat)} of {len(by_floor)} band sizes cost the same under both floors, so "
+            f"case_seconds is keyed off the size's regime rather than off the floor it ran under"
+        )
+
+print(
+    "; ".join(bad)
+    if bad
+    else f"recorded in position, clock read pre-fflush, {strict} arm pairs ordered by speed, "
+         f"0 inverted, both probe floors priced apart"
+)
+sys.exit(1 if bad else 0)
+EOF
+); then
+  ok "per-case wall clock is recorded and tracks arm slowness: $wall"
+else
+  bad "case_seconds is not a usable cost signal — $wall"
+fi
+
 # ---- 3. the majority comparison is exact ----------------------------------
 # A property of decompose.py, not of any dataset, and it has to be checked here
 # because no fixture can reach it: the default --verdict-majority of 0.60 is one
