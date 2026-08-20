@@ -57,6 +57,31 @@ done < <(find . -name '*.py' -not -path './.git/*' | sort)
 
 if command -v ruff >/dev/null 2>&1; then
   if ruff check . >/dev/null 2>&1; then ok "ruff check"; else bad "ruff check (run 'ruff check .' for detail)"; fi
+  # `ruff format --check` is a SEPARATE command from `ruff check`, and this gate ran
+  # only the latter while CI ran both -- so a green P0 sat on top of a red CI twice
+  # (f456cb7 and the commit before this line existed), which inverts the gate's whole
+  # purpose: its own first row is "CI green on a clean clone". A gate that is easier to
+  # pass than the thing it certifies is not a gate. Anything CI runs on this tree runs
+  # here too.
+  if ruff format --check . >/dev/null 2>&1; then
+    ok "ruff format --check"
+  else
+    bad "ruff format --check (run 'ruff format .' — CI runs this and 'ruff check' does not cover it)"
+  fi
+  # And the verdict is version-dependent, so a matching version is part of the check
+  # rather than an assumption about the developer's machine. CI pins ruff for the reason
+  # BLIS_REF is pinned; a local ruff older than the pin can format a file that CI then
+  # rejects, which reproduces the same green-here/red-there gap by a different route.
+  # A WARNING and not a failure: the pin is CI's environment, and requiring every
+  # contributor to match it exactly would fail the gate on a fact about the laptop.
+  ruff_pin=$(sed -n 's/.*pipx install ruff==\([0-9.]*\).*/\1/p' .github/workflows/ci.yml | head -1)
+  ruff_have=$(ruff --version 2>/dev/null | awk '{print $2}')
+  if [ -n "$ruff_pin" ] && [ "$ruff_pin" = "$ruff_have" ]; then
+    ok "ruff version matches CI's pin ($ruff_have)"
+  else
+    printf '  \033[33mWARN\033[0m  local ruff %s != CI pin %s; the format verdict can differ — reproduce CI with: uvx ruff@%s format --check .\n' \
+      "${ruff_have:-unknown}" "${ruff_pin:-unknown}" "${ruff_pin:-VERSION}"
+  fi
 else
   printf '  \033[33mSKIP\033[0m  ruff not installed locally (CI enforces it)\n'
 fi

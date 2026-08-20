@@ -163,6 +163,24 @@ change can be compared.
   CLI value nor the other constant, and a behavioural check that moving
   `DEFAULT_VERDICT_MAJORITY` to 0.99 does not change `sign_majority()`'s answer.
 
+### Fixed — `gates/p0.sh` was easier to pass than the CI it certifies; `ruff format --check` was missing
+
+- **P0's own first row is "CI green on a clean clone", and the gate did not run one of the
+  things CI runs.** `ruff format --check` is a separate command from `ruff check`; the gate ran
+  only the latter, so P0 reported GREEN over a red CI — which had already happened twice, most
+  recently on `f456cb7`, a docs-only commit whose Python whitespace CI rejected. A gate that is
+  easier to pass than the thing it certifies is not a gate, and this is the second appearance of
+  that exact failure: the `python-format` job exists as its own job precisely because a trailing
+  comma once silently disabled `gate-p1` for the window in which the reference-arm scope and the
+  denominator input set were rewritten.
+- **The formatter's verdict is version-dependent, so the version is checked too.** CI pins
+  `ruff==0.16.3` for the reason `BLIS_REF` is pinned. A local ruff older than the pin can format a
+  file CI then rejects, reproducing the same green-here/red-there gap by another route, so the gate
+  compares its own `ruff --version` against the pin read out of `ci.yml` and names the `uvx
+  ruff@<pin>` command that reproduces CI's verdict exactly. A **warning, not a failure**: the pin
+  describes CI's environment, and failing the gate on a fact about the laptop would be a gate on
+  the wrong thing.
+
 ### Added — `gates/p1.sh` checks the roofline record copy against `src/roofline.c`
 
 - **`synth.py` hand-copies the roofline record shape, and the copy just gained a field.** Section 2

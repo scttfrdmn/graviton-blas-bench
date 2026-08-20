@@ -6214,8 +6214,7 @@ def check_one(exp, report, stdout, exit_code, root):
         return not bad, (
             f"{len(rows)} bimodal population(s) matching {where}, "
             f"gaps {[round(p['gap_ratio'], 2) for p in rows[:4]]}, "
-            f"n_low {[p['n_low'] for p in rows[:4]]}"
-            + (f"; WRONG: {bad[:5]}" if bad else "")
+            f"n_low {[p['n_low'] for p in rows[:4]]}" + (f"; WRONG: {bad[:5]}" if bad else "")
         )
 
     if kind == "placement_ratio":
@@ -6236,8 +6235,7 @@ def check_one(exp, report, stdout, exit_code, root):
         if bad or not got:
             return False, f"t={exp['threads']} placement ratio {got}, not a number"
         return all(OPS[exp["op"]](g, exp["value"]) for g in got), (
-            f"t={exp['threads']} placement ratio {[round(g, 3) for g in got]} "
-            f"{exp['op']} {exp['value']}"
+            f"t={exp['threads']} placement ratio {[round(g, 3) for g in got]} {exp['op']} {exp['value']}"
         )
 
     if kind == "bimodal_coverage":

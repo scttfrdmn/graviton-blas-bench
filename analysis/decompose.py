@@ -3454,9 +3454,7 @@ def sign_majority(signs) -> bool:
     must clear it, and float division puts that outcome at the mercy of which decimal
     the constant was written as. Empty is never a majority.
     """
-    return bool(signs) and majority_met(
-        Fraction(abs(sum(signs))), Fraction(len(signs)), SIGN_MAJORITY
-    )
+    return bool(signs) and majority_met(Fraction(abs(sum(signs))), Fraction(len(signs)), SIGN_MAJORITY)
 
 
 def compute_floor_overlap(probe_cells, args):
@@ -3665,9 +3663,7 @@ def compute_floor_overlap(probe_cells, args):
     # unanimities being incompatible, so the status chain cannot reach a state where
     # both are true and precedence alone decides which cause the reader is sent after.
     order_explains = (
-        len(order_signs) >= MIN_FOR_SIGN
-        and sign_majority(order_signs)
-        and not sign_majority(signs)
+        len(order_signs) >= MIN_FOR_SIGN and sign_majority(order_signs) and not sign_majority(signs)
     )
 
     if not pairs:
