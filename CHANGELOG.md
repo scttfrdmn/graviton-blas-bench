@@ -152,6 +152,34 @@ change can be compared.
   independent questions get four answers instead of stopping at the first no.
   `gate-p0` requires both jobs, since its bar is "CI green on a clean clone".
 
+- **`tests/sve-probe-assert.sh`'s own fixture was a race, and unmasking the `shell`
+  job is what revealed it.** The suite's central claim is that its fixture still
+  reproduces the SIGPIPE bug — it asserts the *old* `nm | grep -q` form returns `no`,
+  precisely so that section 3 cannot pass against a broken implementation. That
+  assertion needs `nm` to still be writing when `grep -q` exits, and the fixture was
+  6×500 short-named symbols: about **93 KB of `nm` output against a 64 KiB pipe
+  buffer**. `grep`'s first read drains the whole buffer, and if `nm` can write the
+  remaining ~29 KB *during* that scan it exits 0, there is no SIGPIPE, and the old
+  form returns `yes`. So the fixture reproduced the bug on the dev host and not on
+  x86 CI — the suite was green here and red there, on identical code.
+
+  The earlier note in the file that "a 60 KB fixture reproduced the bug fine" was
+  **recording luck as evidence**, and it is quoted in the source now rather than
+  deleted, because it is the reasoning that shipped the race: outlasting `grep`'s
+  first match is exactly what a size comparable to the buffer cannot guarantee.
+  Margin is now measured in **multiples of the buffer, not kilobytes** — 8×1500
+  symbols with 64-character padded names is **12,038 symbols / 1,152 KB, over 20×**,
+  and the whole suite still runs in ~1.1 s.
+
+  Two **deterministic** assertions now sit alongside the inherently racy one, so that
+  a fixture which stops reproducing the bug says *which* property it lost: the first
+  matching symbol is within the first tenth of `nm`'s lines (so `grep -q` really does
+  exit early), and the output exceeds 8× a 64 KiB buffer (so `nm` cannot drain inside
+  one scan). Writing them promptly reproduced the original defect in miniature —
+  `nm | grep -nE -m1 | cut` under the suite's own `pipefail` killed the suite on the
+  measurement line — so `nm`'s output is captured to a file once and every count is
+  taken from there, which is the same fix the probe itself got. 12/12.
+
 - Tree-wide `shellcheck --severity=warning` is clean, which the `shell` job has
   been failing on: five `cd` without `|| exit` (these scripts run `set -uo
   pipefail`, no `-e`, so a failed `cd` really did continue), two dead variables,
@@ -268,6 +296,37 @@ change can be compared.
   Mutation-validated on four mutations: disabling the loop, killing either branch, and
   dropping the null guard. That last one is what the silent half buys: without it,
   `target_resolved_elsewhere` fires on every scenario in the suite.
+
+  **Both halves were then run against real SVE silicon, and both were wrong in ways
+  no fixture could have caught** — the probe is compiled and executed on the build
+  host, so nothing short of building BLIS tests it. On `castor.local` (Cortex-X925,
+  SVE2 at VL=128; instrument check, never data):
+
+  - The probe **did not compile**, and the read-back therefore recorded
+    `target_effective: "unknown"` — a failure reported honestly, and caused entirely
+    by the flags used to ask the question. `blis.h` includes `bli_pthread.h`, which
+    declares `pthread_barrier_t`; glibc hides that GNU extension behind
+    `__USE_XOPEN2K`, which `-std=c11` switches off by defining `__STRICT_ANSI__`. Now
+    `-std=gnu11 -D_GNU_SOURCE`, with `<blis.h>` and an rpath. This does **not** touch
+    standing order 6: that order constrains the harness so the library under test is
+    the only thing that varies, and this throwaway prints a string and exits — it is
+    not measured and is not linked into any timed binary. With the fix the read-back
+    answers **`armsve`**, confirming the chosen config is the one the library reports.
+  - The run also **exposed a defect in the `target_effective` commit itself.** The
+    final admissibility check for the DYNAMIC arm was one substring spanning four
+    keys — `'"target":"DYNAMIC","coretype":null,"blas_sha":"[0-9a-f]*","built":true'`
+    — so it was really an assertion about how `arm_record()` formats a line. Inserting
+    `target_effective` *between* `target` and `coretype` made it stop matching, and a
+    healthy build died with **"the DYNAMIC_ARCH arm did not build"** while the manifest
+    one line above said `"built":true`. It fails closed, which is the survivable
+    direction and exactly why it was worth fixing rather than tolerating: a fatal that
+    fires on good builds is a fatal someone deletes rather than debugs, and this one
+    guards the arm carrying the entire `OPENBLAS_CORETYPE` sweep. Now matched per
+    field, which also lets the **count** be asserted — `grep -q` is satisfied by one
+    line and says nothing about there being exactly one. Mutation-validated against
+    the shipped manifest on five cases: the real one passes, `built:false` dies, a
+    removed record dies as `found 0`, a duplicated record dies as `found 2`, and
+    `DYNAMIC_OMP` alone does not satisfy it.
 
 ### Removed — affects what the report claims
 

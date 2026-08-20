@@ -546,11 +546,25 @@ if [ "$OK" = true ]; then
   probe_c="$SRCDIR/blis-arch-probe.c"
   cat > "$probe_c" <<'PROBE'
 #include <stdio.h>
-#include "blis.h"
+#include <blis.h>
 int main(void) { printf("%s\n", bli_arch_string(bli_arch_query_id())); return 0; }
 PROBE
-  if ${CC:-gcc} -O2 -std=c11 -I"$PREFIX/blis/include/blis" "$probe_c" \
-       -o "$SRCDIR/blis-arch-probe" -L"$PREFIX/blis/lib" -lblis -lm -lpthread \
+  # `-std=gnu11 -D_GNU_SOURCE`, and both are required. blis.h pulls in
+  # bli_pthread.h, which declares pthread_barrier_t -- a GNU extension that
+  # glibc's pthread.h hides under __USE_XOPEN2K, which `-std=c11` switches off by
+  # defining __STRICT_ANSI__. The first attempt used `-std=c11` and the probe
+  # failed to compile with "unknown type name 'pthread_barrier_t'", which this
+  # block then dutifully recorded as `target_effective: unknown` -- a read-back
+  # failure reported honestly, and caused entirely by the flags used to ask.
+  #
+  # This does NOT touch standing order 6. That order constrains the harness, so
+  # that the thing being measured is the only thing that varies between arms.
+  # Nothing here is measured or linked into a timed binary: it is a throwaway
+  # that prints a string and exits, and it must compile against whatever headers
+  # the library ships.
+  if ${CC:-gcc} -O2 -std=gnu11 -D_GNU_SOURCE -I"$PREFIX/blis/include/blis" "$probe_c" \
+       -o "$SRCDIR/blis-arch-probe" -L"$PREFIX/blis/lib" -lblis \
+       -Wl,-rpath,"$PREFIX/blis/lib" -lm -lpthread \
        >>"$PREFIX/blis.buildlog" 2>&1; then
     BLIS_ARCH="$("$SRCDIR/blis-arch-probe" 2>>"$PREFIX/blis.buildlog" | tr -d '[:space:]')"
   fi
@@ -603,7 +617,35 @@ printf '"native_target":"%s","cross_target":"%s","host_sve":%s,"host_sve2":%s}\n
 log "manifest written to $MANIFEST"
 cat "$MANIFEST" >&2
 
-if ! grep -q '"target":"DYNAMIC","coretype":null,"blas_sha":"[0-9a-f]*","built":true' "$MANIFEST"; then
-  die "the DYNAMIC_ARCH arm did not build. It carries the entire OPENBLAS_CORETYPE
-     sweep, so there is no experiment without it. See $PREFIX/openblas-DYNAMIC.buildlog"
+# The DYNAMIC arm is checked field by field, not by one substring spanning four of
+# them. The previous form was
+#
+#   grep -q '"target":"DYNAMIC","coretype":null,"blas_sha":"[0-9a-f]*","built":true'
+#
+# which required those keys to be ADJACENT and IN THAT ORDER, so it was really an
+# assertion about how arm_record() happens to format a line. Adding
+# `target_effective` between `target` and `coretype` -- a provenance field that has
+# nothing to do with whether the arm built -- made it stop matching, and a healthy
+# build on real SVE silicon died with "the DYNAMIC_ARCH arm did not build" while the
+# manifest one line above said `"built":true`.
+#
+# It fails closed, which is the survivable direction, and that is exactly why it is
+# worth fixing rather than tolerating: a fatal that fires on good builds is a fatal
+# someone deletes rather than debugs, and this one guards the arm carrying the whole
+# OPENBLAS_CORETYPE sweep. Matching per field also lets the count be asserted, which
+# the old form could not do -- `grep -q` is satisfied by one line and says nothing
+# about there being exactly one.
+dyn_lines="$(grep -F '"library":"openblas"' "$MANIFEST" \
+             | grep -F '"target":"DYNAMIC",' || true)"   # trailing comma: not DYNAMIC_OMP
+n_dyn="$(printf '%s' "$dyn_lines" | grep -c . || true)"
+if [ "$n_dyn" -ne 1 ]; then
+  die "expected exactly 1 openblas/DYNAMIC arm record in $MANIFEST, found $n_dyn.
+     That is a manifest-shape fault, not a build failure: the record either was not
+     written or was written twice, and either way the coretype sweep cannot be keyed
+     off it."
 fi
+case "$dyn_lines" in
+  *'"built":true'*) ;;
+  *) die "the DYNAMIC_ARCH arm did not build. It carries the entire OPENBLAS_CORETYPE
+     sweep, so there is no experiment without it. See $PREFIX/openblas-DYNAMIC.buildlog" ;;
+esac

@@ -109,11 +109,26 @@ mkfixture() {   # mkfixture <dir> <with-sve: yes|no>
   fi
   # Filler, to push nm's output well past the pipe buffer so grep -q's early exit
   # leaves nm still writing. Names deliberately free of `sve_`, `_sve` and
-  # `ARMV8SVE`. Generated as a few large translation units rather than hundreds of
-  # tiny ones purely so this suite stays quick enough to run on every push.
-  for i in 1 2 3 4 5 6; do
-    seq 1 500 | awk -v b="$i" '{printf "int filler_%d_%d(void){return %d;}\n", b, $1, $1}' \
-      > "$TMP/f.c"
+  # `ARMV8SVE`.
+  #
+  # THE SIZE IS NOT ARBITRARY AND "past the pipe buffer" IS NOT ENOUGH. This started
+  # at 6x500 short-named symbols -- about 93 KB of nm output against a 64 KiB pipe
+  # buffer -- and section 2 failed it on x86 CI while passing on the dev host. The
+  # margin was the whole problem: grep's first read drains the full 64 KiB, and while
+  # grep is still scanning that block for a match, nm writes the remaining ~29 KB and
+  # exits 0. No SIGPIPE, so the old form returns `yes` and the fixture stops
+  # reproducing the bug. It is a race, so it was never reliably reproducing it -- it
+  # won on one platform and lost on another, and the earlier note in section 1 that
+  # "a 60 KB fixture reproduced the bug fine" was recording luck as evidence.
+  #
+  # The fix is margin measured in multiples, not in kilobytes: names are padded so
+  # each nm line is long, which buys bytes far more cheaply than more symbols buys
+  # compile time. ~12k symbols at ~100 bytes a line is ~1.4 MB, more than 20x the
+  # buffer, so nm cannot possibly finish inside one of grep's scans.
+  local pad=________________________________________________________________
+  for i in 1 2 3 4 5 6 7 8; do
+    seq 1 1500 | awk -v b="$i" -v p="$pad" \
+      '{printf "int filler_%s_%d_%d(void){return %d;}\n", p, b, $1, $1}' > "$TMP/f.c"
     cc -c "$TMP/f.c" -o "$TMP/f_$i.o"
   done
   ar rcs "$dir/lib/libopenblas.a" "$TMP"/f_*.o 2>/dev/null
@@ -123,17 +138,48 @@ mkfixture() {   # mkfixture <dir> <with-sve: yes|no>
 printf '\n1. fixtures\n'
 mkfixture "$TMP/with" yes
 mkfixture "$TMP/without" no
-NSYM=$(nm --defined-only "$TMP/with/lib/libopenblas.a" | wc -l | tr -d ' ')
-NBYTES=$(nm --defined-only "$TMP/with/lib/libopenblas.a" | wc -c | tr -d ' ')
-NMATCH=$(nm --defined-only "$TMP/with/lib/libopenblas.a" | grep -cE '(ARMV8SVE|_sve|sve_)' || true)
+# Captured to a file rather than piped, for the same reason the fixed probe captures
+# it: any `nm | grep -m1`-shaped measurement below would exit early, SIGPIPE nm, and
+# under this suite's own `set -o pipefail` kill the suite. That happened while these
+# assertions were being written, which is a fair indication of how easy the original
+# defect was to introduce.
+nm --defined-only "$TMP/with/lib/libopenblas.a" > "$TMP/with.nm"
+NSYM=$(wc -l <"$TMP/with.nm" | tr -d ' ')
+NBYTES=$(wc -c <"$TMP/with.nm" | tr -d ' ')
+NMATCH=$(grep -cE '(ARMV8SVE|_sve|sve_)' "$TMP/with.nm" || true)
 ok "with-SVE archive: $NSYM defined symbols, $NBYTES bytes of nm output, $NMATCH matching"
-# Informational, NOT an assertion. The pipe buffer is 64 KiB on Linux but starts at
-# 16 KiB and grows on macOS, and nm's output only has to outlast grep's first match
-# rather than exceed any particular size -- a 60 KB fixture reproduced the bug
-# fine. Section 2 measures adequacy directly by running the broken form, so a
-# byte-count proxy here would be both stricter and less accurate than the real
-# check, and would fail the suite on a fixture that works.
-printf '  ..    %s bytes of nm output (context; adequacy is asserted in section 2)\n' "$NBYTES"
+# The two halves of the SIGPIPE window, asserted separately from section 2's
+# end-to-end reproduction so that a fixture which stops reproducing the bug says
+# WHICH property it lost instead of only that it lost one. Section 2 is a race by
+# nature -- it depends on grep and nm interleaving -- and these two are not, so they
+# are what keeps section 2 from being flaky rather than merely lucky.
+#   (a) the match is early, so grep -q exits with most of the output unwritten;
+#   (b) there is far more output than one pipe buffer, so nm cannot drain to
+#       completion inside a single one of grep's scans. 93 KB against a 64 KiB
+#       buffer did exactly that and cost this suite a red on CI and a green here.
+#
+# An earlier note here called the byte count "informational, NOT an assertion",
+# on the grounds that nm's output "only has to outlast grep's first match rather
+# than exceed any particular size -- a 60 KB fixture reproduced the bug fine."
+# That reasoning is why this suite shipped a race. The first clause is true and the
+# conclusion does not follow: outlasting grep's first match is exactly what a size
+# comparable to the buffer cannot guarantee, and "reproduced the bug fine" was one
+# platform's scheduler, not a property of the fixture. The buffer is 64 KiB on
+# Linux and starts smaller on macOS, so the bound below is conservative on the
+# platform that matters and slack on the other.
+FIRST=$(grep -nE -m1 '(ARMV8SVE|_sve|sve_)' "$TMP/with.nm" | cut -d: -f1)
+if [ "${FIRST:-0}" -gt 0 ] && [ "$FIRST" -lt $((NSYM / 10)) ]; then
+  ok "first matching symbol is at line $FIRST of $NSYM -- grep -q exits early (the SIGPIPE window)"
+else
+  bad "first match at line ${FIRST:-none} of $NSYM: not in the first tenth, so grep -q would
+        consume most of nm's output before exiting and the bug would not reproduce"
+fi
+if [ "$NBYTES" -gt $((64 * 1024 * 8)) ]; then
+  ok "nm output is $((NBYTES / 1024)) KB, >8x a 64 KiB pipe buffer (nm cannot finish mid-scan)"
+else
+  bad "nm output is only $((NBYTES / 1024)) KB: too close to the 64 KiB pipe buffer for the
+        race to go the same way every time. Enlarge the filler."
+fi
 WMATCH=$(nm --defined-only "$TMP/without/lib/libopenblas.a" | grep -cE '(ARMV8SVE|_sve|sve_)' || true)
 if [ "$WMATCH" -eq 0 ]; then
   ok "without-SVE archive has 0 matching symbols"
