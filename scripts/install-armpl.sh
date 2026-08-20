@@ -30,7 +30,12 @@
 #   export ARMPL_DIR="$(GBB_ARMPL_ACCEPT_EULA=1 bash scripts/install-armpl.sh --print-dir)"
 #
 # Then build-libs.sh picks it up from ARMPL_DIR and records the arm as measured
-# rather than as an explained absence.
+# rather than as an explained absence. scripts/workload.sh does both, and makes a
+# missing ArmPL fatal on a P3 pass before any instance-hours are spent.
+#
+# GBB_ARMPL_MIRROR=s3://.../vendor (or a local directory) is checked before the CDN
+# and populated from the first successful CDN fetch, so P3's fifteen passes read one
+# set of bytes and the vendor CDN is off the critical path. See the MIRROR block.
 
 set -euo pipefail
 
@@ -108,18 +113,56 @@ sha_of() {
   else die "no sha256sum and no shasum, so the download cannot be verified"; fi
 }
 
+# GBB_ARMPL_MIRROR: an s3:// prefix or a local directory holding the same tarball
+# under the same basename. Tried before the CDN, and given no more trust than it --
+# the digest check below is identical either way, so a poisoned mirror aborts the
+# install exactly as a moved permalink would.
+#
+# Why it exists: P3 is fifteen passes (five hosts x three), and fifteen 1.0 GB pulls
+# from a vendor CDN sit on the critical path of a spend-authorised sweep. The pin
+# protects the campaign from the permalink changing mid-campaign, but it protects it
+# by aborting a pass, and a pass that aborts on the download is instance-hours spent
+# for nothing. Mirroring once means all fifteen passes read identical bytes and the
+# CDN is off the critical path. Optional, because a single-host P2 does not need it.
+MIRROR="${GBB_ARMPL_MIRROR:-}"
+mirror_uri=""
+[ -n "$MIRROR" ] && mirror_uri="${MIRROR%/}/${BASE}_gcc.tar"
+
+fetch_from_mirror() {
+  [ -n "$mirror_uri" ] || return 1
+  case "$mirror_uri" in
+    s3://*)
+      command -v aws >/dev/null 2>&1 || { log "mirror is s3:// but no aws cli"; return 1; }
+      log "trying mirror $mirror_uri"
+      aws s3 cp ${GBB_AWS_REGION:+--region "$GBB_AWS_REGION"} --only-show-errors \
+        "$mirror_uri" "$TARBALL.part" >/dev/null 2>&1 || { log "mirror miss"; return 1; }
+      ;;
+    *)
+      [ -f "$mirror_uri" ] || { log "mirror miss ($mirror_uri)"; return 1; }
+      log "trying mirror $mirror_uri"
+      cp "$mirror_uri" "$TARBALL.part" || return 1
+      ;;
+  esac
+  mv "$TARBALL.part" "$TARBALL"
+  log "fetched from mirror"
+}
+
 # Re-download only if what is cached is not what is pinned. A cached file that fails
 # the digest is deleted rather than reused: the common cause is a truncated earlier
 # run, and the second most common is the permalink having moved under us, which is
 # the case this pin exists to catch.
+FETCHED_FROM_CDN=0
 if [ -f "$TARBALL" ] && [ "$(sha_of "$TARBALL")" = "$ARMPL_SHA256" ]; then
   log "using cached $TARBALL (digest matches)"
 else
   [ -f "$TARBALL" ] && { log "cached tarball fails the pinned digest; discarding it"; rm -f "$TARBALL"; }
-  command -v curl >/dev/null 2>&1 || die "curl is required to fetch ArmPL"
-  log "fetching $URL (~1.0 GB)"
-  curl -fSL --retry 3 --retry-delay 5 -o "$TARBALL.part" "$URL" || die "download failed"
-  mv "$TARBALL.part" "$TARBALL"
+  if ! fetch_from_mirror; then
+    command -v curl >/dev/null 2>&1 || die "curl is required to fetch ArmPL"
+    log "fetching $URL (~1.0 GB)"
+    curl -fSL --retry 3 --retry-delay 5 -o "$TARBALL.part" "$URL" || die "download failed"
+    mv "$TARBALL.part" "$TARBALL"
+    FETCHED_FROM_CDN=1
+  fi
 fi
 
 GOT="$(sha_of "$TARBALL")"
@@ -133,6 +176,27 @@ if [ "$GOT" != "$ARMPL_SHA256" ]; then
      digest against a second source and bump both fields at the top of this script."
 fi
 log "digest verified: $GOT"
+
+# Populate the mirror only from a CDN fetch that passed the digest, and only
+# upward: never overwrite a mirror entry with itself, and never write a file this
+# run did not verify. Best effort -- a pass must not fail because the mirror is
+# read-only, since the tarball it needs is already on disk.
+if [ "$FETCHED_FROM_CDN" -eq 1 ] && [ -n "$mirror_uri" ]; then
+  case "$mirror_uri" in
+    s3://*)
+      if aws s3 cp ${GBB_AWS_REGION:+--region "$GBB_AWS_REGION"} --only-show-errors \
+           "$TARBALL" "$mirror_uri" >/dev/null 2>&1; then
+        log "mirrored to $mirror_uri (subsequent passes will not touch the CDN)"
+      else
+        log "could not write the mirror at $mirror_uri -- continuing"
+      fi
+      ;;
+    *)
+      cp "$TARBALL" "$mirror_uri" 2>/dev/null \
+        && log "mirrored to $mirror_uri" || log "could not write $mirror_uri -- continuing"
+      ;;
+  esac
+fi
 
 WORK="$CACHE/extract"
 rm -rf "$WORK"; mkdir -p "$WORK"

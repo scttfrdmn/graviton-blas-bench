@@ -26,8 +26,9 @@ for f in LICENSE README.md CHANGELOG.md CLAUDE.md .gitignore Makefile \
          CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md \
          src/bench.c src/roofline.c src/coreprobe.c \
          scripts/build-libs.sh scripts/capture-env.sh scripts/run-matrix.sh \
+         scripts/workload.sh scripts/install-armpl.sh \
          analysis/decompose.py tests/run-matrix-stubs.sh \
-         tests/arch-selected-assert.sh \
+         tests/arch-selected-assert.sh tests/workload-preflight.sh \
          tools/synth.py gates/p1.sh \
          .github/workflows/ci.yml scripts/bootstrap-github.sh; do
   if [ -f "$f" ]; then ok "$f"; else bad "$f missing"; fi
@@ -114,6 +115,19 @@ else
   grep -A2 'FAIL' /tmp/gbb-p0-arch.log | head -20
 fi
 
+# ---- 5d. the payload refuses a pass it cannot make admissible ------------
+# workload.sh's preflight is what stops a P3 pass spending ~40 minutes of build
+# and hours of sweep before discovering it has no reference arm or no commit pin.
+# The suite asserts both the refusal AND that build-libs.sh was never reached --
+# a preflight that fired after the build would satisfy the exit code and none of
+# the point.
+if bash tests/workload-preflight.sh >/tmp/gbb-p0-workload.log 2>&1; then
+  ok "workload preflight suite ($(grep -o '^[0-9]* passed' /tmp/gbb-p0-workload.log | tail -1))"
+else
+  bad "workload preflight suite -- see /tmp/gbb-p0-workload.log"
+  grep -A2 'FAIL' /tmp/gbb-p0-workload.log | head -30
+fi
+
 # ---- 6. build flags are the ones we promised -----------------------------
 head_ "6. harness build flags (standing order 6)"
 if bash gates/check-build-flags.sh >/tmp/gbb-p0-flags.log 2>&1; then
@@ -128,12 +142,22 @@ fi
 # as the set of things CI runs. A gate or a suite that exists in the tree but is
 # not wired into CI rots silently, and the whole value of the P1 calibration is
 # that it fails at push time rather than on a dataset that cost instance-hours.
+# The list is DERIVED from the tree, not written out here. A hardcoded list rots in
+# exactly the way this section exists to catch: someone adds a suite, forgets to add
+# it to the list, and the check keeps passing while the suite is unwired. Deriving it
+# fails safe -- a new suite is required in CI by default, and the only way out is an
+# explicit exemption below, which is a decision rather than an omission.
 head_ "7. CI runs every gate and suite in the tree"
 CI=.github/workflows/ci.yml
-for want in gates/p0.sh gates/p1.sh gates/check-build-flags.sh \
-            tests/run-matrix-stubs.sh tests/arch-selected-assert.sh; do
+# Gates that require a collected dataset cannot run in CI by construction: there is
+# no results/ on a clean clone. Named individually so a NEW gate is not exempt.
+NOT_IN_CI="gates/p2.sh gates/p3.sh gates/p4.sh"
+while IFS= read -r want; do
+  case " $NOT_IN_CI " in
+    *" $want "*) printf '  \033[33mSKIP\033[0m  %s needs a dataset; not runnable in CI\n' "$want"; continue ;;
+  esac
   if grep -q "$want" "$CI"; then ok "CI runs $want"; else bad "$CI never runs $want"; fi
-done
+done < <(find gates tests -name '*.sh' -not -path './.git/*' | sed 's|^\./||' | sort)
 
 # ---- 8. no results or binaries committed ---------------------------------
 head_ "8. no artifacts committed"

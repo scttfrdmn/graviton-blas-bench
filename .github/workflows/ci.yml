@@ -116,6 +116,11 @@ jobs:
         # Standing order 8 rides on capture-env.sh refusing to proceed rather
         # than noting the problem in a file nobody reads.
         run: bash tests/arch-selected-assert.sh
+      - name: the payload refuses a pass before spending on it
+        # workload.sh aborts a P3 pass with no ArmPL or no commit pin *before*
+        # build-libs.sh, so the cost of a bad launch is minutes rather than hours.
+        # The suite asserts the ordering, not just the exit code.
+        run: bash tests/workload-preflight.sh
 
   python:
     name: python

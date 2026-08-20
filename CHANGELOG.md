@@ -314,6 +314,63 @@ change can be compared.
 
 ### Added — affects how a number is produced
 
+- **`scripts/workload.sh`: the campaign pass payload is in-tree, and it refuses a
+  pass before spending on it.** P2 pass 1 ran from a hand-written script in `/tmp`.
+  P3 is fifteen passes — five hosts × three — launched days apart, and CLAUDE.md
+  already names the failure: *"a hand-driven or newly-written procedure drifts
+  between launches… a drift between passes is indistinguishable from the effect the
+  passes exist to test."* This is the payload spawn runs, not a launcher: it creates,
+  tags, waits on and terminates nothing, and the prohibition on `scripts/launch.sh`
+  is untouched — the lifecycle stays with truffle/spawn, which is already exercised.
+
+  Three preflight assertions, all of them **before** `build-libs.sh`, which is the
+  whole point:
+
+  - **ArmPL is acquired, not discovered.** `scripts/install-armpl.sh` existed and
+    nothing called it. The payload now runs it first, gated on the operator having
+    set `GBB_ARMPL_ACCEPT_EULA=1` — the script still never accepts the licence, and
+    neither does this one. `GBB_PHASE=p3` makes a missing ArmPL **fatal**, which is
+    CLAUDE.md's rule (*"ArmPL absent is admissible for P2 and not for P3"*) turned
+    into a refusal that costs ~2 minutes instead of a census gap that costs a
+    six-hour sweep. `GBB_PHASE=p2` records it as an explained absence and proceeds,
+    which is exactly what pass 1 did.
+  - **`GBB_EXPECT_HEAD` pins the harness commit.** Three passes off a moving `main`
+    are three different harnesses and nothing in the dataset would say so. Unset is
+    allowed for P2 and fatal for P3: *"it was main at the time"* is not a pin.
+  - **Log paths are namespaced per host and per pass.** The P2 payload shipped to
+    `gbb/logs/run.log` flat. Correct for one host; for fifteen it overwrites
+    fourteen times, and the run log is the only account of what a pass did.
+
+  `tests/workload-preflight.sh` (23 assertions, wired into CI and `gates/p0.sh`
+  §5d) asserts both halves of each refusal: non-zero exit **and** that
+  `build-libs.sh` was never reached. The second half is load-bearing and
+  mutation-validated — moving the ArmPL gate to after the sweep leaves every
+  exit-code assertion passing and fails exactly the three "did not build/sweep"
+  ones. `GBB_COMPLETE_MARKER` exists only so the suite can assert that completion
+  is signalled without signalling it; touching the real `/tmp/SPAWN_COMPLETE` would
+  terminate whatever instance the test ran on.
+
+- **`GBB_ARMPL_MIRROR` takes the vendor CDN off P3's critical path.** An s3:// prefix
+  or a local directory, checked before the CDN and populated from the first fetch that
+  passes the pinned digest — and given no more trust than the CDN, since the digest
+  check is the same one either way. Fifteen 1.0 GB pulls from a registration-gated
+  vendor permalink is fifteen chances for the pin to do its job by *aborting a
+  spend-authorised pass*; mirroring once means all fifteen read identical bytes.
+
+- **`scripts/diag-numa.sh`: is the t≥128 cliff the memory policy or the hardware?**
+  `pin_for()` derives the memory policy from the thread count, so on a 2×96 host it
+  switches `--membind=<node>` → `--interleave=0,1` at exactly t=128 — and two roofline
+  numbers fall off a cliff at precisely that rung (triad 368.5 → 133.9 GB/s, allcore
+  `scaling_efficiency` 0.942 → 0.531). 13 roofline cells × 2 reps and 3 full-matrix
+  bench cells vary the policy independently of the thread count, including the two
+  decisive controls: t=96 on one node under `--interleave=0,1` (policy varied, hardware
+  fixed) and 96 threads spanning both sockets under the same policy (span varied,
+  thread count fixed). Quarantined by construction, three ways: `GBB_ROLE=diagnostic`,
+  which `decompose.py`'s `load()` drops before the shape dispatch and reports as
+  `role_excluded`; a `diag-numa-*` run_id namespace; and a `gbb/diagnostics/` S3 prefix.
+  It deliberately does not go through `run-matrix.sh`, which would correctly derive
+  `role=campaign` on a campaign host.
+
 - **Every bench record now carries `case_seconds`, the wall clock that case cost.**
   The spend policy's remaining unknown is the expanded matrix's wall-clock
   multiplier, `MIN_SECONDS` being per-regime moved it again, and the README's
@@ -557,6 +614,17 @@ change can be compared.
   the `NEOVERSEN2:neoversev2` alias entry fails three of scenario O's assertions.
 
 ### Fixed — gate
+
+- **`gates/p0.sh` §7 checked a hardcoded list against the tree, which rots in exactly
+  the way the section exists to catch.** Its own comment says a suite *"that exists in
+  the tree but is not wired into CI rots silently"* — and the enumeration of what to
+  check for was itself hand-maintained, so adding a suite and forgetting to add it to
+  the list left the check green while the suite was unwired. The list is now derived
+  from `find gates tests -name '*.sh'`, which fails safe: a new suite is required in CI
+  by default. `NOT_IN_CI` names the gates that cannot run on a clean clone because they
+  need a collected dataset (`p2`/`p3`/`p4`), individually rather than by pattern, so a
+  future gate is not exempt by accident. Found while wiring the first new suite since
+  that list was written.
 
 - **`gates/p1.sh` could go green on code that was not on disk.** Section 2 loads
   `tools/synth.py` and `analysis/decompose.py` with
