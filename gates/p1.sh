@@ -34,6 +34,18 @@ WORK="${GBB_P1_WORK:-${TMPDIR:-/tmp}/gbb-p1.$$}"
 KEEP="${GBB_P1_KEEP:-0}"
 PY="${PYTHON:-python3}"
 
+# Section 2 loads tools/synth.py and analysis/decompose.py with
+# importlib.util.spec_from_file_location, which writes __pycache__ and validates it
+# on (mtime, size). That is a stale-artefact hazard aimed straight at this gate: a
+# checkout, `git stash pop`, or any restore that lands a same-size file whose mtime
+# the cache still considers current makes every assertion in section 2 read the
+# BYTECODE rather than the file, and the gate goes green on code that is not on disk.
+# Found in exactly that way -- a restored src/bench.c kept reporting the mutated
+# band. A green gate that measured the wrong artefact is the worst failure available
+# here, so the cache is disabled and any existing one is removed rather than trusted.
+export PYTHONDONTWRITEBYTECODE=1
+rm -rf tools/__pycache__ analysis/__pycache__
+
 PASS=0
 FAIL=0
 SCEN_PASS=0
@@ -147,6 +159,7 @@ ladder_check "large sizes"  "SIZES_LARGE"  "SIZES_LARGE"
 ladder_check "level-1 lengths" "lens" "LEVEL1_LENS"
 ladder_check "lda pads (small+medium)" "LDA_PADS_EXTRA" "LDA_PADS_EXTRA"
 ladder_check "lda pads (large)" "LDA_PADS_EXTRA_LARGE" "LDA_PADS_EXTRA_LARGE"
+ladder_check "overlap band sizes" "OVERLAP_SIZES" "OVERLAP_SIZES"
 strings_check "padded routines" "PADDED_ROUTINES" "PADDED_ROUTINES"
 
 # pad 0 must not appear in either extra-pad table. The base sweep already emits
@@ -264,6 +277,118 @@ EOF
   ok "MIN_SECONDS floors agree with src/bench.c: $floors"
 else
   bad "the timing-floor copy drifted — $floors"
+fi
+
+# The overlap band's numbers agreeing (ladder_check above) is not the same as the
+# band still DOING anything. Three ways it can be silently neutered, none of which
+# a value comparison catches:
+#
+#   - It stops straddling. If every band size fell in one regime, both members of
+#     each pair would be measured at the same floor, every delta would be zero, and
+#     AGREES would be reported having compared nothing with nothing. That is the
+#     worst failure available here: the band's whole output is a confirmation, and a
+#     vacuous confirmation is indistinguishable from a real one downstream.
+#   - It stops alternating. bench.c's order alternation is the ONLY thing that
+#     separates a floor effect from a first-vs-second drift; without it
+#     ORDER-CONFOUNDED is unreachable and a drift reads as a floor bias.
+#   - The probe tag drifts between the three files, and a probe record that
+#     decompose.py does not recognise as one lands in the cross as a second
+#     measurement of an existing condition.
+if band=$("$PY" - <<'EOF'
+import importlib.util, pathlib, re, sys
+
+src = pathlib.Path("src/bench.c").read_text()
+spec = importlib.util.spec_from_file_location("dc", pathlib.Path("analysis/decompose.py"))
+dc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dc)
+sspec = importlib.util.spec_from_file_location("synth", pathlib.Path("tools/synth.py"))
+synth = importlib.util.module_from_spec(sspec)
+sspec.loader.exec_module(synth)
+
+bad = []
+band = tuple(synth.OVERLAP_SIZES)
+in_small = [m for m in band if m in synth.SIZES_SMALL]
+in_medium = [m for m in band if m in synth.SIZES_MEDIUM]
+stray = [m for m in band if m not in synth.SIZES_SMALL and m not in synth.SIZES_MEDIUM]
+if not in_small or not in_medium:
+    bad.append(
+        f"the band does not straddle the floor step: {len(in_small)} sizes below, "
+        f"{len(in_medium)} above. Both members of every pair would carry the same floor"
+    )
+if stray:
+    bad.append(f"band sizes {stray} are on no ladder, so the matrix never measures them")
+# Said the other way round, off the mapping rather than off the ladders: the band
+# must contain at least one size at each floor.
+if len({synth.min_seconds_for(m) for m in band}) != 2:
+    bad.append(f"every band size maps to one floor: {sorted({synth.min_seconds_for(m) for m in band})}")
+
+# The alternation, in both producers. Read out of the function bodies rather than
+# the whole file so an unrelated `i % 2` elsewhere cannot satisfy it.
+cbody = re.search(r"static void run_floor_overlap\(void\)\s*\{(.*?)\n\}", src, re.S)
+if not cbody:
+    bad.append("run_floor_overlap() not found in src/bench.c")
+elif "i % 2 == 0" not in cbody.group(1):
+    bad.append("src/bench.c's run_floor_overlap() no longer alternates which floor runs first")
+pysrc = pathlib.Path("tools/synth.py").read_text()
+pbody = re.search(r"\ndef floor_probe_records\(.*?\n(?=def )", pysrc, re.S)
+if not pbody:
+    bad.append("floor_probe_records() not found in tools/synth.py")
+elif "i % 2 == 0" not in pbody.group(0):
+    bad.append("tools/synth.py's floor_probe_records() no longer mirrors bench.c's alternation")
+
+# The tag, across all three files. bench.c is the producer, so its literal wins.
+# The format string is C source, so the quotes around the JSON key are escaped in
+# the file text: the bytes on disk are \"probe\":\"%s\". Match those bytes.
+if r'\"probe\":\"%s\"' not in src:
+    bad.append("src/bench.c's emit() no longer prints a probe field")
+# And that the argument is in the position the format string asks for. printf takes
+# the two lists positionally, so a key added to one and not the other -- or added to
+# both in different places -- shifts every field after it and silently relabels the
+# record. That is standing order 10's failure mode reached through a typo.
+stmt = re.search(r'printf\("\{\\"run_id.*?\);', src, re.S)
+if not stmt:
+    bad.append("src/bench.c's emit() no longer has the record printf")
+else:
+    fmt, _, argv = stmt.group(0).partition(r'\n",')
+    for a, b, c, where in ((r'\"role\"', r'\"probe\"', r'\"threads\"', "format string"),
+                           ("g_role", "g_probe", "g_threads", "argument list")):
+        text = fmt if where == "format string" else argv
+        if not (0 <= text.find(a) < text.find(b) < text.find(c)):
+            bad.append(f"src/bench.c's emit() {where} no longer has probe between role and threads")
+if 'g_probe = "floor-overlap"' not in src:
+    bad.append('src/bench.c no longer tags the band records "floor-overlap"')
+if dc.FLOOR_PROBE != "floor-overlap":
+    bad.append(f"decompose.py FLOOR_PROBE={dc.FLOOR_PROBE!r}, bench.c writes 'floor-overlap'")
+if 'static const char *g_probe = "none"' not in src:
+    bad.append("src/bench.c's g_probe no longer defaults to \"none\"")
+if dc.NO_PROBE != "none" or dc.canon_probe(None) != "none":
+    bad.append(f"decompose.py NO_PROBE={dc.NO_PROBE!r} / canon_probe(None)={dc.canon_probe(None)!r}")
+
+# And that the split actually splits. A one-line behavioural check, because every
+# assertion above is about spelling.
+m, p = dc.split_floor_probe(
+    [{"routine": "dgemm"}, {"routine": "dgemm", "probe": "none"}, {"routine": "dgemm", "probe": "floor-overlap"}]
+)
+if len(m) != 2 or len(p) != 1:
+    bad.append(f"split_floor_probe put {len(m)} in the matrix and {len(p)} in the probe, want 2 and 1")
+# An unknown probe name must NOT reach the matrix. Fail-closed: an unrecognised
+# probe is not a matrix record, and admitting it would put a second measurement of
+# an existing condition into the cross.
+m2, p2 = dc.split_floor_probe([{"routine": "dgemm", "probe": "some-future-probe"}])
+if m2 or len(p2) != 1:
+    bad.append("split_floor_probe admitted an unknown probe tag into the matrix")
+
+print(
+    "; ".join(bad)
+    if bad
+    else f"band {band} straddles ({len(in_small)} below / {len(in_medium)} above), alternates, tags agree"
+)
+sys.exit(1 if bad else 0)
+EOF
+); then
+  ok "the overlap band still measures something: $band"
+else
+  bad "the overlap band is neutered — $band"
 fi
 
 # ---- 3. the majority comparison is exact ----------------------------------
@@ -429,6 +554,7 @@ declare -a BITCASES=(
   "missing-arm-unexplained:4:unexplained coverage hole"
   "no-provenance:8:provenance incomplete"
   "replicate-diverges:16:headline does not reproduce"
+  "floor-band-disagrees:32:timing-floor band unconfirmed"
 )
 for case in "${BITCASES[@]}"; do
   scen="${case%%:*}"; rest="${case#*:}"; bit="${rest%%:*}"; what="${rest#*:}"
@@ -450,6 +576,17 @@ if [ -f "$WORK/null/report.json" ]; then
     ok "the clean scenario 'null' returns exit 0 (the bits are not always-on)"
   else
     bad "the clean scenario 'null' returned exit $got, not 0"
+  fi
+  # Specifically that bit 32 is not set by a dataset with NO probe records. ABSENT
+  # and unconfirmed are different claims: every result set produced before the probe
+  # existed is ABSENT, and decompose.py must still be able to read its own history.
+  # Requiring the probe to be PRESENT is gates/p2.sh's job, not this one's.
+  st=$("$PY" -c "import json,sys;print(json.load(open(sys.argv[1]))['floor_overlap']['status'])" \
+       "$WORK/null/report.json")
+  if [ "$st" = "ABSENT" ] && [ "$(bit_of "$got" 32)" = "0" ]; then
+    ok "a dataset with no probe records is ABSENT and does NOT set bit 32"
+  else
+    bad "no-probe dataset reported '$st' with exit $got — ABSENT must not set bit 32"
   fi
 fi
 

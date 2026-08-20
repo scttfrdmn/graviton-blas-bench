@@ -79,6 +79,37 @@
  * n=8), so a per-regime floor introduces no non-uniformity that was not already
  * there. What must stay uniform is the COMPARISON, and it does: the same case on
  * two arms is batched to the same ~1 ms sample, so both arms get the same count.
+ *
+ * WHAT THE FOUR CHECKS DO NOT COVER, and why run_floor_overlap() exists.
+ *
+ * All four are arguments that a 0.05 s window is long enough to measure with.
+ * None of them addresses WHERE the change of window sits. The floor steps at
+ * n=256, and n=256 is also the size at which OpenBLAS's GEMM_SMALL_* path is
+ * hypothesised to hand over to the blocked kernel -- which is to say the
+ * measurement's noise characteristics change at the exact size the campaign is
+ * trying to locate an effect at. A step in the regime profile at n=256 would then
+ * be ambiguous between "the fast path ends here" and "the floor changed here",
+ * and no amount of reasoning about window length distinguishes those two after
+ * the fact, because they predict the same picture.
+ *
+ * There were two ways out. Move the transition to n=512, clear of the expected
+ * crossover -- which buys an assumption, and gives back most of the small-end
+ * economy the per-regime floor was for. Or measure the band at both floors and
+ * find out, which buys evidence. This file does the second: OVERLAP_SIZES spans
+ * the boundary (192, 224, 256 from the SMALL ladder and 320, 384 from MEDIUM) and
+ * every arm measures each of them TWICE, once at each floor. If the pairs agree,
+ * the step at n=256 is the hardware and the record says so; if they disagree, the
+ * per-regime floor is an instrument artefact sitting on the answer and must be
+ * moved before anything is concluded from a regime profile.
+ *
+ * It costs ~1.75 s of BLAS work per arm (5 sizes x (0.05 + 0.30)), which is why
+ * it runs on every arm rather than once on one of them. Per-arm is also the
+ * stronger claim: the number of calls a 0.05 s window buys depends on how fast
+ * the arm is and on the thread count, so "the floors agree on the arm we tried"
+ * and "the floors agree on every arm" are different statements, and the cheap one
+ * to make is the strong one. No environment variable turns it off, deliberately:
+ * a knob that changes what is measured would let two arms differ by something
+ * other than the BLAS under test (standing order 6).
  */
 #define MIN_SECONDS          0.30      /* of real BLAS work per measurement  */
 #define MIN_SECONDS_SMALL    0.05      /* ... in the SMALL regime; see above  */
@@ -346,6 +377,29 @@ static const char *g_blas_sha, *g_coretype, *g_thread_backend, *g_pin_policy,
                   *g_role;
 static int g_threads;
 
+/* Which probe, if any, produced this record. "none" for every record in the
+ * campaign matrix; "floor-overlap" for the deliberate double-measurement in
+ * run_floor_overlap().
+ *
+ * A separate field rather than a value of g_role, and rather than a note. The
+ * role says whose data this is (campaign vs a castor/pollux instrument check) and
+ * the analysis excludes anything that is not "campaign" -- but the overlap band IS
+ * campaign data, produced on campaign hardware by the arm under test, and
+ * excluding it would throw away the evidence it exists to provide. The note field
+ * is the wrong home too: emit() overwrites it when the timer is outrun, so a
+ * record's probe identity would disappear in exactly the failure it is needed to
+ * diagnose.
+ *
+ * What it is FOR is partitioning. A probe record is the same (routine, m, n, k,
+ * lda_pad, incx, transa, transb) as a matrix record and differs only in
+ * min_seconds, so pooling the two would put a second measurement of an existing
+ * condition into the cross, where min-within-run would keep whichever of the pair
+ * looked worse. decompose.py's split_floor_probe() partitions on this field before
+ * build_cells() sees anything; the timing floor being in the comparison key is the
+ * fail-safe underneath, not the mechanism. Default "none" so records written
+ * before this field existed read as matrix records, which they are. */
+static const char *g_probe = "none";
+
 /* Looked up at runtime rather than linked, for two reasons.
  *
  * One: bench.c is compiled with identical flags for every arm -- standing order 6
@@ -427,7 +481,8 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"library\":\"%s\",\"target\":\"%s\",\"build\":\"%s\","
            "\"blas_sha\":\"%s\",\"coretype\":\"%s\","
            "\"thread_backend\":\"%s\",\"pin_policy\":\"%s\","
-           "\"arch_selected\":\"%s\",\"role\":\"%s\",\"threads\":%d,"
+           "\"arch_selected\":\"%s\",\"role\":\"%s\",\"probe\":\"%s\","
+           "\"threads\":%d,"
            "\"routine\":\"%s\",\"m\":%d,\"n\":%d,\"k\":%d,\"lda_pad\":%d,"
            "\"incx\":%d,"
            "\"reps\":%d,\"batch\":%ld,\"calls\":%ld,"
@@ -437,7 +492,7 @@ static void emit(const char *routine, int m, int n, int k, int lda_pad,
            "\"gflops\":%.6f,\"gflops_p50\":%.6f,\"verified\":%s,\"note\":\"%s\"}\n",
            g_run_id, g_host, g_instance, g_library, g_target, g_build,
            g_blas_sha, g_coretype, g_thread_backend, g_pin_policy,
-           g_arch_selected, g_role, g_threads,
+           g_arch_selected, g_role, g_probe, g_threads,
            routine, m, n, k, lda_pad,
            g_incx,
            reps, g_batch, (long)reps * g_batch,
@@ -685,6 +740,73 @@ static void sweep(const char *routine, const int *sizes, int nsizes, int lda_pad
     }
 }
 
+/* The timing-floor overlap band. Spans the MIN_SECONDS transition at n=256: 192,
+   224 and 256 are the top of SIZES_SMALL and 320, 384 the bottom of SIZES_MEDIUM,
+   so the band is three sizes below the step and two above it and every size in it
+   is one the matrix already measures. See the header comment for why it exists. */
+static const int OVERLAP_SIZES[] = { 192, 224, 256, 320, 384 };
+
+/* Measure each band size at both floors, back to back on one set of operands.
+ *
+ * Three things are controlled here that calling run_dgemm() twice would not
+ * control, and each of them could produce a difference that looks like a floor
+ * effect and is not:
+ *
+ *   - ONE ALLOCATION for both measurements. run_dgemm() allocates and frees per
+ *     call, so two calls get two sets of addresses and possibly different page
+ *     colouring and TLB behaviour. The pair has to differ in the floor and in
+ *     nothing else, and the operands are the easiest thing to hold fixed.
+ *   - C IS RESTORED FROM C0 before each timed loop, exactly as run_dgemm() does
+ *     it. beta is 1.0, so C accumulates across the thousands of calls a timed
+ *     loop makes; without the restore the second measurement would start from
+ *     whatever magnitudes the first one left, and if those reach inf the second
+ *     measurement is timing a different arithmetic problem than the first.
+ *   - THE ORDER ALTERNATES with the size index. If the short floor always ran
+ *     first it would always run against the colder cache, and a systematic
+ *     first-vs-second drift would be indistinguishable from a systematic
+ *     short-vs-long floor difference -- which is the one distinction this probe
+ *     exists to make. Alternating separates them, and the note field records
+ *     which position each record held so the analysis can test the two
+ *     explanations against each other rather than assume one.
+ *
+ * pad=0 and NN only. The question is whether a shorter averaging window changes
+ * the answer, and that is not a question about alignment or about which packing
+ * kernel runs; crossing it with the pad axis would multiply the cost by five to
+ * re-ask the same thing. */
+static void run_floor_overlap(void) {
+    g_probe = "floor-overlap";
+    for (unsigned i = 0; i < sizeof OVERLAP_SIZES/sizeof(int); i++) {
+        int m = OVERLAP_SIZES[i], n = m, k = m;
+        int lda = m, ldb = k, ldc = m;
+        double alpha = 1.0, beta = 1.0;
+        double *A  = xalloc((size_t)lda*k*sizeof(double));
+        double *B  = xalloc((size_t)ldb*n*sizeof(double));
+        double *C  = xalloc((size_t)ldc*n*sizeof(double));
+        double *C0 = xalloc((size_t)ldc*n*sizeof(double));
+        fill_d(A, (size_t)lda*k); fill_d(B, (size_t)ldb*n); fill_d(C, (size_t)ldc*n);
+        memcpy(C0, C, (size_t)ldc*n*sizeof(double));
+
+        dgemm_("N","N",&m,&n,&k,&alpha,A,&lda,B,&ldb,&beta,C,&ldc);
+        int ok = verify_gemm_corner(A,lda,B,ldb,C,ldc,m,n,k,alpha,beta,C0);
+
+        double first  = (i % 2 == 0) ? MIN_SECONDS_SMALL : MIN_SECONDS;
+        double second = (i % 2 == 0) ? MIN_SECONDS : MIN_SECONDS_SMALL;
+        double floors[2] = { first, second };
+        for (int f = 0; f < 2; f++) {
+            memcpy(C, C0, (size_t)ldc*n*sizeof(double));
+            g_min_seconds = floors[f];
+            double *samples = NULL; int nreps = 0;
+            TIMED_LOOP(dgemm_("N","N",&m,&n,&k,&alpha,A,&lda,B,&ldb,&beta,C,&ldc));
+            emit("dgemm", m,n,k, 0, samples, nreps, case_flops("dgemm",m,n,k), ok,
+                 f == 0 ? "floor_probe_first" : "floor_probe_second");
+            free(samples);
+        }
+        free(A); free(B); free(C); free(C0);
+    }
+    g_probe = "none";
+    g_min_seconds = MIN_SECONDS;
+}
+
 static const char *env_or(const char *k, const char *dflt) {
     const char *v = getenv(k);
     return (v && *v) ? v : dflt;
@@ -785,5 +907,13 @@ int main(int argc, char **argv) {
             if (WANT("ddot"))  { run_level1(&c,"ddot", 1); run_level1(&c,"ddot", 4); }
         }
     }
+
+    /* Last, so that adding it left the order of every matrix record unchanged --
+       the probe is validating the instrument the matrix was measured with, and
+       inserting it earlier would have changed the cache and allocator history the
+       matrix sweeps run against. Gated on dgemm because it measures dgemm; an arm
+       invoked as `gbb-bench dtrsm` is a debugging invocation, not a campaign arm,
+       and giving it a dgemm probe would be a record it did not ask for. */
+    if (WANT("dgemm")) run_floor_overlap();
     return 0;
 }

@@ -455,6 +455,32 @@ support opposite conclusions.
   generic `ARMV8` arm at 1 thread will be the single most expensive arm in the
   campaign. Instrument the *slowest* arm of the first P2 iteration, not a
   representative one, or the extrapolation lands low.
+- **The per-regime floor put a change of instrument at n=256, which is where the
+  effect is expected to be.** `GEMM_SMALL_*`'s crossover is hypothesised to sit at
+  about the same size as the 0.05/0.30 transition, so a step in the section 4
+  profile at n=256 is ambiguous between "the fast path ends here" and "the
+  measurement window changed here" — and the ambiguity lands on the one section
+  whose whole job is locating the effect in the size range. Moving the transition
+  to n=512 would separate them by assumption; measuring an overlap band separates
+  them by evidence, and costs about 1.75 s per arm. `run_floor_overlap()` therefore
+  re-measures `dgemm` at n ∈ {192, 224, 256, 320, 384} at *both* floors, tagging
+  those records `probe: floor-overlap` so `split_floor_probe()` partitions them out
+  before the cross is built — a probe record is the same condition as a matrix
+  record bar the floor, and left in the cross min-within-run would silently keep
+  whichever read faster. Section 9 then pairs them and reports `AGREES`,
+  `AGREES-WITH-BIAS`, `DISAGREES`, `ORDER-CONFOUNDED` or `INCOMPLETE`; anything but
+  the first two sets **exit bit 32** and bars section 4 from being read across
+  n=256. Three details are load-bearing. The band must *straddle* the transition,
+  or every pair compares a floor with itself and `AGREES` confirms nothing.
+  `bench.c` **alternates which floor runs first** by size index, because with a
+  fixed order "the first one reads high" and "the short floor reads high" are the
+  same dataset — that alternation is the only thing that makes `ORDER-CONFOUNDED`
+  reachable rather than a drift reported as a floor bias. And a *signed* bias above
+  `--min-effect` is `DISAGREES` even when every pair sits inside its own parity
+  band, because `band_for()` widens on a dispersed cell and would otherwise pass a
+  consistent bias large enough to move a verdict. `ABSENT` deliberately does not
+  set bit 32: every result set produced before the probe existed is `ABSENT`, and
+  requiring the probe to be *present* is `gates/p2.sh`'s job.
 - **A penalty is a property of the stride, so the pad axis has to be attributed
   per pad.** With one extra pad value, "tight versus padded" was one comparison
   and pooling was unobservable. With `LDA_PADS_EXTRA = {1, 4, 8, 64}` a section 3
@@ -500,10 +526,12 @@ support opposite conclusions.
 
 ## What the output supports
 
-`decompose.py` prints nine numbered sections and then a `DECISION` block. The
+`decompose.py` prints ten numbered sections and then a `DECISION` block. The
 sections are: 0 hosts and admissibility, 1 deficit by routine, 2 the target
 cross, 3 the leading-dimension penalty, 4 the regime profile, 5 anomalies,
-6 thread scaling, 7 the coverage census, 8 replicate agreement.
+6 thread scaling, 7 the coverage census, 8 replicate agreement, 9 the
+timing-floor overlap band. Section 9 gates section 4: read it first, because it
+is what says whether a step at n=256 is the effect or the instrument.
 
 Section 8 exists because the docs call for repeated `hpc7g` runs, and the
 tempting thing to do with a second box is pool it with the first. Pooling turns

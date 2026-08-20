@@ -389,6 +389,14 @@ class Scenario:
     # does emit the fields, add a ladder_check for this tuple in gates/p1.sh
     # section 2 like the size ladders, and drop this paragraph.
     transposes: tuple = ()
+    # The timing-floor overlap band, off by default. Off rather than on because
+    # turning it on for every scenario would add ten records per (arm, thread point)
+    # to fixtures whose claims are about the cross, and a fixture whose record count
+    # moved for a reason unrelated to what it asserts is harder to trust, not easier.
+    # Leaving it off also means the existing scenarios cover the ABSENT path, which
+    # is a real state: every dataset written before bench.c grew the probe is in it.
+    # See floor_probe_records() for the modes.
+    floor_probe: dict | None = None
     expect: list = field(default_factory=list)
     blas_sha: str = "a" * 40
     blas_sha_overrides: dict = field(default_factory=dict)  # (library,target) -> sha
@@ -552,6 +560,14 @@ def bench_records(sc: Scenario, host: HostSpec):
                             "pin_policy": "taskset -c 0" if threads == 1 else f"numactl -C 0-{threads - 1}",
                             "arch_selected": host.dynamic_selection,
                             "role": "campaign",
+                            # Matrix records, so "none". Emitted rather than left
+                            # absent even though decompose.py defaults absence to
+                            # the same value: bench.c writes the field on every
+                            # record, and a fixture that relies on the default is
+                            # not testing the producer's output, it is testing the
+                            # consumer's fallback. The floor-overlap records are
+                            # written by floor_probe_records() below.
+                            "probe": "none",
                             "threads": threads,
                             "routine": routine,
                             "m": m,
@@ -579,6 +595,118 @@ def bench_records(sc: Scenario, host: HostSpec):
                             "gflops_p50": round(gf / (1.0 + arm.spread), 6) if gf else 0.0,
                             "verified": verified,
                             "note": note,
+                        }
+                    )
+    return recs
+
+
+# src/bench.c's OVERLAP_SIZES, hand-copied like the size ladders and asserted
+# against the producer in gates/p1.sh section 2 for the same reason: there is
+# nothing to import from a C file, and a copy that drifts turns the fixture into a
+# rigorous test of the wrong band.
+OVERLAP_SIZES = (192, 224, 256, 320, 384)
+
+
+def floor_probe_records(sc: Scenario, host: HostSpec):
+    """src/bench.c run_floor_overlap(), field for field.
+
+    Four modes, one per way the band can come out, because the analysis reports
+    four statuses and a fixture that only exercises the happy one asserts nothing
+    about the other three:
+
+      agree     independent jitter on each floor. Signs scatter and every delta is
+                well inside the band -> AGREES.
+      bias      the short floor reads consistently low by `amount`, below
+                --min-effect -> AGREES-WITH-BIAS. This is the mode worth having:
+                the band passes AND the bias is reported, so a reader can discount
+                a section-4 step by it.
+      disagree  the short floor reads low by more than the band -> DISAGREES.
+      order     whichever floor ran FIRST reads high, by less than the band. Because
+                bench.c alternates the order, the floor-signed deltas then alternate
+                while the order-signed ones do not, which is the whole point of
+                alternating -> ORDER-CONFOUNDED.
+      half      only one floor is emitted -> INCOMPLETE.
+
+    `order` is the mode that would be unreachable if bench.c ran the short floor
+    first every time: with a fixed order, "first reads high" and "short reads high"
+    are the same dataset and no analysis could separate them. The fixture and the
+    producer have to agree about the alternation, so the parity of the index is
+    computed the same way here as there."""
+    spec = sc.floor_probe
+    if not spec:
+        return []
+    mode = spec.get("mode", "agree")
+    amount = spec.get("amount", 0.0)
+    recs = []
+    for arm in sc.arms:
+        if not arm.measured or host.failure_reason(arm) is not None or host.lost(arm):
+            continue
+        for threads in host.threads:
+            for i, m in enumerate(OVERLAP_SIZES):
+                base = base_gflops("dgemm", m, threads) * arm.multiplier(
+                    "dgemm", m, 1, 0, None
+                ) * host.host_scale
+                # Same parity rule as bench.c: even index -> short floor first.
+                short_first = i % 2 == 0
+                floors = (
+                    (MIN_SECONDS_SMALL, MIN_SECONDS) if short_first else (MIN_SECONDS, MIN_SECONDS_SMALL)
+                )
+                for pos, floor in enumerate(floors):
+                    is_short = floor == MIN_SECONDS_SMALL
+                    if mode == "half" and not is_short:
+                        continue
+                    mult = 1.0
+                    if mode in ("bias", "disagree") and is_short:
+                        mult = 1.0 - amount
+                    elif mode == "order" and pos == 0:
+                        mult = 1.0 + amount
+                    # Keyed on the floor as well, so `agree` gets two independent
+                    # draws and the sign of the difference scatters. Without the
+                    # floor in the key both records would draw the same jitter,
+                    # every delta would be exactly 0, and the sign test would be
+                    # vacuous rather than passed.
+                    gf = base * mult * jitter(host.run_id, arm.key, threads, m, floor, amp=arm.noise)
+                    flops = case_flops("dgemm", m, m, m)
+                    t_min = flops / (gf * 1e9)
+                    recs.append(
+                        {
+                            "run_id": host.run_id,
+                            "host": f"ip-10-0-0-{abs(hash(host.instance_id)) % 200}",
+                            "instance": host.instance_type,
+                            "library": arm.library,
+                            "target": arm.target,
+                            "build": "synthetic",
+                            "blas_sha": arm_sha(sc, host, arm),
+                            "coretype": arm.coretype,
+                            "thread_backend": arm.thread_backend,
+                            "pin_policy": "taskset -c 0"
+                            if threads == 1
+                            else f"numactl -C 0-{threads - 1}",
+                            "arch_selected": host.dynamic_selection,
+                            "role": "campaign",
+                            "probe": "floor-overlap",
+                            "threads": threads,
+                            "routine": "dgemm",
+                            "m": m,
+                            "n": m,
+                            "k": m,
+                            "lda_pad": 0,
+                            "incx": 1,
+                            "reps": 15,
+                            "batch": 1,
+                            "calls": 15,
+                            "min_seconds": floor,
+                            "timer_overhead_ns": 21.0,
+                            "timer_res_ns": 1.0,
+                            "t_min": t_min,
+                            "t_p50": t_min * (1.0 + arm.spread),
+                            "t_p90": t_min * (1.0 + 1.6 * arm.spread),
+                            "gflops": round(gf, 6),
+                            "gflops_p50": round(gf / (1.0 + arm.spread), 6),
+                            "verified": True,
+                            # The producer puts the pair position here, and the
+                            # analysis reads it to tell a floor effect from a drift.
+                            "note": "floor_probe_first" if pos == 0 else "floor_probe_second",
                         }
                     )
     return recs
@@ -762,11 +890,18 @@ def arm_effective(host: HostSpec, arm: Arm):
     return host.coretype_aliases.get(arm.coretype, arm.coretype).lower()
 
 
-def census_records(sc: Scenario, host: HostSpec, bench):
+def census_records(sc: Scenario, host: HostSpec, bench, probe=()):
     """scripts/run-matrix.sh census(). Note the coretype spelling: run_arm is
     called with an empty $ct for the unforced arm, so the real census writes ""
     where bench.c writes "unforced". Reproduced deliberately -- that mismatch is
-    one of the two bugs this file found."""
+    one of the two bugs this file found.
+
+    `probe` is folded into the `records` count and nowhere else. The runner takes
+    that number from `wc -l` on the whole output file, so on real data it includes
+    the floor-overlap records; counting only the matrix here would make the fixture
+    disagree with the producer by exactly the probe's size. Nothing in the analysis
+    reads the field -- which is why the drift would have gone unnoticed, and why it
+    is worth removing rather than tolerating."""
     recs = []
     for threads in host.threads:
         recs.append(
@@ -832,7 +967,7 @@ def census_records(sc: Scenario, host: HostSpec, bench):
         for threads in host.threads:
             n = sum(
                 1
-                for r in bench
+                for r in list(bench) + list(probe)
                 if r["threads"] == threads and (r["library"], r["target"], r["coretype"]) == arm.key
             )
             recs.append(
@@ -928,7 +1063,14 @@ def write_scenario(sc: Scenario, root: pathlib.Path):
     res.mkdir(parents=True, exist_ok=True)
     for host in sc.hosts:
         bench = bench_records(sc, host)
-        _w(res / f"bench-{host.run_id}.ndjson", bench)
+        # One stream, as bench.c writes it, but the probe records are kept out of
+        # everything derived FROM the matrix. census_records() classifies expected
+        # (arm, cell) coverage and roofline_records() takes the measured peak: a
+        # probe record is neither an expected cell nor a candidate for peak, and
+        # letting it into either would make the fixture assert that the analysis
+        # tolerates a leak it should never see.
+        probe = floor_probe_records(sc, host)
+        _w(res / f"bench-{host.run_id}.ndjson", bench + probe)
         if host.foreign_role is not None:
             # An instrument-check host's records sitting in a campaign directory,
             # which is what one `aws s3 sync` of a bucket holding both prefixes
@@ -947,7 +1089,7 @@ def write_scenario(sc: Scenario, root: pathlib.Path):
         if host.roofline_present:
             _w(res / f"roofline-{host.run_id}.ndjson", roofline_records(host, bench))
         _w(res / f"manifest-{host.run_id}.ndjson", manifest_records(sc, host))
-        _w(res / f"census-{host.run_id}.ndjson", census_records(sc, host, bench))
+        _w(res / f"census-{host.run_id}.ndjson", census_records(sc, host, bench, probe))
         if host.env_present:
             (res / f"env-{host.run_id}.json").write_text(json.dumps(env_record(host), indent=2) + "\n")
         (res / f"topology-{host.run_id}.txt").write_text(
@@ -3097,6 +3239,265 @@ def sc_transpose_lost():
     )
 
 
+def _floor_band(name, description, spec, expect, **arm_kw):
+    """One overlap-band scenario. A null cross on purpose: the band is a statement
+    about the instrument, so a fixture that also planted a kernel effect would leave
+    it ambiguous whether the band status came from the probe records or from the
+    matrix ones.
+
+    `arm_kw` reaches the arms, and the only thing it is used for is `spread` --
+    `band_for()` is adaptive, so widening the band is how the one case that the band
+    test alone cannot catch gets constructed."""
+    return Scenario(
+        name=name,
+        description=description,
+        hosts=[_host()],
+        routines=("dgemm",),
+        level1=False,
+        arms=_arms(**arm_kw),
+        floor_probe=spec,
+        expect=expect,
+    )
+
+
+def sc_floor_band_agrees():
+    """The two MIN_SECONDS floors give the same answer, with the signs scattered.
+
+    The baseline the other three are read against, and the state the campaign needs
+    to be in before section 4 can be read across n=256. Each floor draws its own
+    jitter, so the difference is scatter rather than a lean: that is what AGREES
+    means, and it is a different claim from AGREES-WITH-BIAS.
+
+    Note what this scenario must NOT do -- set the exit bit. A confirming band is
+    the clean case, and if bit 32 fired here it would fire on every good dataset."""
+    return _floor_band(
+        "floor-band-agrees",
+        (
+            "n=192..384 measured at 0.05 s and 0.30 s, independent noise on each. Deltas "
+            "well inside the parity band and signs scattered, so the band confirms and the "
+            "step at n=256 in section 4 is attributable to the hardware."
+        ),
+        {"mode": "agree"},
+        [
+            {"kind": "json_string", "path": "floor_overlap.status", "expect": "AGREES"},
+            {"kind": "json_bool", "path": "floor_overlap.confirmed", "value": True},
+            # 6 arms x 2 thread points x 5 sizes. Asserted as a number because a
+            # probe that silently emitted half its pairs would still say AGREES.
+            {"kind": "json_number", "path": "floor_overlap.n_pairs", "op": "==", "value": 60},
+            {"kind": "json_number", "path": "floor_overlap.outside_band", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "floor_overlap.incomplete_cases", "op": "==", "value": 0},
+            # The probe records are held out of the cross, not analysed inside it.
+            # If they leaked in they would appear as extra dgemm rows at n=192..384
+            # carrying a second min_seconds, and this is the cheapest assertion that
+            # catches it: the census counts expected cells, and a leaked probe cell
+            # is not one.
+            {"kind": "json_number", "path": "coverage.missing_unexplained", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "coverage.partial", "op": "==", "value": 0},
+            {"kind": "exit_bits_clear", "bits": [32]},
+            {"kind": "stdout_contains", "text": "9. TIMING-FLOOR OVERLAP BAND"},
+            {"kind": "stdout_contains", "text": "held out of the cross"},
+        ],
+    )
+
+
+def sc_floor_band_biased():
+    """The floors agree within band, but consistently: the short floor reads 2% low
+    on every single pair.
+
+    The mode worth having, and the reason the sign test is not redundant with the
+    band test. Every delta here is inside the parity band, so a check that only
+    asked "is any pair outside its band" would report a clean AGREES and the 2%
+    lean would go unrecorded. It is a real property of the instrument and the
+    reader needs the number, because a 2% step at n=256 in section 4 is now
+    explained without appeal to the hardware.
+
+    It is deliberately BELOW --min-effect, which is what makes it a footnote rather
+    than a failure: nothing under the reporting floor can become a finding. Above
+    it, the same fixture would be DISAGREES -- see `floor-band-disagrees`."""
+    return _floor_band(
+        "floor-band-biased",
+        (
+            "The 0.05 s floor reads 2% below the 0.30 s floor on every pair. Inside the "
+            "parity band, so the band passes, but consistently signed, so the bias is "
+            "reported as a quantity to discount a section-4 step against."
+        ),
+        {"mode": "bias", "amount": 0.02},
+        [
+            {"kind": "json_string", "path": "floor_overlap.status", "expect": "AGREES-WITH-BIAS"},
+            # Confirmed: the floors do agree. The bias is a measurement, not a fault.
+            {"kind": "json_bool", "path": "floor_overlap.confirmed", "value": True},
+            {"kind": "json_number", "path": "floor_overlap.outside_band", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "floor_overlap.floor_sign_consistency", "op": "==", "value": 1.0},
+            # Signed, and negative: the SHORT floor reads low. A fixture that only
+            # asserted the magnitude would pass on an analysis that lost the sign,
+            # and the sign is the whole content of "which floor reads low".
+            {"kind": "json_number", "path": "floor_overlap.median_bias", "op": "<", "value": -0.01},
+            {"kind": "json_number", "path": "floor_overlap.median_bias", "op": ">", "value": -0.04},
+            {"kind": "exit_bits_clear", "bits": [32]},
+            {"kind": "stdout_contains", "text": "consistently signed"},
+            {"kind": "anomaly_kind_absent", "kind_name": "floor_overlap_unconfirmed"},
+        ],
+    )
+
+
+def sc_floor_band_disagrees():
+    """The short floor reads 12% low — past the band, so the per-regime floor is an
+    instrument artefact sitting exactly where the answer is.
+
+    The failure this whole probe exists to detect, and the one the alternative
+    design (move the transition to n=512 and assume) could never have detected. The
+    consequence is specific: section 4's small-minus-large number straddles n=256,
+    so it cannot be published, and the DECISION section says so next to the
+    sentence that would have been quoted."""
+    return _floor_band(
+        "floor-band-disagrees",
+        (
+            "The 0.05 s floor reads 12% below the 0.30 s floor, past the parity band. Bit 32, "
+            "a hard section-5 anomaly, and the small-regime CONSEQUENCE in the DECISION "
+            "section carries a do-not-publish caveat."
+        ),
+        {"mode": "disagree", "amount": 0.12},
+        [
+            {"kind": "json_string", "path": "floor_overlap.status", "expect": "DISAGREES"},
+            {"kind": "json_bool", "path": "floor_overlap.confirmed", "value": False},
+            {"kind": "json_number", "path": "floor_overlap.outside_band", "op": "==", "value": 60},
+            {"kind": "exit_bits_set", "bits": [32]},
+            # Section 5 is where a reader is told to look before trusting section 4,
+            # so the finding has to reach it and not only section 9.
+            {"kind": "anomaly_kind_present", "kind_name": "floor_overlap_unconfirmed"},
+            {"kind": "stdout_contains", "text": "cannot be read across n=256"},
+            # ...and it must not be mistaken for a coverage or provenance problem.
+            # Every arm ran and every record is accounted for; only the instrument
+            # is unvalidated.
+            {"kind": "exit_bits_clear", "bits": [4, 8, 16]},
+        ],
+    )
+
+
+def sc_floor_band_order_confounded():
+    """Whichever floor ran FIRST reads 3% high, which is drift and not a floor
+    effect — and the only reason that is knowable is that bench.c alternates.
+
+    This is the scenario that justifies the alternation. Under a fixed order (short
+    floor always first) this dataset and `floor-band-biased` would be the same
+    dataset: "the first one reads high" and "the short one reads high" would be
+    indistinguishable, and the analysis would have called a thermal or cache drift a
+    floor bias. Alternating makes the floor-signed deltas alternate while the
+    order-signed ones stay consistent, and the two consistency numbers separate the
+    explanations.
+
+    ORDER-CONFOUNDED is neither a pass nor a floor problem. The probe did not
+    measure what it set out to measure, so it sets bit 32 -- the band is unconfirmed
+    -- but the text says drift, because sending someone to change MIN_SECONDS over a
+    drift would be the wrong fix applied confidently."""
+    return _floor_band(
+        "floor-band-order-confounded",
+        (
+            "Whichever floor ran first reads 3% high. Inside the band, but the signs track "
+            "measurement order and not the floor, which is only separable because bench.c "
+            "alternates which floor goes first. Reported as ORDER-CONFOUNDED, not as a bias."
+        ),
+        {"mode": "order", "amount": 0.03},
+        [
+            {"kind": "json_string", "path": "floor_overlap.status", "expect": "ORDER-CONFOUNDED"},
+            {"kind": "json_bool", "path": "floor_overlap.confirmed", "value": False},
+            {"kind": "json_number", "path": "floor_overlap.order_sign_consistency", "op": "==", "value": 1.0},
+            # The discriminator: order explains every pair, the floor explains a
+            # minority. If these two were equal the alternation would have bought
+            # nothing and the status would be unreachable.
+            {"kind": "json_number", "path": "floor_overlap.floor_sign_consistency", "op": "<", "value": 0.5},
+            {"kind": "json_number", "path": "floor_overlap.outside_band", "op": "==", "value": 0},
+            {"kind": "exit_bits_set", "bits": [32]},
+            {"kind": "anomaly_kind_present", "kind_name": "floor_overlap_unconfirmed"},
+            {"kind": "stdout_contains", "text": "measured drift"},
+        ],
+    )
+
+
+def sc_floor_band_bias_past_floor():
+    """A 10% consistent bias on an arm noisy enough that the parity band widened to
+    20% — so every pair passes the band test and the probe still has to fail.
+
+    The hole in the band test, and the reason the sign test carries its own
+    DISAGREES branch rather than only ever producing a footnote. `band_for()` is
+    adaptive by design (see its KNOWN LIMIT note): it returns
+    max(min_effect, dispersion), so a dispersed cell gets a band wider than
+    --min-effect and a bias underneath that band is invisible to `outside_band`
+    however large it is in reportable terms. 10% is twice the 5% reporting floor: a
+    bias that size can produce a section-4 step at n=256 on its own, which is
+    exactly the ambiguity the probe was built to remove.
+
+    Read against `floor-band-biased`, which is the same mode at 2%. The two differ
+    only in whether the bias clears --min-effect, and that difference alone moves the
+    status from AGREES-WITH-BIAS to DISAGREES. Both have outside_band == 0, so a
+    fixture set containing only one of them would leave the branch that separates
+    them untested, and the analysis could report either as the other.
+
+    `spread` is 0.20 and not 0.30: above --noisy-spread's 0.25 default the host would
+    also be flagged noisy, and a scenario whose claim is about the band must not
+    quietly depend on an anomaly it never mentions."""
+    return _floor_band(
+        "floor-band-bias-past-floor",
+        (
+            "The 0.05 s floor reads 10% low on every pair, on an arm dispersed enough that "
+            "the adaptive parity band widened to 20%. Every pair is inside its own band, so "
+            "the band test passes, and the signed bias is still past the 5% reporting floor: "
+            "DISAGREES on the sign test alone."
+        ),
+        {"mode": "bias", "amount": 0.10},
+        [
+            {"kind": "json_string", "path": "floor_overlap.status", "expect": "DISAGREES"},
+            {"kind": "json_bool", "path": "floor_overlap.confirmed", "value": False},
+            # The discriminator against `floor-band-disagrees`: that scenario fails
+            # because pairs fall outside the band, this one fails despite none doing.
+            # If this number were ever nonzero the scenario would be testing the same
+            # branch as the other and would prove nothing.
+            {"kind": "json_number", "path": "floor_overlap.outside_band", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "floor_overlap.floor_sign_consistency", "op": "==", "value": 1.0},
+            # Past --min-effect, which is the whole reason this is a failure and the
+            # 2% version is not. Signed: the short floor is the one reading low.
+            {"kind": "json_number", "path": "floor_overlap.median_bias", "op": "<", "value": -0.05},
+            {"kind": "exit_bits_set", "bits": [32]},
+            {"kind": "anomaly_kind_present", "kind_name": "floor_overlap_unconfirmed"},
+            {"kind": "stdout_contains", "text": "The bands were widened by dispersion"},
+            # And it must not be reported as drift: the order-signed deltas alternate
+            # here, because the bias follows the floor and bench.c alternates the
+            # order. ORDER-CONFOUNDED would send someone after the wrong cause.
+            {"kind": "json_number", "path": "floor_overlap.order_sign_consistency", "op": "<", "value": 0.5},
+        ],
+        spread=0.20,
+    )
+
+
+def sc_floor_band_half():
+    """Half a probe: every case carries the short floor and none carries the long
+    one, so not one pair can be formed.
+
+    Distinguishable from ABSENT and that distinction is the point. ABSENT means no
+    probe ran, which is the state of every dataset written before bench.c grew one
+    and must stay analysable. INCOMPLETE means a probe ran and produced unusable
+    output -- a truncated file, an arm killed between the two measurements, or a
+    producer bug -- and the band is unconfirmed. Reporting both as "no band" would
+    make a broken probe look like an old dataset."""
+    return _floor_band(
+        "floor-band-half",
+        (
+            "Probe records present but only one floor among them, so no pair exists. "
+            "INCOMPLETE and bit 32, which is a different claim from ABSENT: something "
+            "produced half a probe, rather than nothing having produced one."
+        ),
+        {"mode": "half"},
+        [
+            {"kind": "json_string", "path": "floor_overlap.status", "expect": "INCOMPLETE"},
+            {"kind": "json_number", "path": "floor_overlap.n_pairs", "op": "==", "value": 0},
+            {"kind": "json_number", "path": "floor_overlap.incomplete_cases", "op": "==", "value": 60},
+            {"kind": "exit_bits_set", "bits": [32]},
+            {"kind": "anomaly_kind_present", "kind_name": "floor_overlap_unconfirmed"},
+            {"kind": "stdout_absent", "text": "no floor-overlap probe records"},
+        ],
+    )
+
+
 def sc_probe_inapplicable():
     """The DYNAMIC_ARCH probe did not run because the DYNAMIC build failed, so
     there was nothing to probe.
@@ -3238,6 +3639,12 @@ SCENARIOS = {
         sc_nodata_group_hole,
         sc_medium_large_localised,
         sc_transpose_lost,
+        sc_floor_band_agrees,
+        sc_floor_band_biased,
+        sc_floor_band_disagrees,
+        sc_floor_band_order_confounded,
+        sc_floor_band_bias_past_floor,
+        sc_floor_band_half,
     )
 }
 
@@ -3401,6 +3808,15 @@ def check_one(exp, report, stdout, exit_code, root):
             hit,
             f"coherent subsets {got}, want {'exactly' if exp.get('exact', True) else 'at least'} {want}",
         )
+
+    if kind == "json_string":
+        # An exact string field. Distinct from stdout_contains because a status is
+        # a closed vocabulary and substring matching on it is wrong in a way that
+        # only shows up later: "AGREES" is a substring of "AGREES-WITH-BIAS", so a
+        # stdout check for the former would pass on the latter, and the two differ
+        # by whether a bias was found. Asserting the field forces the distinction.
+        got = dig(report, exp["path"])
+        return got == exp["expect"], f"{exp['path']}={got!r}, want {exp['expect']!r}"
 
     if kind == "json_strings":
         # A list-of-strings field, asserted as an exact sorted set. json_len would

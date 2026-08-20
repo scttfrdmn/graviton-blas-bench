@@ -73,6 +73,83 @@ change can be compared.
   It is part of the comparison key, so a fixture that omitted it keyed every
   record at the legacy floor and no fixture exercised the small floor at all.
 
+### Added — affects how a number is produced
+
+- **A timing-floor overlap band, because the per-regime `MIN_SECONDS` put a change
+  of instrument at the size where the answer is expected to be.** The floor steps
+  from 0.05 s to 0.30 s at n=256, and n=256 is also where `GEMM_SMALL_*` is
+  hypothesised to hand over to the blocked kernel. A step in section 4's regime
+  profile at n=256 was therefore ambiguous between "the fast path ends here" and
+  "the averaging window changed here", the two predict the same picture, and nothing
+  in the data resolved them after the fact — on the one section whose whole job is
+  locating the effect in the size range. Moving the transition to n=512 would have
+  separated them by assumption. This separates them by measurement, for about
+  1.75 s per arm.
+
+  `src/bench.c` grows `run_floor_overlap()`, which re-measures `dgemm` at
+  n ∈ {192, 224, 256, 320, 384} at *both* floors and tags those records
+  `probe: floor-overlap`. `decompose.py` grows section 9, which pairs them and
+  reports `AGREES`, `AGREES-WITH-BIAS`, `DISAGREES`, `ORDER-CONFOUNDED`,
+  `INCOMPLETE` or `ABSENT`. Section 4's title and the small-regime `CONSEQUENCE:`
+  line now both point at it, and anything but the first two statuses sets the new
+  **exit bit 32** plus a hard section-5 anomaly.
+
+  Five decisions in it are load-bearing, and each is held by a mutation-validated
+  fixture:
+
+  - **The probe records are partitioned out of the cross before `build_cells()`,
+    on the tag and not on the floor.** A probe record is the same condition as a
+    matrix record bar `min_seconds`; left in the cross, min-within-run would have
+    silently kept whichever of the two read faster. The floor in the comparison key
+    is the fail-safe underneath, not the mechanism, and `split_floor_probe()`
+    fail-closes on an unrecognised tag rather than treating a future probe as
+    matrix data. Neutering the split kills all six band fixtures.
+  - **The band must straddle the transition.** If every band size fell in one
+    regime, both members of every pair would carry the same floor, every delta
+    would be zero, and `AGREES` would be reported having compared nothing with
+    nothing — a vacuous confirmation, indistinguishable downstream from a real one.
+    `gates/p1.sh` asserts the straddle separately from asserting the sizes, because
+    moving the band in `bench.c` and `synth.py` together passes the value check.
+  - **`bench.c` alternates which floor runs first**, by size-index parity, and
+    records the position. With a fixed order, "the first one reads high" and "the
+    short floor reads high" are the same dataset, so a thermal or cache drift would
+    have been reported as a floor bias and someone would have been sent to change
+    `MIN_SECONDS` over it. The alternation is the only thing that makes
+    `ORDER-CONFOUNDED` reachable.
+  - **A *signed* bias above `--min-effect` is `DISAGREES` even when every pair sits
+    inside its own band.** `band_for()` is adaptive — `max(min_effect, dispersion)`
+    — so a dispersed cell gets a band wider than the reporting floor and a bias
+    underneath it is invisible to a band test however large it is in reportable
+    terms. `floor-band-bias-past-floor` is that case: a 10% bias on an arm whose
+    band widened to 20%, `outside_band == 0`, and still a failure. Without the
+    branch it reads as a footnote.
+  - **`ABSENT` deliberately does not set bit 32.** Every result set produced before
+    the probe existed has no probe records and must keep analysing exactly as it
+    did. Requiring the probe to be *present* is `gates/p2.sh`'s job. `INCOMPLETE` —
+    records present, not one complete pair — *is* a failure, because something
+    produced half a probe.
+
+  Six fixtures: `floor-band-agrees`, `floor-band-biased`, `floor-band-disagrees`,
+  `floor-band-order-confounded`, `floor-band-bias-past-floor`, `floor-band-half`.
+  Not comparability-affecting for the matrix — no matrix record changes value — but
+  every bench record gains a `probe` field, and the runner's per-arm `records` count
+  now includes the ten probe lines, deliberately: it answers "how much did this arm
+  emit", and the probe is emitted.
+
+### Fixed — gate
+
+- **`gates/p1.sh` could go green on code that was not on disk.** Section 2 loads
+  `tools/synth.py` and `analysis/decompose.py` with
+  `importlib.util.spec_from_file_location`, which writes `__pycache__` and
+  validates it on `(mtime, size)`. A restore that lands a same-size file whose mtime
+  the cache still considers current makes every assertion in that section read the
+  *bytecode* instead of the file. Found while mutation-validating the band checks: a
+  restored `src/bench.c` kept reporting the mutated band, and the failure presents
+  as the gate agreeing with a file it never read. The gate now exports
+  `PYTHONDONTWRITEBYTECODE=1` and removes any existing cache rather than trusting
+  it. A green gate that measured the wrong artefact is the worst outcome available
+  in this repository.
+
 ### Added
 
 - Three P1 fixtures, each mutation-validated in both directions:

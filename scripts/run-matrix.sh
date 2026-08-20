@@ -644,6 +644,10 @@ run_arm() {
   # named OPENBLAS_CORETYPE with quotes in its value.
   local -a ctenv=()
   [ -n "$ct" ] && ctenv=(OPENBLAS_CORETYPE="$ct")
+  # A line count, so it includes the ten floor-overlap probe records bench.c writes
+  # after the matrix on any arm that ran dgemm. Deliberately not netted out: this
+  # field answers "how much did this arm emit", and the probe is emitted. The
+  # analysis never reads it -- it partitions on the `probe` field instead.
   before=$(wc -l < "$OUT")
   log "run library=$lib target=$tgt coretype=${ct:-unforced} threads=$T"
   # shellcheck disable=SC2086

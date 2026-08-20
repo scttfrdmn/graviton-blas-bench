@@ -32,6 +32,8 @@ number. Everything else was renumbered around them.
                       GEMM_SMALL_* entries at all, so if a deficit exists it
                       should be visible in small and absent in large. The
                       small-minus-large gap is reported as an explicit number.
+                      READ SECTION 9 FIRST: the MIN_SECONDS floor also steps at
+                      n=256, so a step there has two candidate causes.
   5. anomalies        everything that should stop a conclusion.
   6. scaling          GFLOP/s vs threads against the measured all-core peak.
   7. coverage census  every expected cell classified. MISSING-UNEXPLAINED is the
@@ -44,11 +46,18 @@ number. Everything else was renumbered around them.
                       tighter error bars. Three rather than two because the median
                       of two is the mean; three rejects one bad pass, which is
                       reported as REPRODUCES-MAJORITY.
+  9. floor-overlap    the same DGEMM case measured at BOTH MIN_SECONDS floors.
+                      The floor steps at n=256 and so, by hypothesis, does
+                      GEMM_SMALL_*, so a step in section 4 is ambiguous between
+                      the hardware and the instrument. This section settles it by
+                      measurement. Numbered last only to leave 0-8 alone, since
+                      CLAUDE.md and the gate text name those by number; it is
+                      read before section 4, which says so in its own header.
 
   VERDICT             one machine-greppable line computed from the data.
 
 EXIT CODES -- load-bearing, because gates/p1.sh has to be able to assert on
-something. 2, 4, 8 and 16 are bit flags and are OR-ed together; 1 is returned
+something. 2, 4, 8, 16 and 32 are bit flags and are OR-ed together; 1 is returned
 alone.
 
   0  clean
@@ -72,6 +81,12 @@ alone.
      type and different physical boxes reached different verdicts. Not the same
      failure as noise -- the parity band already absorbs noise -- so it gets its
      own bit rather than widening the meaning of 2
+ 32  the timing-floor overlap band did not confirm that the two MIN_SECONDS floors
+     agree: they measurably disagree, the differences track measurement order
+     rather than the floor, or half a probe arrived. Section 4 cannot be read
+     across n=256 in any of those states. The band being ABSENT does NOT set this
+     -- pre-probe datasets have to keep analysing -- so requiring it is a gate's
+     job and not this bit's
 
 Usage:
     python3 decompose.py results/ [--min-effect 0.05] [--json out.json]
@@ -460,6 +475,21 @@ def canon_floor(v):
     if not isinstance(v, (int, float)) or isinstance(v, bool):
         return f"{LEGACY_MIN_SECONDS:.3f}"
     return f"{float(v):.3f}"
+
+
+NO_PROBE = "none"
+
+
+def canon_probe(v):
+    """Which probe produced a record, defaulting to NO_PROBE.
+
+    Absent means a matrix record, which is what every record written before
+    bench.c grew the field is. Defaulting rather than treating absence as unknown
+    matters here: the default is the value that puts a record INTO the cross, so
+    old data reads exactly as it used to, and the only records that get partitioned
+    out are ones that positively asked to be."""
+    s = str(v).strip() if isinstance(v, str) else ""
+    return s if s else NO_PROBE
 
 
 # Routine families for verdict weighting. The family is the routine name minus
@@ -1161,6 +1191,45 @@ def build_cells(bench, hosts, exc: Excluded):
     return cells
 
 
+FLOOR_PROBE = "floor-overlap"
+
+
+def split_floor_probe(bench):
+    """Partition bench records into (matrix, probe) on the `probe` field.
+
+    This must happen before build_cells(), and the reason is the same one that put
+    the floor in the comparison key -- stated once here and once there because
+    either alone would look like belt-and-braces.
+
+    A floor-overlap record is the same (routine, m, n, k, lda_pad, incx, transa,
+    transb) as a record the matrix already holds; only min_seconds differs. So it is
+    a SECOND MEASUREMENT OF AN EXISTING CONDITION, which is precisely the shape the
+    min-within-run rule exists to defend against -- except that here the rule would
+    do the wrong thing in a new way. Min-within-run is right when two records are
+    two samples of one measurement (keep the unluckier, do not let a lucky sample
+    stand). These two are not samples of one measurement: they are one measurement
+    at each of two averaging windows, and taking the min of the pair would report
+    the shorter window's number whenever the shorter window reads low -- which is
+    the very bias the band was built to detect. The probe would then be invisible
+    inside the thing it is measuring.
+
+    Tag-based rather than floor-based because the tag says WHY the record exists.
+    The floor in the key stops the collision either way, but it would leave the
+    probe's ten dgemm records sitting in the cross as extra thin rows at n=192..384,
+    tugging the regime profile with measurements taken for a different purpose. The
+    key is the fail-safe; this is the mechanism.
+
+    Returns two lists rather than filtering in place so the caller can report on
+    the probe. A record whose probe field names something this version of the
+    analysis does not know still lands in `probe`, not in the matrix: an unknown
+    probe is not a matrix record, and admitting it would be the fail-open
+    direction."""
+    matrix, probe = [], []
+    for r in bench:
+        (matrix if canon_probe(r.get("probe")) == NO_PROBE else probe).append(r)
+    return matrix, probe
+
+
 # ---- comparison primitives -------------------------------------------------
 
 
@@ -1857,7 +1926,7 @@ def report_regime_profile(deficits, cross, args, out):
     """Promised in the docstring since the first draft and never implemented,
     while P1 requires the planted small-regime penalty be recovered."""
     out("\n" + "=" * 78)
-    out("4. REGIME PROFILE  — where in the size range the effect lives")
+    out("4. REGIME PROFILE  — where in the size range the effect lives (see §9 first)")
     out("=" * 78)
     out("The N2 kernel set defines no GEMM_SMALL_* entries, so a kernel-set deficit should")
     out("be visible in small and absent in large. small-large is that gap, explicitly.")
@@ -1974,9 +2043,9 @@ def report_regime_profile(deficits, cross, args, out):
 # ---- 5. anomalies ----------------------------------------------------------
 
 
-def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, args, out):
+def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, overlap, args, out):
     out("\n" + "=" * 78)
-    out("5. ANOMALIES  — read this before trusting any number in sections 1-4, 6-7")
+    out("5. ANOMALIES  — read this before trusting any number in sections 1-4, 6-9")
     out("=" * 78)
     items = []
 
@@ -2008,6 +2077,20 @@ def report_anomalies(inp, cells, hosts, exc: Excluded, scaling, args, out):
         )
     for fam in inp.missing_families:
         add(".", "file_family_absent", f"no {fam}-*.ndjson/json in results/ — coverage fact, see section 7")
+
+    # Surfaced here as well as in section 9 because this section is where a reader
+    # is told to look before trusting section 4, and an unconfirmed timing floor is
+    # a reason not to trust section 4 specifically. AGREES-WITH-BIAS is not an
+    # anomaly: the bias is below --min-effect by construction, so it is a
+    # measurement to quote, not a hazard to flag.
+    if overlap["status"] in ("DISAGREES", "ORDER-CONFOUNDED", "INCOMPLETE"):
+        add(
+            "!!",
+            "floor_overlap_unconfirmed",
+            f"timing-floor overlap band {overlap['status']}: {overlap['why']}. Section 4's "
+            f"regime profile cannot be read across n=256 until this is resolved — a step there "
+            f"is what the band exists to attribute. See section 9.",
+        )
     if inp.bad_lines:
         add("!", "unparseable_lines", f"{inp.bad_lines} unparseable/unclassifiable NDJSON lines were skipped")
     for a in inp.escalation_acks:
@@ -2637,6 +2720,229 @@ def report_replicates(inp, hosts, explain, pass_explain, args, out):
     return payload
 
 
+# ---- timing-floor overlap band ---------------------------------------------
+
+
+def _sign(x):
+    return (x > 0) - (x < 0)
+
+
+def compute_floor_overlap(probe_cells, args):
+    """Does the same case measured at both MIN_SECONDS floors give the same answer?
+
+    WHY THIS SECTION EXISTS. The floor steps from 0.05 s to 0.30 s at n=256, and
+    n=256 is also where OpenBLAS's GEMM_SMALL_* path is hypothesised to hand over
+    to the blocked kernel. A step in the section-4 regime profile at n=256 is
+    therefore ambiguous between "the fast path ends here" and "the averaging window
+    changed here", and the two predict the same picture, so nothing in the data
+    resolves them after the fact. bench.c measures n=192..384 at both floors so the
+    ambiguity is settled by measurement instead of by argument.
+
+    THREE STATISTICS, because the probe can fail in three distinguishable ways and
+    only one of them is "the floors disagree".
+
+    (1) Per pair, is the difference inside the parity band? Same band_for() the
+        whole campaign uses, so "the floors agree" means exactly what "these two
+        arms are at parity" means everywhere else in this file. Using a bespoke
+        tolerance here would make the instrument check stricter or looser than the
+        findings it is validating, and there is no argument for either.
+
+    (2) Pooled, is the sign consistent? Scatter within the band is noise; five
+        sizes all leaning the same way is a bias, and pooling across arms is where
+        the power is (one arm's five pairs is 6% under a fair-coin null, twenty
+        arms' hundred pairs is not a coincidence anyone need weigh). A consistent
+        bias smaller than --min-effect cannot manufacture a finding, because
+        nothing below that floor is reportable -- so it is recorded as a quantity
+        to discount a regime step against, not as a failure.
+
+        But band_for() WIDENS past min_effect on a dispersed cell, so a consistent
+        bias can in principle clear min_effect while every pair still sits inside
+        its own widened band. That case is a failure, not a footnote, and it is
+        tested separately: a signed bias above min_effect is DISAGREES even when
+        every individual pair passes (1).
+
+    (3) Pooled, does the difference track ORDER better than it tracks the FLOOR?
+        bench.c alternates which floor runs first precisely so this is answerable.
+        If the short floor always ran first it would always meet the colder cache,
+        and a first-vs-second drift would be indistinguishable from a
+        short-vs-long floor effect. When order explains the signs better than the
+        floor does, the probe has not measured what it set out to measure: that is
+        ORDER-CONFOUNDED, which is neither a pass nor a floor problem, and it is
+        reported as its own status rather than being rounded to either.
+
+    ABSENT is not a failure. Datasets written before bench.c grew the probe have no
+    such records and must keep analysing exactly as they did; requiring the probe is
+    gates/p2.sh's job, not the exit code's. INCOMPLETE -- probe records present but
+    not one complete pair among them -- IS a failure, because something produced
+    half a probe."""
+    pairs = []
+    by_case = defaultdict(dict)
+    for (cond, arm), cell in probe_cells.items():
+        # Everything except the floor, which is what the pair varies.
+        by_case[(cond[:10], arm)][cond[10]] = cell
+
+    incomplete = 0
+    for (case, arm), by_floor in by_case.items():
+        if len(by_floor) != 2:
+            incomplete += 1
+            continue
+        # Read short/long off the data rather than off a constant. bench.c owns
+        # the two values and this file must not hold a third copy of them.
+        f_short, f_long = sorted(by_floor, key=float)
+        cs, cl = by_floor[f_short], by_floor[f_long]
+        g_short, g_long = cs.value, cl.value
+        if not (g_long > 0):
+            incomplete += 1
+            continue
+        d_floor = (g_short - g_long) / g_long
+        # Positive means the first-measured of the pair read higher. Same
+        # magnitude as d_floor by construction; only the sign carries information,
+        # and the sign is what separates a floor effect from a drift.
+        short_first = "floor_probe_first" in cs.notes
+        long_first = "floor_probe_first" in cl.notes
+        d_order = d_floor if short_first else -d_floor if long_first else None
+        pairs.append(
+            {
+                "instance": case[0],
+                "threads": case[1],
+                "routine": case[2],
+                "m": case[3],
+                "arm": arm_label(arm),
+                "floor_short": f_short,
+                "floor_long": f_long,
+                "gflops_short": g_short,
+                "gflops_long": g_long,
+                "delta": d_floor,
+                "band": band_for(cs, cl, args.min_effect),
+                "short_ran_first": short_first if (short_first or long_first) else None,
+                "delta_order": d_order,
+                "verified": cs.all_verified and cl.all_verified,
+            }
+        )
+
+    pairs.sort(key=lambda p: skey((p["instance"], p["arm"], p["threads"], p["m"])))
+    outside = [p for p in pairs if abs(p["delta"]) > p["band"]]
+
+    signs = [_sign(p["delta"]) for p in pairs if p["delta"]]
+    order_signs = [_sign(p["delta_order"]) for p in pairs if p["delta_order"]]
+    floor_consistency = abs(sum(signs)) / len(signs) if signs else 0.0
+    order_consistency = abs(sum(order_signs)) / len(order_signs) if order_signs else 0.0
+    median_bias = statistics.median([p["delta"] for p in pairs]) if pairs else None
+    worst = max(pairs, key=lambda p: abs(p["delta"])) if pairs else None
+
+    # 5 is one full band on one arm: the smallest set in which all-same-sign is
+    # better than one-in-ten under a fair coin. Below it, sign consistency is not
+    # evidence of anything and claiming a bias from it would be the tuning this
+    # campaign is not allowed to do.
+    MIN_FOR_SIGN = 5
+    biased = len(signs) >= MIN_FOR_SIGN and floor_consistency == 1.0
+    order_explains = (
+        len(order_signs) >= MIN_FOR_SIGN
+        and order_consistency == 1.0
+        and order_consistency > floor_consistency
+    )
+
+    if not pairs:
+        status = "INCOMPLETE" if incomplete else "ABSENT"
+        why = (
+            f"{incomplete} probe case(s) carry only one floor, so no pair could be formed"
+            if incomplete
+            else "no floor-overlap probe records in this dataset"
+        )
+    elif outside:
+        status = "DISAGREES"
+        w = outside[0]
+        why = (
+            f"{len(outside)} of {len(pairs)} pairs differ by more than their parity band, "
+            f"worst {w['instance']} {w['arm']} n={w['m']} at {100 * w['delta']:+.1f}% "
+            f"against a band of {100 * w['band']:.1f}%"
+        )
+    elif biased and abs(median_bias) > args.min_effect:
+        status = "DISAGREES"
+        why = (
+            f"every pair is inside its own band, but all {len(signs)} lean the same way and the "
+            f"median bias is {100 * median_bias:+.1f}%, past the {100 * args.min_effect:.0f}% "
+            f"reporting floor. The bands were widened by dispersion; a bias this size can "
+            f"produce a section-4 step on its own"
+        )
+    elif order_explains:
+        status = "ORDER-CONFOUNDED"
+        why = (
+            f"all {len(order_signs)} differences follow measurement order and only "
+            f"{100 * floor_consistency:.0f}% follow the floor, so the probe measured drift "
+            f"rather than the floor and cannot settle the n=256 ambiguity"
+        )
+    elif biased:
+        status = "AGREES-WITH-BIAS"
+        why = (
+            f"all {len(signs)} pairs agree within band, but consistently signed: the "
+            f"{float(pairs[0]['floor_short']):g} s floor reads {100 * median_bias:+.1f}% against "
+            f"the {float(pairs[0]['floor_long']):g} s floor. Below the "
+            f"{100 * args.min_effect:.0f}% reporting floor, so it cannot create a finding — "
+            f"discount a section-4 step near n=256 by this much"
+        )
+    else:
+        status = "AGREES"
+        why = (
+            f"all {len(pairs)} pairs agree within band, signs scattered "
+            f"({100 * floor_consistency:.0f}% consistent), median "
+            f"{100 * median_bias:+.1f}%. The step at n=256 in section 4 is the hardware"
+        )
+
+    return {
+        "status": status,
+        "why": why,
+        "confirmed": status in ("AGREES", "AGREES-WITH-BIAS"),
+        "pairs": pairs,
+        "n_pairs": len(pairs),
+        "incomplete_cases": incomplete,
+        "outside_band": len(outside),
+        "floor_sign_consistency": floor_consistency,
+        "order_sign_consistency": order_consistency,
+        "median_bias": median_bias,
+        "worst_delta": worst["delta"] if worst else None,
+        "min_pairs_for_sign_test": MIN_FOR_SIGN,
+    }
+
+
+def report_floor_overlap(ov, args, out):
+    out("\n" + "=" * 78)
+    out("9. TIMING-FLOOR OVERLAP BAND  — is the step at n=256 hardware or instrument")
+    out("=" * 78)
+    out(f"  {ov['status']}: {ov['why']}")
+    if not ov["pairs"]:
+        if ov["status"] == "ABSENT":
+            out("  bench.c emits this probe on every arm; a dataset without it predates the")
+            out("  probe. Nothing here is wrong, but nothing here is confirmed either.")
+        return ov
+    out("")
+    out(
+        f"  {'instance':<18} {'arm':<26} {'thr':>4} {'n':>5} "
+        f"{'short':>9} {'long':>9} {'delta':>8} {'band':>7} first"
+    )
+    for p in ov["pairs"][: args.max_listed]:
+        first = "short" if p["short_ran_first"] else "long" if p["short_ran_first"] is False else "?"
+        flag = " !!" if abs(p["delta"]) > p["band"] else ""
+        out(
+            f"  {p['instance']!s:<18} {p['arm']:<26} {p['threads']!s:>4} {p['m']!s:>5} "
+            f"{p['gflops_short']:9.2f} {p['gflops_long']:9.2f} "
+            f"{100 * p['delta']:+7.1f}% {100 * p['band']:6.1f}% {first}{flag}"
+        )
+    if len(ov["pairs"]) > args.max_listed:
+        out(f"  ... {len(ov['pairs']) - args.max_listed} more pairs, see --json")
+    out("")
+    out(
+        f"  sign consistency: floor {100 * ov['floor_sign_consistency']:.0f}%, "
+        f"order {100 * ov['order_sign_consistency']:.0f}% "
+        f"(order is the control; bench.c alternates which floor runs first so that a "
+        f"first-vs-second"
+    )
+    out("  drift cannot masquerade as a short-vs-long floor effect)")
+    if ov["incomplete_cases"]:
+        out(f"  {ov['incomplete_cases']} probe case(s) carried only one floor and were not paired")
+    return ov
+
+
 # ---- verdict ---------------------------------------------------------------
 
 
@@ -3115,7 +3421,9 @@ def compute_verdict(cross, hosts, exc: Excluded, args):
     }
 
 
-def report_verdict(verdict, lda, regimes, coverage, anomalies, replicates, exit_code, args, out):
+def report_verdict(
+    verdict, lda, regimes, coverage, anomalies, replicates, overlap, exit_code, args, out
+):
     out("\n" + "=" * 78)
     out("DECISION")
     out("=" * 78)
@@ -3226,9 +3534,33 @@ def report_verdict(verdict, lda, regimes, coverage, anomalies, replicates, exit_
             f"  CONSEQUENCE: deficit concentrated in the small regime in {len(small_led)} profiles "
             f"(median small-large {100 * med:+.1f}%) — the missing GEMM_SMALL_* path."
         )
+        # This is the one CONSEQUENCE the timing floor can fabricate, so it is the
+        # one that carries the band's status. small-minus-large straddles n=256,
+        # where MIN_SECONDS also steps, and "small is slower" and "small was
+        # measured over a shorter window" predict the same sign. The band is the
+        # only thing that tells them apart, so the sentence that would be quoted
+        # says out loud whether the band backs it.
+        if not overlap["confirmed"]:
+            out(
+                f"    ...BUT the timing-floor overlap band is {overlap['status']} (section 9), and "
+                f"small-minus-large straddles the floor step at n=256. Do not publish this "
+                f"consequence until the band confirms."
+            )
+        elif overlap["status"] == "AGREES-WITH-BIAS":
+            # The ratio is the useful number -- "the lean is 15x smaller than the
+            # effect" is what makes the effect safe -- but median_bias can be
+            # exactly 0 when enough pairs land on 0 to carry the median while five
+            # nonzero pairs still share a sign. Print the lean without the ratio
+            # rather than dividing by it.
+            bias = overlap["median_bias"]
+            ratio = f", {abs(med / bias):.0f}x smaller than the effect above" if bias else ""
+            out(
+                f"    ...and the band confirms it is not the instrument: the floors agree within "
+                f"band, with a {100 * bias:+.1f}% consistent lean{ratio}."
+            )
     out(
         f"  EXIT: {exit_code} (0 clean; 2 poisoned/inadmissible, 4 coverage hole, "
-        f"8 provenance, 16 does-not-reproduce, OR-ed)"
+        f"8 provenance, 16 does-not-reproduce, 32 floor-band unconfirmed, OR-ed)"
     )
 
 
@@ -3359,7 +3691,18 @@ def main(argv=None):
     for inst in {r.get("instance") for r in inp.bench}:
         hosts.setdefault(inst, Host(instance=inst))
     exc = Excluded()
-    cells = build_cells(inp.bench, hosts, exc)
+    # The probe leaves the pool before anything is aggregated; see
+    # split_floor_probe() for why the tag and not the floor key does this.
+    matrix_recs, probe_recs = split_floor_probe(inp.bench)
+    cells = build_cells(matrix_recs, hosts, exc)
+    # Deliberately the same `exc`, not a throwaway. A probe record that failed
+    # verification is a poisoned record under standing order 4 whatever sweep wrote
+    # it -- it is the same dgemm on the same arm -- so it must set the same exit
+    # bit. The exclusion bookkeeping is keyed on (condition, arm) and a probe
+    # condition carries the probe's floor, so nothing it adds is ever looked up by
+    # the coverage census, which builds its cell set from the matrix cells only.
+    probe_cells = build_cells(probe_recs, hosts, exc)
+    overlap = compute_floor_overlap(probe_cells, args)
     explain, _manifest, pass_explain = build_absence(inp)
 
     lines = []
@@ -3369,6 +3712,11 @@ def main(argv=None):
         f"graviton-blas-bench decomposition — {len(inp.bench)} records, {len(cells)} cells, "
         f"{len(run_ids)} run_ids, {len(hosts)} instance types, {len(inp.envs)} env files"
     )
+    if probe_recs:
+        out(
+            f"  of which {len(probe_recs)} are probe records held out of the cross "
+            f"({len(probe_cells)} cells) — see section 9"
+        )
     out(
         f"min-effect floor {100 * args.min_effect:.0f}%, widened per cell to observed dispersion; "
         f"min-sizes {args.min_sizes}; win-fraction {args.win_fraction}"
@@ -3382,10 +3730,13 @@ def main(argv=None):
     lda = report_lda_penalty(cells, hosts, args, out)
     regimes = report_regime_profile(deficits, cross, args, out)
     scaling = compute_scaling(cells, inp.roof, args)
-    anomalies, coverage_table, unver_cells = report_anomalies(inp, cells, hosts, exc, scaling, args, out)
+    anomalies, coverage_table, unver_cells = report_anomalies(
+        inp, cells, hosts, exc, scaling, overlap, args, out
+    )
     report_scaling(scaling, out)
     coverage = report_coverage(cells, inp, explain, hosts, exc, args, out)
     replicates = report_replicates(inp, hosts, explain, pass_explain, args, out)
+    report_floor_overlap(overlap, args, out)
     verdict = compute_verdict(cross, hosts, exc, args)
 
     exit_code = 0
@@ -3423,8 +3774,24 @@ def main(argv=None):
         # would make "the data is unusable" and "the finding is not real" the same
         # signal to the gate.
         exit_code |= 16
+    if overlap["status"] in ("DISAGREES", "ORDER-CONFOUNDED", "INCOMPLETE"):
+        # Bit 32 means exactly "the timing-floor overlap band did not confirm that
+        # the two floors agree". Its own bit for the same reason 16 is: every arm
+        # ran, every record is accounted for, no host is inadmissible, and the
+        # instrument is nonetheless unvalidated at the one size the campaign most
+        # needs it validated at.
+        #
+        # ABSENT deliberately does NOT set it. A dataset written before bench.c
+        # grew the probe has no such records and must keep analysing exactly as it
+        # did; making its absence an error would mean this file could no longer read
+        # its own earlier output. Requiring the probe to be PRESENT is a gate's job
+        # (gates/p2.sh), where the requirement can be stated about the dataset being
+        # collected rather than about every dataset ever.
+        exit_code |= 32
 
-    report_verdict(verdict, lda, regimes, coverage, anomalies, replicates, exit_code, args, out)
+    report_verdict(
+        verdict, lda, regimes, coverage, anomalies, replicates, overlap, exit_code, args, out
+    )
     print("\n".join(lines))
 
     if args.json:
@@ -3480,6 +3847,7 @@ def main(argv=None):
             "unverified_cells": unver_cells,
             "coverage": coverage,
             "replicates": replicates,
+            "floor_overlap": overlap,
             "exit_code": exit_code,
         }
         args.json.write_text(json.dumps(payload, indent=2, default=str) + "\n")
