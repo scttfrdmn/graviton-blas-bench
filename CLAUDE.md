@@ -112,6 +112,22 @@ until it finds something.
     run the arm — a mislabelled arm is not a failed run, it is a plausible wrong
     answer, which is worse. Same rule for `TARGET=`, the MIDR, and the thread
     count: record the observed value, not the intended one.
+    **Known blind spot, recorded 2026-08-20 rather than discovered later:** the
+    read-back cannot distinguish `NEOVERSEN2` from `NEOVERSEV2`. Both requests
+    report `neoversev2`, because `gotoblas_corename()` tests `corename[12]` before
+    `corename[13]` on what `dynamic_arm64.c` `#define`s to one pointer. It is blind
+    *harmlessly*, and only for one reason: at `cc3fc1e`,
+    `kernel/arm64/KERNEL.NEOVERSEV2` is a single 39-byte line,
+    `include $(KERNELDIR)/KERNEL.NEOVERSEN2`, so there is exactly one kernel table
+    and nothing for the read-back to fail to tell apart. That is why the `NEOVERSEN2`
+    arm is `alias_duplicate` rather than a hole — the kernel set *was* measured, by
+    the arm labelled `NEOVERSEV2`. **The harmlessness is a property of the pinned
+    SHA, not of the mechanism.** If a future OpenBLAS gives V2 a table of its own or
+    reorders `corename[]`, this pair becomes the one place a request can silently
+    land on a different table than the label claims, and `alias_ok()`'s declaration
+    turns from correct into exactly the plausible wrong answer this order exists to
+    prevent. Re-derive it against the SHA under test; do not carry this paragraph
+    forward as if it were about the mechanism.
 11. **A gap in the results carries a reason.** Every arm the runner declines to
     run writes a census record saying why. Absent and null are different claims,
     and the analysis must be able to tell them apart: "V1 and V2 are at parity"
@@ -165,6 +181,26 @@ run is to replace the arithmetic with a measurement.
 Measure it on the **slowest** arm of the first P2 iteration, not a representative
 one — see §Wall-clock is anti-correlated with arm quality for why a representative
 arm extrapolates low.
+
+**And sum it per rung, never per stream.** A stream is not a unit of cost. Measured
+on the first P2 pass, one `openblas/DYNAMIC` stream costs **7.2 min at t=1, 6.6 at
+t=8, 4.1 at t=16** and falls further above that, because the small, medium and
+level-1 regimes are `MIN_SECONDS`-floored and therefore flat in thread count while
+the large regime is `ABS_MIN_SAMPLES = 3`-bound and scales with it. So
+`mean_stream_cost × stream_count` priced at the head of the thread ladder runs high —
+it did, by ~1.4–1.8× on the first P2 pass, whose pre-launch band priced all eight
+thread points at about the `t=8` cost and counted the roofline streams, which cost
+seconds, as streams. The estimate is `Σ over thread points (per-rung stream cost
+× streams at that rung)`, and the per-rung costs are measurements, one per rung.
+The counter-intuitive term is the one that stops the total collapsing: **t=8 is only
+9% cheaper than t=1, not half**, because the thread-dependent large cap lifts at
+`LARGE_CAP_MIN_THREADS = 8` and the large ladder gains two rungs — large costs *more*
+at t=8 (5.20 min) than at t=1 (4.60) — which is why the correction is ~1.4–1.8× and not
+the 3–4× that "later rungs are cheaper" on its own implies. Report progress as
+elapsed-time fraction, not as streams done: at 17 of 88 streams this pass was 19% by
+stream count and 24–34% by time, an understatement, because what is left is the cheap
+end of the ladder. Per-rung costs are host-dependent (`c6g`/`hpc7g` have no 192-thread
+rung at all), so P3 re-derives them per host and does not scale c8g's.
 
 - **Everything runs on-demand, including P2.** Spot was the earlier decision and is
   reversed: ~$100 of saving is not worth putting untested reclaim handling on the

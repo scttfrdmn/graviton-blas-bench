@@ -49,8 +49,16 @@ change can be compared.
   `sanity_check()`'s hard abort. Those guard standing order 2's optimizer hazard (927
   TFLOP/s on one core from a folded FMA chain), which is a different question from
   whether the number bounds anything. `roofline.c` was rebuilt and re-run after the
-  comment change per standing order 2: 25.13 GFLOP/s f64 single-core at `-O2` on an
-  Apple M-series host, plausible and far below the abort bound.
+  comment change per standing order 2: 25.13 GFLOP/s f64 single-core at `-O2`, plausible
+  and far below the abort bound. **That re-run was on the local dev host** — `arm64`,
+  Apple clang 21, darwin 25.6.0 — **not** the campaign host, which is aarch64 gcc 11.5.0
+  on Amazon Linux 2023 and produced the 4.22. So it verifies the chain is not folded
+  (standing order 2's letter) without exercising the path that produced the number under
+  discussion, and that is worth stating rather than leaving to be inferred. The 6× spread
+  between the two is the closing argument for the retirement, not a caveat on it — and a
+  *stronger* argument than an x86-vs-Arm gap would have been, because both hosts are
+  aarch64, so the whole 6× is compiler and `-O` level. That is precisely the dependency
+  that makes the bound worthless as a floor.
 
   Fixtures: `headroom` is replaced by **`peak-fma-retired`**, which plants the case
   that used to be the headline (`peak_fma` 1.5× the best GEMM, which no Graviton host
@@ -173,6 +181,27 @@ change can be compared.
 
 ### Changed
 
+- **The spend policy now states how a pass's cost is summed: per rung, never per
+  stream.** A stream is not a unit of cost, and the 8–14 instance-hour band posted to #3
+  before the first P2 pass priced all eight thread points at roughly the head-of-ladder
+  cost (`~9.6 h` over `~96 streams` — 6.0 min each, near the measured `t=8` figure), and
+  counted the eight roofline streams, which cost seconds, as streams. Measured on that pass, one
+  `openblas/DYNAMIC` stream costs **7.2 min at t=1, 6.6 at t=8, 4.1 at t=16**, because
+  small, medium and level-1 are `MIN_SECONDS`-floored and therefore flat in thread count
+  while large is `ABS_MIN_SAMPLES = 3`-bound and scales. The estimate is `Σ over thread
+  points (per-rung stream cost × streams at that rung)`, each per-rung cost measured
+  rather than derived. The term that stops the total collapsing is counter-intuitive and
+  is called out: **t=8 is only 9% cheaper than t=1, not half**, because the
+  thread-dependent large cap lifts at `LARGE_CAP_MIN_THREADS = 8` and the large ladder
+  gains two rungs, so large costs *more* at t=8 (5.20 min) than at t=1 (4.60). That term
+  is why the correction is ~1.4–1.8× rather than the 3–4× a straight "later rungs are
+  cheaper" reading suggests. Progress is to be reported as elapsed-time fraction, not
+  streams done — 17 of 88 streams read as 19% by stream count and 24–34% by time, an
+  understatement, because the remaining streams are the cheap ones. Per-rung
+  costs are host-dependent (`c6g`/`hpc7g` have no 192-thread rung at all), so P3
+  re-derives them per host rather than scaling `c8g`'s. **No cost figure is added to
+  `CLAUDE.md`**, per its own rule on the three struck figures; the method is written down,
+  the numbers stay in #3.
 - **Section 1's reference arm is chosen once per host, not per comparison group.**
   The last of the count-derived-selection defects and the worst of them: the group
   key carries the regime, so on a host with two reference candidates whose coverage
@@ -448,7 +477,7 @@ change can be compared.
   `9048a2b` when the guard was fixed, so its census carries `unrunnable` for the
   `NEOVERSEN2` arm with a reason string asserting that `force_coretype()` ignored the
   request — a status the code can no longer emit for that arm, and a mechanism claim
-  that is simply false. The pass was **not** re-run (~10 instance-hours, ~$80, and no
+  that is simply false. The pass was **not** re-run (a fresh on-demand sweep, and no
   measurement would change) and the shipped census was **not** edited: rewriting a
   record after it shipped destroys the only evidence of what the harness did. The note
   quotes both records verbatim, gives the cc3fc1e mechanism, and states what does not
@@ -459,6 +488,28 @@ change can be compared.
   arm's cells under `unrunnable`). What differs is the `by_status` bucket, so a reader
   diffing this pass's census against a P3 pass's will see one arm move, and that move
   is this note.
+
+  The note now also carries **the build-system half of the identity, which is what makes
+  `alias_duplicate` a correct description rather than a charitable one.**
+  `kernel/arm64/KERNEL.NEOVERSEV2` at cc3fc1e is one line and 39 bytes — `include
+  $(KERNELDIR)/KERNEL.NEOVERSEN2` (verified against the pinned SHA, not assumed). There
+  is no V2 kernel table, so the two names select a byte-identical kernel set *before* any
+  runtime dispatch. That converts "we shipped a wrong reason string on a failed arm" into
+  "the arm was always redundant and the new status says so": declining it lost no kernel
+  set, because the surviving `NEOVERSEV2` arm measured the same one. The note states the
+  identity at all three levels it holds at — makefile, the `#define`, and the read-back.
+
+  And it records **the one place standing order 10's assert-what-you-forced discipline is
+  blind**, as a known limit rather than something to be discovered later: `gbb-coreprobe`'s
+  read-back cannot distinguish `NEOVERSEN2` from `NEOVERSEV2`, because both requests report
+  `neoversev2`. It is blind harmlessly *only* because of the makefile fact — there is one
+  table, so there is nothing to fail to distinguish. **The harmlessness is a property of
+  the pinned SHA, not of the mechanism**: an OpenBLAS that gives V2 its own kernel table,
+  or reorders `corename[]`, makes the read-back load-bearing on this pair overnight and
+  makes `alias_ok()`'s declaration wrong in the dangerous direction — a request landing on
+  a different table than the label claims, which is exactly standing order 10's "plausible
+  wrong answer". Also recorded in standing order 10 itself, so it is read before the next
+  coretype is added rather than after. Re-derive against the pinned SHA; do not assume it.
 
 - **`gates/p2.sh --self-test` rehearsed against one more arm than a real pass can
   contain.** The `p2-host` fixture planted `NEOVERSEV2` *and* `NEOVERSEN2` as fully
